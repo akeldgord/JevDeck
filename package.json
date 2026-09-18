@@ -1,0 +1,21 @@
+{
+  "name": "jevdeck",
+  "version": "0.1.0",
+  "description": "Turn your documents into flashcards worth remembering",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "bun --filter \"@jevdeck/web\" dev",
+    "build": "bun --filter \"@jevdeck/web\" build",
+    "preview": "bun --filter \"@jevdeck/web\" preview",
+    "test": "bun test",
+    "typecheck": "tsc -b"
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.0",
+    "typescript": "^5.6.2"
+  }
+}
