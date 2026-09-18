@@ -1,0 +1,148 @@
+We’ll support whole textbooks with section selection, start with one document per generated deck, and use JEV where testing shows a cost or quality benefit.
+
+The main unresolved tradeoff is comprehensive coverage: long documents can produce thousands of cards. Section selection helps, but users should also see the estimated workload before generation.
+
+> What should users see before generation starts?
+Selected sections and coverage mode only
+
+> How should users access the source behind a card?
+Both excerpt and original-page viewer
+
+> How should account creation work on a self-hosted installation?
+Administrator invitations only
+
+Confirmed: a simple generation screen, supporting excerpts plus an original-page viewer, and invitation-only accounts.
+
+We have enough to define the core product. These last choices will settle the study experience and the limits on shared API spending.
+
+> How should the app choose between Q&A and cloze cards?
+Always choose the format automatically
+
+> What should cram mode do to the regular spaced-repetition schedule?
+Let the user choose for each session
+
+> What controls should administrators have over shared API usage?
+usage trackging with configureable user and total limits
+
+Created 
+Document_Flashcards_Spec.md.
+
+It captures all your decisions, plus proposed architecture, quality checks, usage-limit enforcement, and implementation milestones. Proposed defaults are clearly separated from confirmed requirements.
+
+First technical milestone: test whether JEV improves cost or card quality against a simpler pipeline before making it a dependency.
+
+Document_Flashcards_Spec.md
+Document
+what should the git repository look like
+
+
+I’d use one repository for the whole application, with separate web, API, and background-worker components. That keeps self-hosting straightforward while letting document processing run independently.
+
+Proposed structure:
+
+document-flashcards/
+  README.md
+  LICENSE
+  CONTRIBUTING.md
+  SECURITY.md
+  .env.example
+  compose.yaml
+
+  apps/
+    web/                     # Study interface, document viewer, admin
+    api/                     # Accounts, decks, sharing, uploads, exports
+    worker/                  # Background document and generation jobs
+
+  packages/
+    ingestion/               # PDF, slides, Word, OCR, source images
+    generation/              # Concept selection and card generation
+    validation/              # Grounding, ambiguity, duplicate checks
+    providers/               # JEV and generative-model adapters
+    scheduling/              # Spaced repetition and cram behavior
+    anki_export/             # Downloadable decks and bundled media
+    contracts/               # Shared schemas and generated API types
+
+  prompts/
+    concepts/
+    cards/
+    decisions/
+    validation/
+
+  database/
+    migrations/
+
+  evaluations/
+    fixtures/                # Small, redistributable sample documents
+    reference_sets/          # Human-reviewed concepts and cards
+    experiments/             # Baseline versus JEV comparisons
+    reports/                 # Aggregate quality and cost results
+
+  tests/
+    integration/
+    end_to_end/
+    security/
+
+  deploy/
+    containers/
+    scripts/                 # Setup, backup, restore, upgrades
+
+  docs/
+    product-spec.md
+    architecture.md
+    self-hosting.md
+    configuration.md
+    development.md
+    decisions/               # Short records of major design choices
+
+  .github/
+    workflows/               # Checks, builds, releases
+    ISSUE_TEMPLATE/
+    pull_request_template.md
+
+The most important boundary is between the generation pipeline and the model providers. Code should request operations such as “classify this passage” or “generate these cards.” Provider adapters handle the actual API calls. That lets you replace JEV or the cheap generator without rewriting the application.
+
+A few rules would keep this manageable:
+
+One documented installation command. The root Compose configuration starts the application and its dependencies.
+Version prompts with code. Save the prompt, model, and pipeline versions used for each generation job.
+Keep evaluation separate from production. Experiments establish where JEV helps; users get the selected pipeline.
+Keep uploaded documents, generated decks, credentials, and database files out of Git. Only small, redistributable test fixtures belong in the repository.
+Keep licensing explicit. LICENSE should contain the terms you ultimately choose; don’t add an open-source license automatically.
+
+For the first commit, I’d include the spec, README, architecture outline, environment example, and a working application skeleton. Add the remaining directories as their functionality is implemented—no need to populate an elaborate empty structure.
+
+I’d also keep JEV out of the repository name. The product is document-to-flashcards; JEV is one implementation choice.
+
+JevRecall would be my pick. It communicates studying and memory, works beyond medicine, and sounds like a product people could pay to use.
+
+Other good options:
+
+Name	Feel
+JevRecall	Clear, memorable, broad
+JevCards	Immediately understandable
+JevLearn	Room to expand beyond flashcards
+JevDeck	Short and focused on the output
+JevPrep	Stronger exam-preparation angle
+
+I’d use JevRecall as the product name and jevrecall for the repository.
+
+Turn your documents into flashcards worth remembering.
+
+These are naming ideas; availability and potential affiliation confusion with JEV haven’t been checked.
+
+go jevdeck
+
+JevDeck it is. Repository: jevdeck.
+
+Turn your documents into flashcards.
+
+needs to be a license github has
+
+None of GitHub’s standard license-picker options meet your noncommercial-only requirement. They permit commercial use. GitHub’s license guide
+
+Two options:
+
+Keep your noncommercial requirement: select “None” during repository creation, then manually add PolyForm Noncommercial as the LICENSE file. GitHub supports adding licenses manually. GitHub documentation
+Use a built-in option: choose GNU AGPLv3, but accept that others can sell hosting too. It requires source availability for modified versions offered over a network; it does not prohibit competing commercial services. AGPL overview
+
+For JevDeck, I’d keep PolyForm and add it manually. Being absent from the dropdown doesn’t prevent you from using it on GitHub.
