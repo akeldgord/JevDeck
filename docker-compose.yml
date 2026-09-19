@@ -1,0 +1,57 @@
+# A self-hosted JevDeck: the API (which also serves the built web app) and a worker process.
+#
+#   docker compose up --build
+#
+# No `.env` is required: without one the container starts and reports the honest state (no
+# provider configured, generation unavailable). Copy the environment table from
+# docs/self-hosting.md into a `.env` beside this file (git-ignored) when you have values to set —
+# there is no tracked `.env.example` yet, because the file tooling used to build this refuses
+# any `.env*` path.
+#
+# The database and the retained source files are both inside the SQLite file on the named volume,
+# which is what makes a backup a single artifact. See docs/self-hosting.md.
+
+services:
+  api:
+    build: .
+    # `.env` is optional here: without it the container still starts and reports the honest state
+    # (no provider configured, generation unavailable).
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PORT: 3001
+      JEVDECK_DB_PATH: /data/jevdeck.sqlite
+      # One worker process is enough for a self-hosted installation, and running it here keeps the
+      # deployment to a single container. Set JEVDECK_WORKER_ENABLED=false to use the worker
+      # service below instead.
+      JEVDECK_WORKER_ENABLED: ${JEVDECK_WORKER_ENABLED:-true}
+    ports:
+      - "${JEVDECK_PORT:-3001}:3001"
+    volumes:
+      - jevdeck-data:/data
+    restart: unless-stopped
+
+  # The same queue, drained by a separate process. Enable it by setting
+  # JEVDECK_WORKER_ENABLED=false for the API and running:
+  #   docker compose up --build api worker
+  worker:
+    build: .
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      JEVDECK_DB_PATH: /data/jevdeck.sqlite
+      JEVDECK_WORKER_POLL_MS: 1500
+    volumes:
+      - jevdeck-data:/data
+    # The API owns the schema, so the worker waits until migrations have run.
+    depends_on:
+      api:
+        condition: service_healthy
+    command: ["bun", "run", "apps/worker/src/run.ts"]
+    restart: unless-stopped
+    profiles: ["worker"]
+
+volumes:
+  jevdeck-data:

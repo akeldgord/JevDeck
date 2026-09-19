@@ -2,13 +2,15 @@
   "name": "@jevdeck/worker",
   "version": "0.1.0",
   "main": "./src/index.ts",
+  "types": "./src/index.ts",
   "scripts": {
-    "start": "bun run src/index.ts",
+    "start": "bun run src/run.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@jevdeck/contracts": "workspace:*",
     "@jevdeck/generation": "workspace:*",
+    "@jevdeck/providers": "workspace:*",
     "@jevdeck/validation": "workspace:*"
   },
   "devDependencies": {

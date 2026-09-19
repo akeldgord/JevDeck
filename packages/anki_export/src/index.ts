@@ -1,6 +1,17 @@
 import { Deck, Flashcard } from '@jevdeck/contracts';
 
 /**
+ * Text and JSON export formatters — the browser-safe half of this package.
+ *
+ * The `.apkg` writer is **not** re-exported here, deliberately. It needs Bun's SQLite binding
+ * (`bun:sqlite`), and the web application imports this module to build its text and JSON exports;
+ * re-exporting the writer pulled a server-only module into the browser bundle and broke the
+ * production build. Server code imports the writer by its own entry point:
+ *
+ *     import { buildApkg } from '@jevdeck/anki-export/apkg';
+ */
+
+/**
  * Generates Anki-compatible tab-separated / CSV export with cloze tags and citations.
  */
 export function exportDeckToAnkiTxt(deck: Deck, cards: Flashcard[]): string {

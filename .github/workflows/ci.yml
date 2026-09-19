@@ -1,0 +1,60 @@
+# Continuous integration.
+#
+# This is the clean-install verification: a fresh checkout, `bun install --frozen-lockfile` so the
+# resolve must match `bun.lock`, then the same checks a person would run before trusting a change.
+# Nothing here needs a provider credential — the generation suites drive a stub server that speaks
+# the real provider envelopes — so the workflow does not depend on a repository secret.
+
+name: CI
+
+on:
+  # Every branch is checked through `pull_request`; running again on the branch itself would
+  # duplicate the work for no extra coverage.
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned by `.bun-version` rather than "latest": the lockfile format and the SQLite binding
+      # are version-sensitive, so a floating toolchain would make the clean-install check itself
+      # unreproducible.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+
+      - name: Install from the lockfile
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck every project
+        run: bun run typecheck
+
+      - name: Run the test suite
+        # Includes the migration, backup/restore, budget, study-persistence and end-to-end
+        # workflow suites. The suites create their own temporary databases and remove them.
+        run: bun test
+
+      - name: Build the web application
+        run: bun run build
+
+      - name: Check the production bundle carries no fabricated content
+        # The demo fixtures must not reach a production build. `tests/runtime.test.ts` asserts this
+        # against the sources; this checks the artifact the deployment actually serves.
+        run: |
+          # `JEVDECK_PROVIDER_API_KEY` is included because a client that even names the server-side
+          # credential variable is a leak waiting to happen, not because a value could appear.
+          if grep -rlE "DEMO_MODE_NOTICE|example\.invalid|JEVDECK_PROVIDER_API_KEY" apps/web/dist >/dev/null 2>&1; then
+            echo "Demo fixtures, synthetic identities or server-only configuration were found in the production bundle."
+            exit 1
+          fi

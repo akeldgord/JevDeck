@@ -7,16 +7,74 @@ import {
   Code, 
   Copy, 
   Check, 
-  CheckCircle2
+  CheckCircle2,
+  PackageOpen
 } from 'lucide-react';
+import { api } from '../lib/api';
+import { SimulatedBadge } from './DemoBanner';
 
 interface Props {
-  deck: Deck;
+  deck: Deck | null;
   cards: Flashcard[];
+  /** True when the cards being exported are synthetic demo content. */
+  isDemo: boolean;
+  /** The stored deck id, or `null` when only a local deck exists. */
+  deckId: string | null;
+  /** Whether the package endpoint is available for this deployment. */
+  canExportPackage: boolean;
 }
 
-export const ExportView: React.FC<Props> = ({ deck, cards }) => {
+export const ExportView: React.FC<Props> = ({ deck, cards, isDemo, deckId, canExportPackage }) => {
   const [copiedFormat, setCopiedFormat] = useState<'anki' | 'json' | null>(null);
+  const [packageState, setPackageState] = useState<'idle' | 'busy' | 'done' | 'failed'>('idle');
+  const [packageError, setPackageError] = useState<string | null>(null);
+
+  /**
+   * Downloads the real `.apkg`.
+   *
+   * The package is built by the server from the stored deck, its evidence and the caller's own
+   * schedule, so the file is the deck's actual content rather than a browser-side approximation.
+   */
+  const handleDownloadApkg = async () => {
+    if (!deckId) return;
+
+    setPackageState('busy');
+    setPackageError(null);
+
+    try {
+      const file = await api.downloadApkg(deckId);
+      const url = URL.createObjectURL(new Blob([file.bytes], { type: 'application/octet-stream' }));
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = file.fileName;
+      link.click();
+      URL.revokeObjectURL(url);
+      setPackageState('done');
+    } catch (cause) {
+      setPackageState('failed');
+      setPackageError(cause instanceof Error ? cause.message : 'The package could not be built.');
+    }
+  };
+
+  // Requirement (R0): do not offer an export of a deck that does not exist. An empty deck
+  // reports that there is nothing to export instead of producing an empty file.
+  if (!deck || cards.length === 0) {
+    return (
+      <div className="max-w-xl mx-auto bg-slate-900/60 border border-slate-800 rounded-3xl p-12 text-center backdrop-blur-md shadow-2xl space-y-5">
+        <div className="w-16 h-16 rounded-2xl bg-slate-800/80 text-slate-400 mx-auto flex items-center justify-center border border-slate-700">
+          <PackageOpen className="w-8 h-8" />
+        </div>
+        <div className="space-y-2">
+          <h2 className="text-2xl font-black text-slate-100">Nothing to export yet</h2>
+          <p className="text-sm text-slate-400">
+            {deck
+              ? 'This deck has no cards. Generate cards before exporting.'
+              : 'Generate cards from a document first. Exports are produced from the cards in the deck, not from the document itself.'}
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   const ankiTxt = exportDeckToAnkiTxt(deck, cards);
   const jsonExport = exportDeckToJson(deck, cards);
@@ -53,11 +111,44 @@ export const ExportView: React.FC<Props> = ({ deck, cards }) => {
         <div>
           <h2 className="text-xl font-bold text-slate-100 flex items-center gap-2">
             <Download className="w-5 h-5 text-emerald-400" />
-            Export Deck ({cards.length} Grounded Flashcards)
+            Export Deck ({cards.length} Cards)
+            {isDemo && <SimulatedBadge label="Demo cards" />}
           </h2>
           <p className="text-xs text-slate-400 mt-1">
-            Export directly to Anki (.txt with native Cloze markup & citations) or structured JSON.
+            A real Anki package (<code className="font-mono">.apkg</code>) built on the server and
+            ready to import, or a tab-separated text file and a JSON bundle for other tools.
           </p>
+        </div>
+
+        {/* The real package: a ZIP containing an Anki collection the importer opens. */}
+        <div className="bg-slate-950/60 border border-emerald-900/50 rounded-2xl p-6 space-y-3">
+          <div className="flex items-center gap-2 text-emerald-400 font-bold text-sm">
+            <PackageOpen className="w-4 h-4" />
+            Anki package (.apkg)
+          </div>
+          <p className="text-xs text-slate-400 leading-relaxed">
+            Built on the server from the stored deck, each card's verbatim citation and your own
+            review schedule, so the cards arrive with the intervals you have already earned.
+            Figures and tables are not bundled: this application does not extract media yet, so
+            the package has none rather than placeholders.
+          </p>
+          <button
+            onClick={() => void handleDownloadApkg()}
+            disabled={!canExportPackage || !deckId || packageState === 'busy'}
+            className="px-4 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-slate-950 font-bold text-xs transition-colors inline-flex items-center gap-2"
+          >
+            <Download className="w-4 h-4" />
+            {packageState === 'busy' ? 'Building package…' : 'Download .apkg'}
+          </button>
+          {!canExportPackage && (
+            <p className="text-[11px] text-amber-300/90">
+              Package export needs a stored deck on a running API. This configuration has none.
+            </p>
+          )}
+          {packageState === 'done' && (
+            <p className="text-[11px] text-emerald-300">Package downloaded.</p>
+          )}
+          {packageError && <p className="text-[11px] text-red-300">{packageError}</p>}
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -66,7 +157,7 @@ export const ExportView: React.FC<Props> = ({ deck, cards }) => {
             <div className="space-y-2">
               <div className="flex items-center gap-2 text-emerald-400 font-bold text-sm">
                 <FileSpreadsheet className="w-4 h-4" />
-                Anki Desktop / Mobile (.txt)
+                Anki import file (.txt)
               </div>
               <p className="text-xs text-slate-400 leading-relaxed">
                 Tab-separated format configured with tags, native <code className="text-purple-300 font-mono">{"{{c1::...}}"}</code> cloze fields, and verbatim source excerpts with page numbers.
@@ -100,10 +191,11 @@ export const ExportView: React.FC<Props> = ({ deck, cards }) => {
             <div className="space-y-2">
               <div className="flex items-center gap-2 text-cyan-400 font-bold text-sm">
                 <Code className="w-4 h-4" />
-                Full Deck JSON Bundle
+                Deck JSON Bundle
               </div>
               <p className="text-xs text-slate-400 leading-relaxed">
-                Complete JSON bundle preserving SuperMemo SM-2 intervals, bounding box coordinates, excerpt citations, and section hierarchy.
+                JSON bundle with SM-2 scheduling state, source excerpts, page numbers and section
+                titles. Highlight geometry is omitted when it was not measured.
               </p>
             </div>
 

@@ -8,11 +8,13 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@jevdeck/anki-export": "workspace:*",
     "@jevdeck/contracts": "workspace:*",
     "@jevdeck/generation": "workspace:*",
+    "@jevdeck/providers": "workspace:*",
     "@jevdeck/scheduling": "workspace:*",
     "@jevdeck/validation": "workspace:*",
-    "@jevdeck/anki-export": "workspace:*"
+    "@jevdeck/worker": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^22.5.0",

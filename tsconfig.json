@@ -17,7 +17,11 @@
     { "path": "./packages/scheduling" },
     { "path": "./packages/validation" },
     { "path": "./packages/generation" },
+    { "path": "./packages/providers" },
     { "path": "./packages/anki_export" },
-    { "path": "./apps/web" }
+    { "path": "./packages/evaluation" },
+    { "path": "./apps/web" },
+    { "path": "./apps/api" },
+    { "path": "./apps/worker" }
   ]
 }

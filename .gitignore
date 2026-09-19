@@ -1,8 +1,10 @@
 # Dependencies
+#
+# Lockfiles are tracked: a clean install has to resolve to the versions that were tested, which is
+# what CI's `bun install --frozen-lockfile` and the container build check. Only the lockfiles of
+# other package managers are ignored, so a stray `npm install` cannot look authoritative.
 node_modules/
 .pnpm-store/
-bun.lock
-bun.lockb
 package-lock.json
 pnpm-lock.yaml
 yarn.lock
@@ -42,3 +44,15 @@ temp/
 uploads/
 storage/
 export_cache/
+
+# Evaluation reports describe real held-out material and are regenerated on demand.
+# The harness, its fixtures and its format documentation are tracked; its outputs are not.
+evaluations/reports/*.json
+
+# Local API database (SQLite file and its write-ahead log)
+data/
+*.sqlite
+*.sqlite-*
+
+# Local backups, whatever the script was pointed at.
+backups/

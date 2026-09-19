@@ -112,3 +112,21 @@ export function sortCardsForStudy(cards: Flashcard[], now: Date = new Date()): F
     return dueA - dueB;
   });
 }
+
+/**
+ * Eligibility and session queue.
+ *
+ * Whoever asks "what is due?" — the header badge or the study session — asks this module, so the
+ * count and the queue can never disagree.
+ */
+export {
+  DEFAULT_NEW_LIMIT,
+  DEFAULT_REVIEW_LIMIT,
+  cardStudyState,
+  describeQueue,
+  selectStudyQueue,
+  type StudyCardState,
+  type StudyQueue,
+  type StudyQueueCounts,
+  type StudyQueueInput,
+} from './study';

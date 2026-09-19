@@ -1,23 +1,136 @@
-import React from 'react';
-import { Flashcard } from '@jevdeck/contracts';
-import { 
-  X, 
-  BookOpen, 
-  Sparkles,
+import React, { useEffect, useRef, useState } from 'react';
+import * as pdfjsLib from 'pdfjs-dist';
+import { DocumentPage, Flashcard } from '@jevdeck/contracts';
+import {
+  X,
+  BookOpen,
   CheckCircle2,
-  Bookmark
+  Bookmark,
+  Loader2,
+  AlertCircle,
 } from 'lucide-react';
+
+// Ensure the worker is configured even if the viewer mounts first
+if (typeof window !== 'undefined' && !pdfjsLib.GlobalWorkerOptions.workerSrc) {
+  pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
+    'pdfjs-dist/build/pdf.worker.mjs',
+    import.meta.url
+  ).toString();
+}
 
 interface Props {
   card: Flashcard | null;
   onClose: () => void;
+  /** Intact bytes of the uploaded PDF, when a document is loaded. */
+  pdfBytes: ArrayBuffer | null;
+  /** Extracted page text, used when there is no PDF to rasterise. */
+  pages: DocumentPage[];
+  documentName: string;
+  /**
+   * True when this document was really uploaded but its original bytes were not retained.
+   *
+   * The distinction matters: presenting a genuine upload as a "sample document" is a false
+   * statement about where the text came from.
+   */
+  sourceNotRetained?: boolean;
+  isDemo?: boolean;
 }
 
-export const DualGroundingViewer: React.FC<Props> = ({ card, onClose }) => {
+interface HighlightBox {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+/** Collapses whitespace and punctuation so text-layer items can be matched against an excerpt. */
+function normalizeForMatch(text: string): string {
+  return text.toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+export const DualGroundingViewer: React.FC<Props> = ({
+  card,
+  onClose,
+  pdfBytes,
+  pages,
+  documentName,
+  sourceNotRetained = false,
+  isDemo = false,
+}) => {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const pdfDocRef = useRef<any>(null);
+  const [highlight, setHighlight] = useState<HighlightBox | null>(null);
+  const [isRendering, setIsRendering] = useState(false);
+  const [renderError, setRenderError] = useState<string | null>(null);
+
+  const pageNumber = card?.grounding.pageNumber ?? null;
+  const excerpt = card?.grounding.excerpt ?? '';
+
+  // Drop the cached document when a different file is loaded
+  useEffect(() => {
+    pdfDocRef.current = null;
+  }, [pdfBytes]);
+
+  useEffect(() => {
+    if (!card || !pdfBytes || pageNumber === null) {
+      setIsRendering(false);
+      setHighlight(null);
+      setRenderError(null);
+      return;
+    }
+
+    let cancelled = false;
+    setIsRendering(true);
+    setRenderError(null);
+    setHighlight(null);
+
+    (async () => {
+      try {
+        if (!pdfDocRef.current) {
+          // pdf.js detaches the buffer it receives, so render from a copy
+          pdfDocRef.current = await pdfjsLib.getDocument({ data: pdfBytes.slice(0) }).promise;
+        }
+        const doc = pdfDocRef.current;
+        const page = await doc.getPage(Math.min(Math.max(pageNumber, 1), doc.numPages));
+        if (cancelled) return;
+
+        const baseViewport = page.getViewport({ scale: 1 });
+        const scale = Math.min(2, 720 / baseViewport.width);
+        const viewport = page.getViewport({ scale });
+
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        canvas.width = Math.floor(viewport.width);
+        canvas.height = Math.floor(viewport.height);
+
+        await page.render({ canvas, viewport }).promise;
+        if (cancelled) return;
+
+        setHighlight(await findExcerptBox(page, viewport, excerpt));
+      } catch (err: any) {
+        if (!cancelled) {
+          setRenderError(err?.message || 'Could not render the original page.');
+        }
+      } finally {
+        if (!cancelled) setIsRendering(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [card, pdfBytes, pageNumber, excerpt]);
+
   if (!card) return null;
 
+  const extractedPage = pages.find(p => p.pageNumber === card.grounding.pageNumber);
+  const usesPdf = Boolean(pdfBytes);
+
   return (
-    <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-2 sm:p-6 animate-in fade-in duration-150">
+    // `animate-in fade-in` were inert: they belong to `tailwindcss-animate`, which is not
+    // installed. The animation is now defined in the Tailwind theme and applied only when the
+    // person has not asked for reduced motion.
+    <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-2 sm:p-6 motion-safe:animate-jevdeck-fade-in">
       <div className="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-6xl h-[90vh] flex flex-col shadow-2xl overflow-hidden">
         {/* Modal Top Bar */}
         <div className="px-6 py-4 border-b border-slate-800 flex items-center justify-between bg-slate-950/60">
@@ -30,11 +143,18 @@ export const DualGroundingViewer: React.FC<Props> = ({ card, onClose }) => {
                 <h3 className="font-bold text-slate-100 text-sm sm:text-base">
                   Dual Grounding Inspection
                 </h3>
-                <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-950 border border-emerald-800 text-emerald-400 font-mono">
-                  {Math.round(card.grounding.confidenceScore * 100)}% Verbatim Match
+                {/*
+                  * The recorded checks, not a score. An earlier version showed "100% Grounding
+                  * Score" on every card: locating an excerpt and verifying a claim are separate
+                  * checks, and neither one produces a percentage.
+                  */}
+                <span className="text-xs px-2 py-0.5 rounded-full bg-slate-900 border border-slate-700 text-slate-400 font-mono">
+                  {card.grounding.validationCodes && card.grounding.validationCodes.length > 0
+                    ? `Checked: ${card.grounding.validationCodes.join(', ')}`
+                    : 'Checked: excerpt located in the stored page'}
                 </span>
               </div>
-              <p className="text-xs text-slate-400">
+              <p className="text-xs text-slate-400 truncate max-w-[240px] sm:max-w-md">
                 {card.grounding.sectionTitle} • Page {card.grounding.pageNumber}
               </p>
             </div>
@@ -48,7 +168,7 @@ export const DualGroundingViewer: React.FC<Props> = ({ card, onClose }) => {
           </button>
         </div>
 
-        {/* Dual Panels: Left = Excerpt & Card context, Right = Simulated Original Page PDF Viewer */}
+        {/* Dual Panels: Left = Excerpt & Card context, Right = Original page */}
         <div className="flex-1 grid grid-cols-1 lg:grid-cols-12 overflow-hidden">
           {/* Left Panel: Verified Excerpt & Card Synthesis */}
           <div className="lg:col-span-5 p-6 border-r border-slate-800/80 overflow-y-auto space-y-6 bg-slate-950/30">
@@ -74,17 +194,13 @@ export const DualGroundingViewer: React.FC<Props> = ({ card, onClose }) => {
                 </div>
                 {card.format === 'qa' ? (
                   <>
-                    <div className="text-sm font-semibold text-slate-100">
-                      {card.question}
-                    </div>
+                    <div className="text-sm font-semibold text-slate-100">{card.question}</div>
                     <div className="text-sm text-emerald-200 border-t border-emerald-900/60 pt-2">
                       {card.answer}
                     </div>
                   </>
                 ) : (
-                  <div className="text-sm text-slate-200">
-                    {card.clozeText}
-                  </div>
+                  <div className="text-sm text-slate-200">{card.clozeText}</div>
                 )}
               </div>
             </div>
@@ -97,51 +213,174 @@ export const DualGroundingViewer: React.FC<Props> = ({ card, onClose }) => {
             )}
           </div>
 
-          {/* Right Panel: Synchronized Original-Page PDF Viewer */}
+          {/* Right Panel: Original source page */}
           <div className="lg:col-span-7 bg-slate-950 flex flex-col overflow-hidden">
             <div className="px-4 py-2 border-b border-slate-800 flex items-center justify-between text-xs text-slate-400 bg-slate-900/50">
-              <span className="font-mono">PDF Viewer: Page {card.grounding.pageNumber}</span>
+              <span className="font-mono truncate max-w-[55%]">
+                {/* What this panel is actually showing, said plainly. */}
+                {usesPdf
+                  ? `Original PDF: ${documentName} — Page ${card.grounding.pageNumber}`
+                  : isDemo
+                    ? `Sample document — Page ${card.grounding.pageNumber}`
+                    : `Extracted text of ${documentName} — Page ${card.grounding.pageNumber}`}
+              </span>
               <div className="flex items-center gap-3">
-                <span className="text-[11px] bg-slate-800 px-2 py-0.5 rounded text-slate-300">100% Zoom</span>
-                <span className="text-emerald-400 flex items-center gap-1 font-semibold">
-                  <CheckCircle2 className="w-3.5 h-3.5" /> Highlighting Active Excerpt
-                </span>
+                {usesPdf && <span className="text-[11px] bg-slate-800 px-2 py-0.5 rounded text-slate-300">Fit width</span>}
+                {usesPdf && highlight && (
+                  <span className="text-emerald-400 flex items-center gap-1 font-semibold">
+                    <CheckCircle2 className="w-3.5 h-3.5" /> Excerpt located on page
+                  </span>
+                )}
+                {/* R4: when the excerpt cannot be located, say so instead of drawing nothing. */}
+                {usesPdf && !highlight && !isRendering && !renderError && (
+                  <span
+                    className="text-amber-400/90 font-mono text-[11px]"
+                    title="The cited text was not found in this page's text layer, so no rectangle is drawn."
+                  >
+                    Exact highlight unavailable
+                  </span>
+                )}
               </div>
             </div>
 
-            {/* Simulated Document Page with Realistic Academic Typography and Highlight */}
-            <div className="flex-1 overflow-y-auto p-6 sm:p-10 flex justify-center bg-slate-950">
-              <div className="bg-slate-900 text-slate-300 border border-slate-800 rounded-xl shadow-2xl p-8 sm:p-12 max-w-2xl w-full text-xs sm:text-sm font-serif leading-relaxed relative">
-                {/* Academic Header */}
-                <div className="border-b border-slate-800 pb-3 mb-6 flex justify-between text-[11px] font-mono text-slate-500 uppercase tracking-widest">
-                  <span>Principles of Neural Science • Section 1</span>
-                  <span>Page {card.grounding.pageNumber}</span>
+            <div className="flex-1 overflow-auto p-6 sm:p-8 flex justify-center bg-slate-950">
+              {usesPdf ? (
+                <div className="relative self-start">
+                  <canvas
+                    ref={canvasRef}
+                    className="rounded-xl border border-slate-800 shadow-2xl bg-white max-w-full h-auto"
+                  />
+                  {highlight && (
+                    <div
+                      className="absolute rounded-md bg-emerald-400/30 ring-2 ring-emerald-400/70 pointer-events-none"
+                      style={{
+                        left: highlight.left,
+                        top: highlight.top,
+                        width: highlight.width,
+                        height: highlight.height,
+                      }}
+                      title="Cited excerpt"
+                    />
+                  )}
+                  {isRendering && (
+                    <div className="absolute inset-0 flex items-center justify-center text-slate-300 gap-2 bg-slate-950/60 rounded-xl text-sm">
+                      <Loader2 className="w-4 h-4 animate-spin" /> Rendering original page...
+                    </div>
+                  )}
                 </div>
-
-                <p className="mb-4 text-slate-400">
-                  Synaptic mechanisms in the central nervous system demand exquisite temporal regulation. Active neurotransmitter vesicles congregate at the presynaptic grid, ready for calcium-triggered mobilization.
-                </p>
-
-                {/* Highlighted Excerpt Region */}
-                <div className="relative my-4 p-3 rounded-lg bg-emerald-500/15 border-l-4 border-emerald-400 text-slate-100 font-sans shadow-sm ring-1 ring-emerald-500/20">
-                  <div className="text-[10px] font-mono uppercase tracking-wider text-emerald-400 font-bold mb-1 flex items-center gap-1">
-                    <Sparkles className="w-3 h-3" /> Grounded Passage Target
+              ) : (
+                <div className="bg-slate-900 text-slate-300 border border-slate-800 rounded-xl shadow-2xl p-8 sm:p-12 max-w-2xl w-full text-xs sm:text-sm font-serif leading-relaxed">
+                  <div className="border-b border-slate-800 pb-3 mb-6 flex justify-between text-[11px] font-mono text-slate-500 uppercase tracking-widest">
+                    <span className="truncate max-w-[70%]">{documentName}</span>
+                    <span>Page {card.grounding.pageNumber}</span>
                   </div>
-                  {card.grounding.excerpt}
-                </div>
 
-                <p className="mt-4 text-slate-400">
-                  Subsequent downstream cascade elements recruit phosphorylation kinases to maintain equilibrium. When postsynaptic densities mature, morphological changes stabilize synaptic transmission efficiency across long timescales.
-                </p>
+                  {sourceNotRetained && (
+                    <p className="mb-4 text-[11px] text-amber-300/90 not-italic font-sans">
+                      The original file was not retained for this document (it exceeded the
+                      retention limit), so this is the extracted text rather than the page image.
+                    </p>
+                  )}
 
-                <div className="mt-12 pt-4 border-t border-slate-800 text-[10px] font-mono text-slate-600 text-center">
-                  --- End of Page {card.grounding.pageNumber} Document Render ---
+                  {extractedPage && extractedPage.text.length > 0 ? (
+                    <p className="whitespace-pre-wrap">
+                      {highlightExcerpt(extractedPage.text, card.grounding.excerpt)}
+                    </p>
+                  ) : (
+                    <p className="text-slate-500 italic">
+                      No extracted text is available for this page.
+                    </p>
+                  )}
+
+                  <div className="mt-12 pt-4 border-t border-slate-800 text-[10px] font-mono text-slate-600 text-center">
+                    --- End of Page {card.grounding.pageNumber} ---
+                  </div>
                 </div>
-              </div>
+              )}
             </div>
+
+            {renderError && (
+              <div className="px-4 py-3 border-t border-red-900/50 bg-red-950/30 text-xs text-red-300 flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 flex-shrink-0" />
+                <span>{renderError}</span>
+              </div>
+            )}
           </div>
         </div>
       </div>
     </div>
   );
 };
+
+/** Wraps the cited excerpt inside the extracted page text. */
+function highlightExcerpt(pageText: string, excerpt: string): React.ReactNode {
+  const index = pageText.indexOf(excerpt);
+  if (index === -1) return pageText;
+
+  return (
+    <>
+      {pageText.slice(0, index)}
+      <mark className="bg-emerald-500/25 text-emerald-100 rounded px-0.5 ring-1 ring-emerald-500/40">
+        {excerpt}
+      </mark>
+      {pageText.slice(index + excerpt.length)}
+    </>
+  );
+}
+
+/**
+ * Locates the cited excerpt in the page text layer and returns its bounding box
+ * in viewport pixels, so the viewer can highlight the passage on the real page.
+ */
+async function findExcerptBox(page: any, viewport: any, excerpt: string): Promise<HighlightBox | null> {
+  const target = normalizeForMatch(excerpt);
+  if (!target) return null;
+
+  const content = await page.getTextContent();
+  const spans: Array<{ start: number; end: number; item: any }> = [];
+  let buffer = '';
+
+  for (const item of content.items as Array<any>) {
+    if (typeof item.str !== 'string') continue;
+    const piece = normalizeForMatch(item.str);
+    if (!piece) continue;
+    const start = buffer.length;
+    buffer += piece + ' ';
+    spans.push({ start, end: buffer.length, item });
+  }
+
+  const index = buffer.indexOf(target);
+  if (index === -1) return null;
+
+  const end = index + target.length;
+  const hits = spans.filter(span => span.end > index && span.start < end);
+  if (hits.length === 0) return null;
+
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+
+  for (const hit of hits) {
+    const transform = hit.item.transform as number[];
+    const x = transform[4];
+    const y = transform[5];
+    const width = typeof hit.item.width === 'number' ? hit.item.width : 0;
+    const height = typeof hit.item.height === 'number' ? hit.item.height : Math.abs(transform[3]);
+
+    minX = Math.min(minX, x);
+    maxX = Math.max(maxX, x + width);
+    minY = Math.min(minY, y);
+    maxY = Math.max(maxY, y + height);
+  }
+
+  const [x1, y1] = viewport.convertToViewportPoint(minX, minY);
+  const [x2, y2] = viewport.convertToViewportPoint(maxX, maxY);
+
+  return {
+    left: Math.min(x1, x2),
+    top: Math.min(y1, y2),
+    width: Math.abs(x2 - x1),
+    height: Math.abs(y2 - y1),
+  };
+}

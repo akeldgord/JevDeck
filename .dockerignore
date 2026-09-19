@@ -1,0 +1,33 @@
+# Keep the image context to sources.
+#
+# Without this file, `COPY packages ./packages` also copies the host's `node_modules` and `dist`,
+# so the image would either reuse binaries built for another platform or skip installing
+# altogether. Local data, backups and evaluation reports must never enter an image.
+
+.git
+.github
+node_modules
+**/node_modules
+**/dist
+**/.turbo
+**/*.tsbuildinfo
+
+# Local databases, backups and generated output
+data/
+backups/
+evaluations/reports/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Environment files. Secrets belong in the deployment's environment, never in an image.
+.env
+.env.*
+*.pem
+*.key
+
+# Documentation and tests are not needed to run the server.
+docs/
+tests/
+CONTRIBUTING.md
+SECURITY.md

@@ -2,12 +2,25 @@
 @tailwind components;
 @tailwind utilities;
 
-:root {
-  font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
-}
+/*
+ * Fonts are declared in `tailwind.config.js` (`fontFamily.sans`/`fontFamily.mono`) instead of here,
+ * because `<body>` carries the `font-sans` utility and that utility wins over a `:root` rule. A
+ * declaration in this file alone left the downloaded webfont unused.
+ */
 
-code, pre, .font-mono {
-  font-family: 'JetBrains Mono', monospace;
+/*
+ * Motion policy. The interface is a study tool, so a person who has asked their system for less
+ * motion gets none of the decorative transitions; nothing here is load-bearing.
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 /* Custom scrollbar */
