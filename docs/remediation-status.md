@@ -2,12 +2,55 @@
 
 - **Date:** 19 September 2026
 - **Audited revision:** `0f81317` for sections 1–6 (that revision is on `origin/main`, and the note
-  below about the work being uncommitted is historical). Section 7 is the current status against
-  `docs/remediation-v2.md`, which supplements this spec and takes precedence where it corrects it.
+  below about the work being uncommitted is historical). The **Current status** section at the top
+  is the live one, against `docs/remediation-v3.md`; §7 is the earlier matrix against
+  `docs/remediation-v2.md`, which supplements the original spec and takes precedence where it
+  corrects it. Older sections below the current status are the historical record.
 - **Method:** re-read every work package and acceptance criterion, then check the code and run the
   stack. Evidence is named per row; claims without evidence are marked as such.
 - **Status vocabulary:** `implemented and verified` · `implemented but unverified` ·
   `blocked` · `not implemented`.
+
+## Current status — `docs/remediation-v3.md` (interim, step I pending)
+
+`docs/remediation-v3.md` was inspected at baseline `714e74b` and is an ordered implementation
+checklist (steps A–I) whose explicit decisions override contradictory comments and tests. This
+section is the interim matrix, and it is the current one: where an older section below disagrees
+with it, this section is right and that section is history. Step I replaces this with the single
+concise CURRENT STATUS table once the remaining steps are done.
+
+**Two claims in the historical `V2-5` row below are superseded and must not be read as current.**
+That row says a cancelled run “resumes the same way” and that `resume` answers `nothing_to_resume`
+for a run with no stored progress. Step B reverses both: cancellation is terminal for its job id
+and a resume of one answers `cancelled`, while a paused run that never dispatched anything is
+resumable because it has nothing to re-derive. The row is left as written because a status
+document that rewrites its own history is not evidence; the B row above is what happened.
+
+| Step | Status | Changed paths | Evidence | Remaining limitation |
+| --- | --- | --- | --- | --- |
+| **A — atomic publication** | **Implemented and verified** | `apps/worker/src/queue.ts` (`finaliseWithPublication` replaces `completeJob`/`clearCheckpoint`), `apps/worker/src/pipeline.ts`, `apps/worker/src/worker.ts`, `apps/worker/src/index.ts`, `apps/web/src/lib/api.ts`, `apps/web/src/App.tsx`, `tests/publication-atomicity.test.ts`, `tests/helpers/publishWorker.ts`, `tests/api-cancel.test.ts`, `docs/decisions/0012-atomic-publication.md`, `docs/architecture.md`, `docs/decisions/0009-resuming-an-interrupted-run.md` | 11 tests in `tests/publication-atomicity.test.ts`. The publication, the coverage figures, the counts, `finished_at`, the released lease and the checkpoint clear are one immediate transaction, gated on a re-read of state, worker id, live lease and pending stop requests whose affected-row count is the answer. An abort injected **after** every card, evidence row and concept is written — the trigger's own message reports those in-transaction counts, e.g. `cards=6 evidence=6 concepts=6` — commits none of them and leaves the checkpoint intact; the retry then finishes the run with **no** further provider call and no duplicated cards. A worker process killed while holding the database's write lock **inside the completion statement** (a deliberately slow trigger, with the parent waiting on a real `BEGIN IMMEDIATE` probe rather than a sleep) leaves the run `processing`, no cards and its checkpoint; a worker killed immediately **after** the commit leaves it `completed`, its cards counted, its checkpoint gone, and the stop endpoints answering `already_completed`. The gate is exercised on its own for its five refusals (pause, cancel, taken-over claim, expired lease, already completed) and for a rollback when the writing throws. As the regression proof, reverting the fix reproduces the defect: with the completion written outside the transaction the same kill leaves **6 cards and 6 concepts committed on an unfinished run**, and without the already-published guard a retry replaces all six card identities and deletes the review on one of them | A stale worker's *other* finalisations (`finalisePause`/`finaliseCancellation` from the failure handler) still write without an ownership check of their own; the publication is protected, and step C's claim epoch covers the rest. A run damaged by the previous code whose checkpoint was already cleared re-derives its paid calls before the guard completes it — stated, not hidden. Step B's transition table was implemented in the pass that followed and is recorded in the row below; nothing in this row depends on it |
+| **B — pause/cancel/resume transitions** | **Implemented and verified** | `apps/worker/src/queue.ts` (`resumeJob`, `requestPause`, `requestCancellation`, `cancelOutright`, `pauseOutright`, `recoverAbandonedStops`, `RESUME_ATTEMPT_ALLOWANCE`), `apps/worker/src/checkpoint.ts` (new; the identity check the queue and the loader share), `apps/worker/src/index.ts`, `apps/api/src/routes/resources.ts`, `apps/web/src/lib/api.ts`, `apps/web/src/App.tsx`, `apps/web/src/components/GenerationView.tsx`, `apps/web/src/components/GenerationResult.tsx`, `tests/api-resume.test.ts`, `tests/api-cancel.test.ts`, `docs/decisions/0008-cancelling-a-generation-run.md`, `docs/decisions/0009-resuming-an-interrupted-run.md`, `docs/architecture.md` | 10 tests in `tests/api-resume.test.ts` and 7 in `tests/api-cancel.test.ts`, all counting provider traffic rather than describing it. The eight rows of the table are each asserted: pending + pause → `paused` outright with no call at all, and resuming it completes the run with the extraction paid for **once** (`fromCheckpoint: false`, because a run that never dispatched has nothing to re-derive); processing + pause → `requested`, and the worker stops at its own boundary keeping its claim (the earlier shape, which took the lease off a run a worker was holding, is gone); paused + valid progress → `resumed` with the extraction traffic still at **one**; processing + resume → `already_running`; completed + resume → `completed`; cancelled + resume → **`cancelled`**, with `cancelRequestedAt` **not** cleared and the job not requeued, so the refusal costs nothing and the interface offers a new run instead; a checkpoint whose pipeline version does not apply → `restart_required` with its reason, the stored progress **still in the row**, and a second `/generate` creating a **new job id** that then completes (the “new run, new accounting history” rule); and two resumes issued at once → exactly one `resumed` and one `already_running`, with the run queued once. A stop request left behind by a dead worker is settled by `recoverAbandonedStops` — a paused run becomes `paused`, a cancelled one `failed`/`cancelled_by_user` — with **zero** provider calls between the two, and the settled pause is still resumable while the cancellation stays unqueuable. Pause, resume and cancel also refuse a request without the CSRF header (`csrf_failed`, run unchanged) and a run belonging to another account (404) | The transition updates are conditional statements whose affected-row count is checked, and a loser rereads and reports the actual state; the true interleaving between a resume's `SELECT` and its `UPDATE` cannot be produced inside one synchronous SQLite connection, so the lost-race branch is reached and asserted through the paths that are reproducible (a worker having claimed the run, a second resume arriving first) rather than by a white-box hook. A resume grants a new session's allowance by raising `max_attempts` to `attempts + RESUME_ATTEMPT_ALLOWANCE` instead of resetting the attempt history |
+| C — lease ownership (`claim_epoch`) | Not implemented | — | No `claim_epoch` column exists; claim loss is detected by worker id and live lease inside the finalisation transaction, which is not the same as a monotonic claim identity | — |
+| D — durable call results, complete checkpoint | Not implemented | — | Per-operation result records, per-concept outcomes in the checkpoint and the full fingerprint are absent. D4's administrator reconciliation of uncertain charges **is** implemented (migration `0008`, `POST /api/admin/budget/uncertain/:id/reconcile`) | — |
+| E — process-kill recovery tests | Partially implemented | `tests/helpers/publishWorker.ts`, `tests/publication-atomicity.test.ts` | Two of the five named kill points are real process kills against a temporary on-disk database with a controlled loopback provider: mid-transaction at the completion, and immediately after the commit | The other three points (after dispatch, after response recording, after checkpoint persistence) and the explicit test barriers they need are not implemented |
+| F — sources, sharing, OCR, export media | Not implemented | — | — | Shared-reader source access, PDF image extraction, OCR and APKG media are all still absent |
+| G — browser verification | Not implemented | — | — | No browser automation workflow exists |
+| H — installation and external checks | Not implemented for v3 | — | — | Container/Compose build, a restore rehearsal on a deployment, the live-model review and a real Anki import remain unperformed |
+| I — current status matrix and handoff | Interim | this section | This table is the interim record | The single required CURRENT STATUS table, with the superseded narratives below it, comes with step I |
+
+### Verification performed for this pass
+
+| Check | Result |
+| --- | --- |
+| `bun run typecheck` (`tsc -b`) | Clean |
+| `bun test` | **431 pass, 0 fail**, 30 files (was 417 / 29 before step A) |
+| Step A suite | `tests/publication-atomicity.test.ts` — 11 pass, 0 fail, 150 expectations |
+| Mutation check 1: completion outside the transaction | → the killed-worker case fails with **6 cards and 6 concepts committed on a run that is not completed** |
+| Mutation check 2: no already-published guard | → the recovery case fails with six **new** card ids in place of the published ones, and the review on the original card gone |
+| Step B suites | `tests/api-resume.test.ts` — 10 pass, 0 fail, 180 expectations; `tests/api-cancel.test.ts` — 7 pass, 0 fail, 92 expectations |
+| Step B behaviour change caught by the old tests | Four cases in `tests/api-resume.test.ts` failed against the new code before they were corrected, each one asserting the behaviour step B reverses: `nothing_to_resume`, resume overriding a cancellation, and the pause of a held run being applied outright. The v3 checklist states its decisions override contradictory tests, so the cases were rewritten to the table above rather than the code bent back to them |
+| Restored | Both mutations reverted; the full suite re-run green as above |
+| Preview | Not exercised for this pass: this workspace exposes no preview command, and the change is server-side worker code. The behaviour is asserted by the suites above rather than through a running server |
 
 This file is the requirement-to-evidence matrix required by §7 of the remediation specification.
 The findings with evidence are in the sections below it.
@@ -510,6 +553,10 @@ Every work package now has an implemented or explicitly absent status, and no ro
 8. **R8 — ingestion breadth.** Not implemented. The only work package with no code behind it.
 
 ## 7. Remediation v2 (`docs/remediation-v2.md`) — current status
+
+> **Superseded by the Current status section at the top.** `docs/remediation-v3.md` is the current
+ordered checklist; its explicit decisions override the implementation comments and tests quoted in
+this section.
 
 `docs/remediation-v2.md` reviewed `0f81317` and named six items. This section is the current
 matrix; where it disagrees with §1, §1 is the historical record.

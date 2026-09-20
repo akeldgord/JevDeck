@@ -8,7 +8,7 @@ import { ServerConfig, loadConfig } from '../apps/api/src/config';
 import { startServer, type RunningServer } from '../apps/api/src/server';
 import { createGenerationProvider } from '../packages/providers/src';
 import { GenerationWorker } from '../apps/worker/src/worker';
-import { claimNextJob, requireJob } from '../apps/worker/src/queue';
+import { RESUME_ATTEMPT_ALLOWANCE, claimNextJob, requireJob } from '../apps/worker/src/queue';
 import { startStubProvider, type StubProvider } from './helpers/stubProvider';
 
 /**
@@ -314,11 +314,19 @@ describe('Pausing and resuming a run that is under way', () => {
     drainQueue();
     expect(claimNextJob(workerDb, { workerId: 'wrk_nobody' })?.id).not.toBe(jobId);
 
+    const attemptsBefore = readRow(jobId).attempts;
+
     const resumed = await admin.call(`/api/jobs/${jobId}/resume`, { method: 'POST' });
     expect(resumed.status).toBe(200);
     expect(resumed.body.outcome).toBe('resumed');
     expect(resumed.body.fromCheckpoint).toBe(true);
     expect(resumed.body.job.state).toBe('pending');
+
+    // The resume grants a fresh retry allowance *without* laundering the history: the attempt the
+    // earlier session spent is still on the record, and the job simply has room for more.
+    const resumedRow = readRow(jobId);
+    expect(resumedRow.attempts).toBe(attemptsBefore);
+    expect(resumedRow.max_attempts).toBeGreaterThanOrEqual(attemptsBefore + RESUME_ATTEMPT_ALLOWANCE);
 
     const extractionCallsBefore = countSince(marker, 'extract_concepts');
     expect(extractionCallsBefore).toBe(1);
@@ -388,9 +396,10 @@ describe('An interrupted run', () => {
     expect(stored.body.cards.length).toBe(retried!.cardCount);
   });
 
-  it('refuses a checkpoint that was written for another pipeline, and redoes the work instead', async () => {
-    const { jobId } = await queueRun('resume-foreign.pdf');
+  it('refuses to continue a checkpoint written for another pipeline, and starting over is a new job', async () => {
     const marker = stub.requests.length;
+    const queued = await queueRun('resume-foreign.pdf');
+    const { deckId, jobId } = queued;
 
     const worker = buildWorker('wrk_resume_foreign');
     expect(claimNextJob(workerDb, { workerId: 'wrk_resume_foreign' })?.id).toBe(jobId);
@@ -413,22 +422,43 @@ describe('An interrupted run', () => {
       .run(JSON.stringify(progress), jobId);
 
     const resumed = await admin.call(`/api/jobs/${jobId}/resume`, { method: 'POST' });
-    expect(resumed.body.outcome).toBe('resumed');
-    // The job still has *a* checkpoint, which is what resume requires; whether it applies is
-    // decided by the loader, and this case is about the loader.
-    expect(resumed.body.fromCheckpoint).toBe(true);
+    // Refused, in words, rather than spending again under the label “resume”. The progress that
+    // does not apply is *kept* — it is the record of what was paid for — and the run stays stopped.
+    expect(resumed.body.outcome).toBe('restart_required');
+    expect(resumed.body.resumed).toBe(false);
+    expect(resumed.body.fromCheckpoint).toBe(false);
+    expect(resumed.body.reason).toContain('pipeline');
+    expect(resumed.body.job.state).toBe('paused');
+    expect(readCheckpoint(jobId)!.pipelineVersion).toBe('some-earlier-pipeline');
+
+    // It is not queued: nothing hands it to a worker that would continue progress it must not use.
+    expect(claimNextJob(workerDb, { workerId: 'wrk_never_claims_foreign' })?.id).not.toBe(jobId);
+    expect(countSince(marker, 'extract_concepts')).toBe(1);
+
+    // Starting over is a new run with its own accounting history — the same deck, a second job
+    // whose concepts were derived under the code actually deployed.
+    const restarted = await admin.call(`/api/decks/${deckId}/generate`, {
+      method: 'POST',
+      body: { coverage: 'comprehensive', sectionIds: (await admin.call(`/api/jobs/${jobId}`)).body.job.selectedSectionIds },
+    });
+    expect(restarted.status).toBe(202);
+    expect(restarted.body.job.id).not.toBe(jobId);
 
     const finished = await buildWorker('wrk_resume_foreign_2').runOnce();
     expect(finished?.state).toBe('completed');
     expect(finished?.cardCount).toBeGreaterThan(0);
+    // The work that finished is the new job, and the refused one is still exactly as it was.
+    expect(readRow(restarted.body.job.id).state).toBe('completed');
+    expect(readRow(jobId).state).toBe('paused');
 
-    // Extraction ran again, because nothing stored applied to this run.
+    // The new run derived its own concepts; the refused run's stored progress is still its own.
     expect(countSince(marker, 'extract_concepts')).toBe(2);
+    expect(readCheckpoint(jobId)!.pipelineVersion).toBe('some-earlier-pipeline');
   });
 });
 
 describe('A run cancelled while it was running', () => {
-  it('keeps the progress it had, so stopping to stop spending is not destructive', async () => {
+  it('is terminal: it keeps the progress it had, and resuming it is refused rather than requeued', async () => {
     const { deckId, jobId } = await queueRun('resume-cancelled.pdf');
     const marker = stub.requests.length;
 
@@ -457,36 +487,40 @@ describe('A run cancelled while it was running', () => {
     const beforeResume = await admin.call(`/api/decks/${deckId}/cards`);
     expect(beforeResume.body.cards).toHaveLength(0);
 
+    // Cancellation is terminal for this job id. Resuming is refused as cancelled — the stop flag is
+    // deliberately *not* cleared, because the money and the attempt history belong to a run that
+    // was stopped on purpose — and nothing is queued for a worker to run.
     const resumed = await admin.call(`/api/jobs/${jobId}/resume`, { method: 'POST' });
-    expect(resumed.body.outcome).toBe('resumed');
-    expect(resumed.body.fromCheckpoint).toBe(true);
-    // Resuming overrides the earlier stop, so the queue may hand the run out again.
-    expect(resumed.body.job.cancelRequestedAt).toBeNull();
+    expect(resumed.body.outcome).toBe('cancelled');
+    expect(resumed.body.resumed).toBe(false);
+    expect(resumed.body.job.state).toBe('failed');
+    expect(resumed.body.job.cancelRequestedAt).not.toBeNull();
 
-    const finished = await buildWorker('wrk_resume_cancelled_2').runOnce();
-    expect(finished?.state).toBe('completed');
-    expect(finished?.cardCount).toBeGreaterThan(0);
+    expect(claimNextJob(workerDb, { workerId: 'wrk_resume_cancelled_2' })).toBeNull();
 
-    // The extraction the first attempt paid for was not paid for again.
+    // The refusal cost nothing: the extraction the first attempt paid for was paid for once.
     expect(countSince(marker, 'extract_concepts')).toBe(1);
 
+    // And the work it had paid for is still readable — cancelling ends the run, not its record.
+    expect(readCheckpoint(jobId)!.candidates.length).toBeGreaterThan(0);
+
     const stored = await admin.call(`/api/decks/${deckId}/cards`);
-    expect(stored.body.cards.length).toBe(finished!.cardCount);
+    expect(stored.body.cards).toHaveLength(0);
   });
 });
 
-describe('Refusing to resume nothing', () => {
-  it('answers nothing_to_resume for a run with no stored progress', async () => {
+describe('Refusing to resume what cannot be resumed', () => {
+  it('refuses a run cancelled before it started, where a paused one with no progress would resume', async () => {
     const { jobId } = await queueRun('resume-nothing.pdf');
 
-    // Cancelled before it started: terminal, and there is nothing to continue.
+    // Cancelled before it started: terminal for this job id, checkpoint or no checkpoint.
     const cancelled = await admin.call(`/api/jobs/${jobId}/cancel`, { method: 'POST' });
     expect(cancelled.body.outcome).toBe('cancelled');
     expect(cancelled.body.job.hasCheckpoint).toBe(false);
 
     const resumed = await admin.call(`/api/jobs/${jobId}/resume`, { method: 'POST' });
     expect(resumed.status).toBe(200);
-    expect(resumed.body.outcome).toBe('nothing_to_resume');
+    expect(resumed.body.outcome).toBe('cancelled');
     expect(resumed.body.resumed).toBe(false);
     expect(resumed.body.job.state).toBe('failed');
   });
@@ -560,5 +594,114 @@ describe('A queued run that is paused before a worker reaches it', () => {
 
     drainQueue();
     expect(claimNextJob(workerDb, { workerId: 'wrk_paused_never' })).toBeNull();
+
+    // And it is resumable, which is the point: a run that never dispatched anything has nothing to
+    // re-derive, so it does not need a checkpoint to be safe to continue (remediation v3, step B).
+    const resumed = await admin.call(`/api/jobs/${jobId}/resume`, { method: 'POST' });
+    expect(resumed.body.outcome).toBe('resumed');
+    expect(resumed.body.resumed).toBe(true);
+    expect(resumed.body.fromCheckpoint).toBe(false);
+    expect(resumed.body.job.state).toBe('pending');
+    expect(resumed.body.job.pauseRequestedAt).toBeNull();
+
+    const finished = await buildWorker('wrk_paused_never_2').runOnce();
+    expect(finished?.state).toBe('completed');
+    expect(finished?.cardCount).toBeGreaterThan(0);
+    // The run that finished is the one that was paused and resumed: same job id, one attempt.
+    const finishedRow = readRow(jobId);
+    expect(finishedRow.state).toBe('completed');
+    expect(finishedRow.attempts).toBe(1);
+
+    // The pause and its resume cost nothing: the plan was derived once, by the run that finished.
+    expect(countSince(marker, 'extract_concepts')).toBe(1);
+  });
+});
+describe('The transition table', () => {
+  /**
+   * Stands in for a worker that took a job, asked its provider something, and died: the row is
+   * `processing`, held by a worker that will never renew its lease, with a stop the owner asked for
+   * that nothing alive can honour.
+   */
+  function abandonToStop(jobId: string, stop: 'pause' | 'cancel'): void {
+    workerDb
+      .prepare(
+        `UPDATE generation_jobs
+            SET state = 'processing',
+                worker_id = 'wrk_died',
+                attempts = 1,
+                lease_expires_at = ?,
+                pause_requested_at = ?,
+                cancel_requested_at = ?
+          WHERE id = ?`
+      )
+      .run(
+        new Date(Date.now() - 60_000).toISOString(),
+        stop === 'pause' ? new Date().toISOString() : null,
+        stop === 'cancel' ? new Date().toISOString() : null,
+        jobId
+      );
+  }
+
+  it('settles a stop request left behind by a dead worker, without another provider call', async () => {
+    drainQueue();
+    const paused = await queueRun('state-machine-pause.pdf');
+    const cancelled = await queueRun('state-machine-cancel.pdf');
+
+    abandonToStop(paused.jobId, 'pause');
+    abandonToStop(cancelled.jobId, 'cancel');
+
+    const marker = stub.requests.length;
+
+    // No worker can honour these, so the queue settles them rather than handing either to somebody
+    // new — and the settling itself spends nothing, because no provider call is involved.
+    expect(claimNextJob(workerDb, { workerId: 'wrk_successor' })).toBeNull();
+    expect(stub.requests.length).toBe(marker);
+
+    const pausedRow = readRow(paused.jobId);
+    expect(pausedRow.state).toBe('paused');
+    expect(pausedRow.error_code).toBe('paused_by_user');
+    expect(pausedRow.worker_id).toBeNull();
+    expect(pausedRow.lease_expires_at).toBeNull();
+
+    const cancelledRow = readRow(cancelled.jobId);
+    expect(cancelledRow.state).toBe('failed');
+    expect(cancelledRow.error_code).toBe('cancelled_by_user');
+    expect(cancelledRow.worker_id).toBeNull();
+    expect(cancelledRow.finished_at).not.toBeNull();
+
+    // Settling a pause is not an ending: the run is still continuable, and the resumed run is the
+    // one the queue then hands out.
+    const resumed = await admin.call(`/api/jobs/${paused.jobId}/resume`, { method: 'POST' });
+    expect(resumed.body.outcome).toBe('resumed');
+    expect(resumed.body.job.state).toBe('pending');
+    expect(claimNextJob(workerDb, { workerId: 'wrk_successor' })?.id).toBe(paused.jobId);
+
+    // A settled cancellation is terminal: it is not requeued even though its own stop flag is set.
+    expect(claimNextJob(workerDb, { workerId: 'wrk_successor' })).toBeNull();
+  });
+
+  it('lets exactly one of two simultaneous resumes through, and reports both truthfully', async () => {
+    drainQueue();
+    const { jobId } = await queueRun('state-machine-race.pdf');
+
+    const paused = await admin.call(`/api/jobs/${jobId}/pause`, { method: 'POST' });
+    expect(paused.body.outcome).toBe('paused');
+
+    // Both requests are in the air at once, which is what a double-click sends.
+    const [first, second] = await Promise.all([
+      admin.call(`/api/jobs/${jobId}/resume`, { method: 'POST' }),
+      admin.call(`/api/jobs/${jobId}/resume`, { method: 'POST' }),
+    ]);
+
+    const outcomes = [first.body.outcome, second.body.outcome].sort();
+    expect(outcomes).toEqual(['already_running', 'resumed']);
+
+    // The truthfulness is as much the point as the count: only the winner says it resumed.
+    expect([first, second].filter(response => response.body.resumed)).toHaveLength(1);
+    expect([first, second].filter(response => response.body.job.state === 'pending')).toHaveLength(2);
+
+    // One transition happened, so the run is queued once and no second attempt was invented.
+    expect(readRow(jobId).attempts).toBe(0);
+    expect(claimNextJob(workerDb, { workerId: 'wrk_race' })?.id).toBe(jobId);
   });
 });

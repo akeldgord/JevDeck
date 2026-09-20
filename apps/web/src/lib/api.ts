@@ -698,15 +698,18 @@ export const api = {
   /**
    * Asks a generation run to stop.
    *
-   * `outcome` says what actually happened: `cancelled` when the run was stopped outright (it had
-   * not started, so no provider call was in flight), `requested` when a worker holds it and will
-   * stop at its next paid call, and `already_finished` when there was nothing left to stop.
+   * `outcome` says what actually happened: `cancelled` when the run was stopped outright (nothing
+   * held it, so no provider call was in flight — including a run that had already paused or
+   * failed), `requested` when a worker holds it and will stop at its next paid call,
+   * `already_completed` when it finished before the request arrived (the run and its stop raced,
+   * and the run won) and `already_cancelled` when it was cancelled already.
    */
   cancelJob: (id: string) =>
-    request<{ outcome: 'cancelled' | 'requested' | 'already_finished'; stopped: boolean; job: GenerationJob }>(
-      `/api/jobs/${id}/cancel`,
-      { method: 'POST' }
-    ),
+    request<{
+      outcome: 'cancelled' | 'requested' | 'already_completed' | 'already_cancelled';
+      stopped: boolean;
+      job: GenerationJob;
+    }>(`/api/jobs/${id}/cancel`, { method: 'POST' }),
 
   /**
    * Stops a run and keeps what it has already paid for, so it can be continued later.
@@ -715,22 +718,33 @@ export const api = {
    * it again from there.
    */
   pauseJob: (id: string) =>
-    request<{ outcome: 'paused' | 'requested' | 'already_finished'; stopped: boolean; job: GenerationJob }>(
-      `/api/jobs/${id}/pause`,
-      { method: 'POST' }
-    ),
+    request<{
+      outcome:
+        | 'paused'
+        | 'requested'
+        | 'already_paused'
+        | 'already_completed'
+        | 'already_cancelled'
+        | 'already_stopped';
+      stopped: boolean;
+      job: GenerationJob;
+    }>(`/api/jobs/${id}/pause`, { method: 'POST' }),
 
   /**
    * Queues a stopped run again so it continues from its stored progress.
    *
-   * `outcome` is one of `resumed`, `already_running`, `completed` or `nothing_to_resume`; the last
-   * means there is no checkpoint, and the server refuses rather than quietly starting the run over.
+   * `outcome` is one of `resumed`, `already_running`, `completed`, `cancelled` or
+   * `restart_required`. `fromCheckpoint` says whether a resumed run continues from stored progress
+   * or starts its plan again; `cancelled` is terminal and starting over is a new run; and
+   * `restart_required` carries the `reason` its stored progress cannot be used, so the screen can
+   * offer a new run instead of spending again under the label “resume”.
    */
   resumeJob: (id: string) =>
     request<{
-      outcome: 'resumed' | 'already_running' | 'completed' | 'nothing_to_resume';
+      outcome: 'resumed' | 'already_running' | 'completed' | 'cancelled' | 'restart_required';
       fromCheckpoint: boolean;
       resumed: boolean;
+      reason: string | null;
       job: GenerationJob;
     }>(`/api/jobs/${id}/resume`, { method: 'POST' }),
 

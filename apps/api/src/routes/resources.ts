@@ -1234,16 +1234,21 @@ export function registerResourceRoutes(router: Router): void {
   });
 
   /**
-   * Stops a generation run the caller owns.
+   * Stops a generation run the caller owns, for good.
    *
    * Owner-scoped by the lookup itself, so someone else's job id is a 404 rather than a refusal
    * that confirms the id exists. Cancelling is idempotent in the sense that matters: a job already
    * finished is reported as such and left exactly as it is, because rewriting a completed run's
-   * record to say it was cancelled would be a lie about what happened.
+   * record to say it was cancelled would be a lie about what happened; a job already cancelled is
+   * `already_cancelled`.
    *
-   * A pending job stops immediately — no worker holds it, so no provider call is in flight. A job
-   * being processed is asked to stop, and the worker that holds it stops before its next paid
-   * call; the response says which of the two happened rather than pretending the run is over.
+   * A run that has already stopped for another reason — paused, or failed with progress it could
+   * continue from — is *made* terminal by this call rather than reported as something else:
+   * cancellation is a decision about the run, and this is the call that makes it. The earlier
+   * reason is kept in the message. A pending job stops immediately, because no worker holds it and
+   * no provider call is in flight; a job being processed is asked to stop, and the worker that
+   * holds it stops before its next paid call. The response says which of those happened rather than
+   * pretending the run is over.
    */
   router.post('/api/jobs/:id/cancel', async ctx => {
     assertOriginAllowed(ctx);
@@ -1267,6 +1272,10 @@ export function registerResourceRoutes(router: Router): void {
    * and can be continued by `resume`, while a cancelled one is terminal. A run nobody holds stops
    * outright; one a worker holds is asked to stop before its next provider call, exactly as a
    * cancellation is, and the response says which happened rather than guessing.
+   *
+   * On a run that is already stopped this is a no-op, and each case is named: `already_paused`,
+   * `already_completed`, `already_cancelled`, or `already_stopped` for a run that failed and still
+   * holds the progress a resume would continue from. Nothing is rewritten to look like a pause.
    */
   router.post('/api/jobs/:id/pause', async ctx => {
     assertOriginAllowed(ctx);
@@ -1287,10 +1296,19 @@ export function registerResourceRoutes(router: Router): void {
    * Queues a stopped run again so it continues from where it left off.
    *
    * Every outcome is a `200`, because each one is a truthful answer about the run rather than a
-   * failure of the request: `resumed` (it is queued again, from stored progress), `already_running`
-   * (it is in the queue already), `completed` (there is nothing to continue) and
-   * `nothing_to_resume` (no checkpoint, so continuing it would silently start the plan over — which
-   * is the outcome this endpoint exists to refuse).
+   * failure of the request:
+   *
+   * - `resumed` — it is queued again. `fromCheckpoint` says whether it continues from stored
+   *   progress or starts its plan again, and a run that never dispatched anything is safe to
+   *   queue without a checkpoint: it has nothing to re-derive.
+   * - `already_running` — it is in the queue already, so queueing it again would be a second run.
+   * - `completed` — there is nothing to continue.
+   * - `cancelled` — cancellation is terminal for that job id; starting over is a new run with its
+   *   own accounting history, which is what the interface offers instead.
+   * - `restart_required` — it is stopped and the progress it holds does not apply to it (the source
+   *   version, coverage mode, section selection, checkpoint format or pipeline changed). Its reason
+   *   is returned, the stored progress is left where it is, and the caller is told to start a new
+   *   run rather than spending again under the label “resume”.
    */
   router.post('/api/jobs/:id/resume', async ctx => {
     assertOriginAllowed(ctx);
@@ -1304,6 +1322,8 @@ export function registerResourceRoutes(router: Router): void {
       outcome: result.outcome,
       fromCheckpoint: result.fromCheckpoint,
       resumed: result.outcome === 'resumed',
+      // Only present for `restart_required`: why the stored progress cannot be continued.
+      reason: result.reason ?? null,
       job: toContractJob(requireJob(ctx.db, ctx.params.id)),
     });
   });

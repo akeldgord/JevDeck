@@ -28,6 +28,12 @@ import {
   type TokenUsage,
 } from '@jevdeck/providers';
 import {
+  CHECKPOINT_VERSION,
+  PIPELINE_VERSION,
+  checkpointFor,
+  type CheckpointIdentity,
+} from './checkpoint';
+import {
   buildSectionScopes,
   expandSelectedSections,
   loadStoredSource,
@@ -38,11 +44,10 @@ import {
 } from './source';
 import {
   cancellationRequested,
-  clearCheckpoint,
-  completeJob,
   failJob,
   finaliseCancellation,
   finalisePause,
+  finaliseWithPublication,
   isJobCancelled,
   isJobPaused,
   JobCancelledError,
@@ -79,7 +84,7 @@ import {
  * into something that looks acceptable.
  */
 
-export const PIPELINE_VERSION = 'r3-2';
+export { CHECKPOINT_VERSION, PIPELINE_VERSION };
 
 /** Upper bound on concepts requested for one job. */
 export const MAX_CONCEPTS = 120;
@@ -106,7 +111,7 @@ export interface RunOptions {
 
 export interface RunOutcome {
   /** `paused` is a stop the owner asked for; the run keeps its checkpoint and can be continued. */
-  state: 'completed' | 'failed' | 'paused' | 'pending';
+  state: 'completed' | 'failed' | 'paused' | 'pending' | 'claim_lost';
   conceptCount: number;
   cardCount: number;
   errorCode?: string;
@@ -544,49 +549,44 @@ export interface RunCheckpoint {
   savedAt: string;
 }
 
-/** Bumped when the checkpoint's shape changes, which invalidates stored progress. */
-export const CHECKPOINT_VERSION = 1;
-
 /**
  * Reads this job's unfinished work, or `null` when there is none that still applies.
  *
- * A checkpoint that cannot be trusted is discarded rather than repaired: doing the work again is
- * slower and dearer, while continuing work that does not belong to this run would be wrong.
+ * The verdict comes from `checkpoint.ts`, which is also what the queue asks before it agrees to
+ * queue a stopped run again: the two must agree about what applies, or a run could be handed back
+ * on the strength of progress this pipeline then refuses to use. Progress that does not apply is
+ * discarded here rather than repaired — doing the work again is slower and dearer, while continuing
+ * work that belongs to different material would be wrong.
  */
 function loadCheckpoint(db: Database, job: GenerationJobRow): RunCheckpoint | null {
-  const raw = readCheckpoint(db, job.id);
-  if (!raw) return null;
+  const verdict = checkpointFor<RunCheckpoint>(checkpointIdentity(job), readCheckpoint(db, job.id));
+  if (verdict.status !== 'valid') return null;
 
-  try {
-    const parsed = JSON.parse(raw) as Partial<RunCheckpoint>;
+  const stored = verdict.checkpoint;
+  const selectedNow = readSectionIds(job);
 
-    if (parsed.version !== CHECKPOINT_VERSION) return null;
-    if (parsed.pipelineVersion !== PIPELINE_VERSION) return null;
-    if (parsed.documentVersionId !== job.document_version_id) return null;
-    if (parsed.coverage !== job.coverage) return null;
-    if (!Array.isArray(parsed.candidates) || !Array.isArray(parsed.accepted)) return null;
+  return {
+    version: CHECKPOINT_VERSION,
+    pipelineVersion: PIPELINE_VERSION,
+    documentVersionId: job.document_version_id,
+    coverage: job.coverage,
+    selectedSectionIds: selectedNow,
+    conceptBatchCount: stored.conceptBatchCount ?? 0,
+    completedConceptBatches: stored.completedConceptBatches ?? 0,
+    candidates: stored.candidates,
+    completedCardBatches: stored.completedCardBatches ?? 0,
+    accepted: stored.accepted,
+    savedAt: stored.savedAt ?? new Date().toISOString(),
+  };
+}
 
-    const selectedNow = readSectionIds(job);
-    const storedSelection = [...(parsed.selectedSectionIds ?? [])].sort().join('\u0000');
-    if (storedSelection !== [...selectedNow].sort().join('\u0000')) return null;
-
-    return {
-      version: CHECKPOINT_VERSION,
-      pipelineVersion: PIPELINE_VERSION,
-      documentVersionId: job.document_version_id,
-      coverage: job.coverage,
-      selectedSectionIds: selectedNow,
-      conceptBatchCount: parsed.conceptBatchCount ?? 0,
-      completedConceptBatches: parsed.completedConceptBatches ?? 0,
-      candidates: parsed.candidates,
-      completedCardBatches: parsed.completedCardBatches ?? 0,
-      accepted: parsed.accepted,
-      savedAt: parsed.savedAt ?? new Date().toISOString(),
-    };
-  } catch {
-    // Unreadable progress is a reason to do the work again, not a reason to fail the run.
-    return null;
-  }
+/** The job fields a stored checkpoint has to agree with before this pipeline will apply it. */
+function checkpointIdentity(job: GenerationJobRow): CheckpointIdentity {
+  return {
+    documentVersionId: job.document_version_id,
+    coverage: job.coverage,
+    selectedSectionIds: readSectionIds(job),
+  };
 }
 
 function buildConceptRequest(
@@ -610,9 +610,11 @@ function buildConceptRequest(
 /**
  * Runs one job to completion.
  *
- * Everything the provider produced is held in memory until the end, then written in a single
- * transaction together with the job's final state. A crash part-way through therefore leaves the
- * job claimable rather than leaving half a deck published.
+ * Everything the provider produced is held in memory until the end, then published by the same
+ * transaction that marks the run finished and drops its checkpoint. A crash part-way through
+ * therefore leaves the job claimable — with the progress it had already paid for — rather than
+ * leaving half a deck published, and a crash between the publication and the completion it used to
+ * race against is no longer a state the database can hold.
  */
 export async function runGenerationJob(
   db: Database,
@@ -872,7 +874,7 @@ export async function runGenerationJob(
   }
 
   // -------------------------------------------------------------------------
-  // 4. Duplicate check, then persist everything in one transaction
+  // 4. Duplicate check, then publish in the transaction that finishes the run
   // -------------------------------------------------------------------------
 
   const kept = dropDuplicateCards(accepted, withhold);
@@ -880,7 +882,30 @@ export async function runGenerationJob(
   const now = new Date().toISOString();
   const includedIndex = new Map(included.map((concept, index) => [concept, index]));
 
-  db.transaction(() => {
+  /**
+   * Writes everything the run produced: cards, their evidence, the concept inventory with its
+   * decisions, the deck's card count and the omissions.
+   *
+   * Never called on its own. It runs inside the finalisation transaction, so these rows cannot be
+   * committed unless the run's own completion is committed with them — which is the difference
+   * between a crash losing the last write and a crash leaving a published deck that the job still
+   * reports as unfinished.
+   */
+  const publish = (): void => {
+    // A previous finalisation of this job already committed its cards: the state the earlier,
+    // non-atomic code could leave behind when a process died between publishing the cards and
+    // recording that the run had finished. Those cards, their evidence and any reviews on them are
+    // this run's record already, so they are kept exactly as they are — replacing them would reset
+    // card identities a learner may have studied — and only the completion written above, which
+    // carries the figures and drops the now-stale checkpoint, is missing.
+    const published = db
+      .query(
+        'SELECT COUNT(*) AS n FROM generation_concepts WHERE job_id = ? AND card_id IS NOT NULL'
+      )
+      .get(job.id) as { n: number };
+
+    if (published.n > 0) return;
+
     // A re-run replaces this job's own output rather than appending to it. Deleted in dependency
     // order: evidence, then cards, then the concepts the cards belong to.
     const previousConceptIds = db
@@ -1013,17 +1038,63 @@ export async function runGenerationJob(
       now,
       job.id
     );
-  })();
+  };
 
-  // The stored cards are now the record of this run; a checkpoint that outlived them would be a
-  // second, stale account of the same work.
-  clearCheckpoint(db, job.id);
+  // The lease is renewed immediately before the finalisation so that a long run does not lose the
+  // right to publish work it has just finished computing to a lease that expired while it worked.
+  // Renewal cannot revive a claim somebody else has taken: the transaction below re-checks the
+  // worker id along with the lease, the state and any stop request.
+  renewLease(db, job.id, workerId, leaseSeconds);
 
-  completeJob(db, job.id, {
-    coverageSummary: summary,
-    conceptCount: coverage.inventory.length,
-    cardCount: kept.length,
-  });
+  const finalised = finaliseWithPublication(
+    db,
+    job.id,
+    {
+      coverageSummary: summary,
+      conceptCount: coverage.inventory.length,
+      cardCount: kept.length,
+      workerId,
+    },
+    publish
+  );
+
+  // Finished already. The run's own stored figures are the answer, its cards are left as they are,
+  // and nothing is paid for a second time.
+  if (finalised.outcome === 'already_completed') {
+    return {
+      state: 'completed',
+      conceptCount: finalised.stored.conceptCount,
+      cardCount: finalised.stored.cardCount,
+    };
+  }
+
+  // A stop that arrived before the transaction: nothing was published, so the run is recorded as
+  // paused or cancelled exactly as it would have been had the stop been seen one call earlier.
+  if (finalised.outcome === 'stopped') {
+    const progress = { concepts: context.progress.concepts, cards: kept.length };
+
+    return recordFailure(
+      db,
+      job,
+      finalised.stop === 'cancelled'
+        ? new JobCancelledError(job.id, progress)
+        : new JobPausedError(job.id, progress),
+      progress
+    );
+  }
+
+  // Another worker holds this job now. This worker has no authority over it: no publication, no
+  // failure recorded, no checkpoint rewritten. What it spent is already in the ledger under its
+  // own attempt ids, which is the accounting's business and not the job's.
+  if (finalised.outcome === 'claim_lost') {
+    return {
+      state: 'claim_lost',
+      conceptCount: coverage.inventory.length,
+      cardCount: 0,
+      message:
+        'Another worker took this run over while it was finishing, so this worker left it untouched.',
+    };
+  }
 
   return {
     state: 'completed',

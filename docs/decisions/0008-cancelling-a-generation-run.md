@@ -25,12 +25,27 @@ write that pretends the run has already stopped.**
 - A run that is `pending` is finished outright, because no worker holds it and no provider call is
   in flight. A run that is `processing` only gets the request; the worker that holds it turns that
   into the terminal state.
+- A run that has already stopped for another reason — a pause, a recoverable failure — is *made*
+  terminal by a cancellation rather than reported as something else: cancellation is a decision
+  about the run, not a description of how it happened to stop. The earlier reason is kept in the
+  sentence.
+- **Cancellation is terminal for that job id, permanently.** The request is never cleared, the run
+  is never requeued, and `POST /api/jobs/:id/resume` refuses it as `cancelled` (see `0009` for the
+  transition table). Starting over is a **new job** with its own attempts, its own usage ledger and
+  its own budget history — which is the only way to start over without laundering the money the
+  cancelled run already spent.
 - The terminal outcome is `state = 'failed'` with `error_code = 'cancelled_by_user'`, and the
   sentence in `error_message` / `omission_reasons` says how far the run got and that nothing was
   stored.
 - `claimNextJob` will not claim a job with `cancel_requested_at` set, and `failJob` refuses to put
   one back to `pending`. Together these are what make “cancelled” terminal rather than a race the
   next poll can lose.
+- A stop request whose worker died before honouring it is settled by the queue rather than left to
+  stand: `recoverAbandonedStops` (called from `claimNextJob`) turns an expired `processing` run with
+  a pending cancellation into its terminal state — with the lease released and **no further provider
+  call** — instead of leaving it `processing` forever or handing it to a worker that would spend
+  the money the cancellation was meant to stop. `pause_requested_at` gets the same treatment, as a
+  pause.
 - Nothing is published from a cancelled run: the pipeline writes its cards and concepts in one
   transaction at the end, so stopping before it means no partial deck and no half-checked card.
 
@@ -48,10 +63,12 @@ the code and says **cancelled**.
 
 ## What this does not do
 
-- **Resume.** A cancelled or interrupted run is not continued from where it stopped; a retry
-  re-derives its plan and re-pays for the calls before the interruption. The concept inventory and
-  the accepted cards are still held in memory and written once at the end, so there is nothing
-  persisted to resume from yet. This is recorded as a limitation in `README.md` and in
-  `docs/remediation-status.md` rather than implied to work.
+- **Resuming a cancelled run.** Nothing continues a cancelled job id. An interrupted run — a crash,
+  a lease expiry, one failed call — is a different case and *is* continued from its stored progress;
+  so is a run the owner paused. Both are `0009`. What cancellation adds is that wanting a run gone
+  and wanting it continued must be said with different verbs, and the record keeps both.
 - **Pre-emption of a call already on the wire.** A stop cannot recall a request the provider is
   already processing; the run stops before the *next* one. That call is charged, as it should be.
+- **Discarding what was paid for.** A cancelled run stores no cards, but it does keep the progress
+  it had: the concept candidates and cards it had already paid for remain in its checkpoint as the
+  record of what the money bought. Cancelling ends the run, not the evidence for it.

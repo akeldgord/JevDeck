@@ -24,6 +24,8 @@ export type WorkerEventType =
   | 'paused'
   | 'failed'
   | 'retrying'
+  /** Another worker holds the job now, so this one stopped without touching it. */
+  | 'claim_lost'
   | 'idle'
   | 'error';
 
@@ -95,6 +97,10 @@ export class GenerationWorker {
         this.emit({ type: 'completed', jobId: job.id, outcome });
       } else if (outcome.state === 'pending') {
         this.emit({ type: 'retrying', jobId: job.id, outcome });
+      } else if (outcome.state === 'claim_lost') {
+        // This worker's lease was taken over while it worked. It wrote nothing, so the run is not
+        // this worker's to report on; the owner of the claim will finish it.
+        this.emit({ type: 'claim_lost', jobId: job.id, message: outcome.message, outcome });
       } else if (outcome.state === 'paused') {
         // Stopped on purpose and still resumable, which is a third thing for a log reader.
         this.emit({ type: 'paused', jobId: job.id, outcome });

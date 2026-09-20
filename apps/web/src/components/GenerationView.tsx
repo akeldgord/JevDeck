@@ -61,6 +61,11 @@ interface Props {
   onPauseGeneration: () => void;
   /** Queues a stopped run again, to continue from its stored progress. */
   onResumeGeneration: () => void;
+  /**
+   * Offered only when the server has said the run cannot be continued: a cancelled run, or one
+   * whose stored progress does not apply to it. Starting again is a new run with its own spend.
+   */
+  onStartNewRun?: () => void;
   /** True while a pause, resume or cancel request is in flight. */
   generationActionBusy: boolean;
   /** What a pause or resume request answered when it was not the plain success case. */
@@ -127,6 +132,7 @@ export const GenerationView: React.FC<Props> = ({
   onCancelGeneration,
   onPauseGeneration,
   onResumeGeneration,
+  onStartNewRun,
   generationActionBusy,
   generationActionNotice,
   budgetNotice,
@@ -468,6 +474,7 @@ export const GenerationView: React.FC<Props> = ({
           onCancel={onCancelGeneration}
           onPause={onPauseGeneration}
           onResume={onResumeGeneration}
+          onStartNewRun={onStartNewRun}
           busy={generationActionBusy}
           actionNotice={generationActionNotice}
         />

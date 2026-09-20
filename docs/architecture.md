@@ -95,25 +95,54 @@ is shown.
 
 A run can also be stopped on purpose, in two ways. `POST /api/jobs/:id/pause` is the resumable one:
 the run moves to `paused`, releases its lease, records no finish time and keeps what it had already
-paid for. `POST /api/jobs/:id/cancel` is terminal and discards the un-stored cards, ending as
-`failed` with `error_code = 'cancelled_by_user'` — the state vocabulary has no `cancelled` member
-and the CHECK constraint cannot be widened by a migration that runs inside a transaction, so the
-code is what carries the distinction. Both are owner-scoped, and both work the same way against a
-worker: one nobody has claimed is stopped outright, and one a worker holds gets a request that the
-pipeline honours immediately before its next paid call and at each phase boundary. `claimNextJob`
-refuses a job with a cancel request and `failJob` refuses to return one to `pending`, which is what
-makes a cancellation terminal rather than a race the next poll can lose.
+paid for. `POST /api/jobs/:id/cancel` is terminal for that job id and discards the un-stored cards,
+ending as `failed` with `error_code = 'cancelled_by_user'` — the state vocabulary has no `cancelled`
+member and the CHECK constraint cannot be widened by a migration that runs inside a transaction, so
+the code is what carries the distinction. Both are owner-scoped and require a CSRF token, and both
+work the same way against a worker: one nobody has claimed is stopped outright, and one a worker
+holds gets a request that the pipeline honours immediately before its next paid call and at each
+phase boundary. `claimNextJob` refuses a job with a cancel request and `failJob` refuses to return
+one to `pending`, which is what makes a cancellation terminal rather than a race the next poll can
+lose. A stop request whose worker died before honouring it is settled by `recoverAbandonedStops`,
+called from `claimNextJob`: the expired run is finalized as cancelled or paused with no further
+provider call, rather than sitting in `processing` or being handed to a worker that would spend the
+money the stop was meant to save.
+
+**The three control verbs are decided by one transition table**, in `resumeJob`, `requestPause` and
+`requestCancellation` in `apps/worker/src/queue.ts`. Each transition is a single conditional
+statement whose affected-row count is the decision, so a request that loses a race to a claim or to
+a second request rereads the row and reports what actually happened instead of a transition it did
+not make. The answers are typed and named for what they are: a pause of a stopped run is a no-op
+(`already_paused`, `already_completed`, `already_cancelled`, `already_stopped`), a resume of a
+cancelled run is refused as `cancelled` (a cancellation is never cleared), a resume of progress that
+does not apply is refused with `restart_required` and its reason while leaving that progress where
+it is, and a resume of a run that never dispatched is `resumed` with `fromCheckpoint: false` — a
+checkpoint is not a precondition for continuing work that has not started. The table is written out
+in `docs/decisions/0009-resuming-an-interrupted-run.md`.
+
+**A run is published and finished in one transaction, and there is no state in between.** The last
+phase of the pipeline calls `finaliseWithPublication`, which re-checks the claim, the lease, the
+state and any pending stop request *inside* an immediate transaction and then — in that same
+transaction — writes the cards, their evidence, the concept inventory, the deck's count, the
+omissions, the coverage figures, the completion timestamp, the released lease and the cleared
+checkpoint. A process that dies mid-publication therefore leaves the run unfinished and untouched,
+with the checkpoint intact, rather than leaving cards committed on a run that still looks
+unfinished. If the run had already finished, its stored result is returned and nothing is written;
+if a previous finalisation of the same job had already committed its cards, those cards are kept
+exactly as they are — identities, evidence and reviews — and only the completion is written.
 
 **Progress is stored, so a stop is not a restart.** After every batch the pipeline writes a
 checkpoint onto the job — how many extraction batches are complete with the concepts they returned,
 how many generation batches are complete with the cards they produced and verified — and clears it
-when the run finishes. A later attempt loads it, validates it against the job's source version,
+in the same transaction that publishes the cards and marks the run finished. A later attempt loads it, validates it against the job's source version,
 coverage mode, selection and pipeline version, and skips the batches it covers. Everything
 downstream of those batches — the inventory, the coverage selection, the format decisions — is a
 pure function of the candidates and the stored source, so it is recomputed rather than stored, at
-no provider cost. A checkpoint that fails any identity check is ignored rather than repaired, and
-`resume` answers `nothing_to_resume` rather than queueing a run it cannot continue: silently
-starting the plan over is the one outcome this design exists to prevent.
+no provider cost. The identity check lives in `apps/worker/src/checkpoint.ts` so the queue and the
+loader reach the same verdict, and it is never repaired: an explicit `resume` on progress that does
+not apply answers `restart_required` with the reason and queues nothing, while a claimed retry
+ignores such a checkpoint and re-derives. Silently starting the plan over under the label “resume”
+is the one outcome this design exists to prevent.
 
 The pipeline is ordered so that the provider proposes and the stored source disposes:
 

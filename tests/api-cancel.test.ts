@@ -417,7 +417,9 @@ describe('A run that already finished', () => {
 
     const cancelled = await admin.call(`/api/jobs/${jobId}/cancel`, { method: 'POST' });
     expect(cancelled.status).toBe(200);
-    expect(cancelled.body.outcome).toBe('already_finished');
+    // Named for what happened rather than for the absence of a stop: this is the answer a stop
+    // request gets when it races the run's own finalisation and the run finishes first.
+    expect(cancelled.body.outcome).toBe('already_completed');
     expect(cancelled.body.stopped).toBe(false);
 
     // Rewriting a completed run's record to say it was cancelled would misreport what happened.
@@ -462,5 +464,39 @@ describe('A run that already finished', () => {
     expect(row.state).toBe('failed');
     expect(row.error_code).toBe('cancelled_by_user');
     expect(claimNextJob(workerDb, { workerId: 'wrk_never' })).toBeNull();
+  });
+});
+
+describe('Stopping a run is a state-changing request', () => {
+  it('refuses pause, resume and cancel without the CSRF header, and changes nothing', async () => {
+    const { jobId } = await queueRun('cancel-csrf.pdf');
+
+    // A paused run, so all three verbs have something to act on: pause and cancel would stop it,
+    // resume would queue it again.
+    const paused = await admin.call(`/api/jobs/${jobId}/pause`, { method: 'POST' });
+    expect(paused.body.outcome).toBe('paused');
+
+    const token = admin.csrf;
+    admin.csrf = null;
+    try {
+      for (const verb of ['pause', 'resume', 'cancel']) {
+        const refused = await admin.call(`/api/jobs/${jobId}/${verb}`, { method: 'POST' });
+        expect(refused.status).toBe(403);
+        expect(refused.body.error.code).toBe('csrf_failed');
+      }
+
+      // The same requests with the token are the proof that the block was the CSRF check, and not
+      // a run that happened to be unstoppable.
+      const row = requireJob(workerDb, jobId);
+      expect(row.state).toBe('paused');
+      expect(row.cancel_requested_at).toBeNull();
+      expect(row.pause_requested_at).not.toBeNull();
+    } finally {
+      admin.csrf = token;
+    }
+
+    const allowed = await admin.call(`/api/jobs/${jobId}/resume`, { method: 'POST' });
+    expect(allowed.status).toBe(200);
+    expect(allowed.body.outcome).toBe('resumed');
   });
 });

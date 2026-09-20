@@ -22,6 +22,13 @@ interface Props {
   onPause?: () => void;
   /** Queues a stopped run again, to continue from its stored progress. */
   onResume?: () => void;
+  /**
+   * Starts a new run for this deck, offered when the server has said this one cannot continue.
+   *
+   * It is a separate control from Resume on purpose: a cancelled run and a run whose stored
+   * progress does not apply must not spend again behind a button labelled “resume”.
+   */
+  onStartNewRun?: () => void;
   /** True while a stop or resume request is in flight, so a control cannot be pressed twice. */
   busy?: boolean;
   /** What the last pause or resume request answered, when it was not the plain success case. */
@@ -82,6 +89,7 @@ export const GenerationResult: React.FC<Props> = ({
   onCancel,
   onPause,
   onResume,
+  onStartNewRun,
   busy = false,
   actionNotice = null,
 }) => {
@@ -89,10 +97,13 @@ export const GenerationResult: React.FC<Props> = ({
   // tells them apart — the state alone does not, because a cancelled run is terminal too.
   const wasCancelled = jobStatus?.job.errorCode === 'cancelled_by_user';
   const wasPaused = jobStatus?.job.state === 'paused' || jobStatus?.job.errorCode === 'paused_by_user';
-  // A checkpoint is what makes a stopped run continuable: without one there is nothing to resume
-  // from, and the server refuses rather than silently starting the run again.
+  // Anything stopped can ask to be queued again, and the server answers with what will actually
+  // happen: it continues from stored progress, or it starts its plan from the beginning, or it
+  // refuses and asks for a new run. Requiring a checkpoint here would have hidden the first and
+  // third answers behind a button that never appeared; a cancelled run is the one thing that is
+  // terminal, and it gets the new-run control instead.
   const canResume = Boolean(
-    onResume && jobStatus?.job.hasCheckpoint && jobStatus.job.state !== 'completed'
+    onResume && jobStatus && jobStatus.job.state !== 'completed' && !wasCancelled
   );
 
   if (error) {
@@ -140,8 +151,27 @@ export const GenerationResult: React.FC<Props> = ({
               {busy ? 'Resuming…' : 'Resume run'}
             </button>
             <p className="text-[11px] text-slate-500">
-              Resuming continues from the concepts and cards this run had already paid for, rather
-              than generating them again.
+              {jobStatus?.job.hasCheckpoint
+                ? 'Resuming continues from the concepts and cards this run had already paid for, rather than generating them again.'
+                : 'This run has no stored progress yet, so resuming it starts this work from the beginning.'}
+            </p>
+          </div>
+        )}
+
+        {onStartNewRun && (
+          <div className="space-y-2">
+            <button
+              type="button"
+              onClick={onStartNewRun}
+              disabled={busy}
+              className="inline-flex items-center gap-2 rounded-lg border border-cyan-800 bg-cyan-950/40 px-3 py-1.5 text-xs font-semibold text-cyan-200 transition-colors hover:bg-cyan-950 disabled:opacity-60"
+            >
+              <Play className="w-3.5 h-3.5" />
+              Start a new run
+            </button>
+            <p className="text-[11px] text-slate-500">
+              A new run starts from the beginning with its own spend, and this run’s record is kept
+              as it is.
             </p>
           </div>
         )}

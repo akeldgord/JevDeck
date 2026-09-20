@@ -92,6 +92,14 @@ export default function App() {
   const [jobActionBusy, setJobActionBusy] = useState(false);
   /** What a pause or resume request answered when it was not the plain success case. */
   const [jobActionNotice, setJobActionNotice] = useState<string | null>(null);
+  /**
+   * True when the run on screen cannot be continued and the honest next step is a new run.
+   *
+   * Set from the server's answer rather than guessed from the state: a cancelled run and a run
+   * whose stored progress does not apply both need a new run, and both are decisions only the
+   * server can make.
+   */
+  const [canStartNewRun, setCanStartNewRun] = useState(false);
   const [hasCustomToc, setHasCustomToc] = useState(demo !== null);
   const [cards, setCards] = useState<Flashcard[]>(demo?.cards ?? []);
 
@@ -1059,12 +1067,22 @@ export default function App() {
 
     setJobActionBusy(true);
     setJobActionNotice(null);
+    setCanStartNewRun(false);
     try {
-      const { job } = await api.cancelJob(jobId);
+      const { outcome, job } = await api.cancelJob(jobId);
       setGeneration(previous => (previous ? { ...previous, job } : previous));
 
-      if (job.state === 'failed') {
+      if (outcome === 'already_completed') {
+        // The stop and the run's own finalisation raced, and the run finished first. Saying so is
+        // the only honest answer: nothing was cancelled, and the cards it produced are stored.
+        setJobActionNotice(
+          'This run had already finished by the time the request arrived, so nothing was cancelled.'
+        );
+      } else if (job.state === 'failed') {
         setGenerationError(job.errorMessage ?? 'The run was cancelled.');
+        // Cancellation is terminal for this job, so the way forward is a *new* run — a separate job
+        // with its own spend — not a “resume” over a decision that was taken to stop spending.
+        if (job.errorCode === 'cancelled_by_user') setCanStartNewRun(true);
       }
     } catch (cause) {
       setGenerationError(
@@ -1087,9 +1105,18 @@ export default function App() {
 
     setJobActionBusy(true);
     setJobActionNotice(null);
+    setCanStartNewRun(false);
     try {
-      const { job } = await api.pauseJob(jobId);
+      const { outcome, job } = await api.pauseJob(jobId);
       setGeneration(previous => (previous ? { ...previous, job } : previous));
+
+      if (outcome === 'already_completed') {
+        // A pause that arrived after the run finished stops nothing, and the run's cards are
+        // stored: the request is reported as too late rather than as a pause that took effect.
+        setJobActionNotice(
+          'This run had already finished by the time the request arrived, so there is nothing to continue.'
+        );
+      }
     } catch (cause) {
       setJobActionNotice(cause instanceof Error ? cause.message : 'The run could not be paused.');
     } finally {
@@ -1103,6 +1130,11 @@ export default function App() {
    * A resumed run is the same job continuing, not a new one, so it is followed with the same logic
    * a freshly started run uses — the deck it belongs to, its own run id, and its result loaded from
    * the stored deck once it finishes.
+   *
+   * Every answer the server can give is said plainly. The two that matter most are the ones where
+   * resuming is *not* what the button says: a cancelled run is terminal and starting over is a new
+   * run, and a run whose stored progress does not apply must not be continued under the label
+   * “resume” — it is offered a new run instead, which is the only honest way to spend again.
    */
   const handleResumeGeneration = async (): Promise<void> => {
     const jobId = generation?.job.id;
@@ -1111,6 +1143,7 @@ export default function App() {
 
     setJobActionBusy(true);
     setJobActionNotice(null);
+    setCanStartNewRun(false);
 
     let result: Awaited<ReturnType<typeof api.resumeJob>>;
     try {
@@ -1125,16 +1158,25 @@ export default function App() {
     setGeneration(previous => (previous ? { ...previous, job: result.job } : previous));
 
     if (result.outcome !== 'resumed') {
-      // Each refusal is a different answer about the run, and each is worth saying plainly rather
-      // than leaving a button that appears to have done nothing.
+      setCanStartNewRun(result.outcome === 'cancelled' || result.outcome === 'restart_required');
       setJobActionNotice(
-        result.outcome === 'nothing_to_resume'
-          ? 'This run has no stored progress to continue from, so resuming it would start the work again. Generate again instead.'
-          : result.outcome === 'already_running'
-            ? 'This run is already queued on the server.'
-            : 'This run has already finished; there is nothing to resume.'
+        result.outcome === 'cancelled'
+          ? 'This run was cancelled, and a cancelled run cannot be continued. Starting again creates a new run, with its own spend.'
+          : result.outcome === 'restart_required'
+            ? `This run cannot continue from what it stored: ${result.reason ?? 'its stored progress does not apply to it'}. Start a new run instead — continuing it would redo that work under different rules.`
+            : result.outcome === 'already_running'
+              ? 'This run is already queued on the server.'
+              : 'This run has already finished; there is nothing to resume.'
       );
       return;
+    }
+
+    // A resumed run with no stored progress is not the same promise as one continuing from it, so
+    // the screen says which of the two happened rather than leaving the button's label to imply it.
+    if (!result.fromCheckpoint) {
+      setJobActionNotice(
+        'This run had no stored progress, so it was queued to start from the beginning.'
+      );
     }
 
     const runId = generationRunRef.current + 1;
@@ -1437,6 +1479,7 @@ export default function App() {
               onCancelGeneration={() => void handleCancelGeneration()}
               onPauseGeneration={() => void handlePauseGeneration()}
               onResumeGeneration={() => void handleResumeGeneration()}
+              onStartNewRun={canStartNewRun ? () => void handleStartGeneration() : undefined}
               generationActionBusy={jobActionBusy}
               generationActionNotice={jobActionNotice}
               budgetNotice={budgetNotice}
