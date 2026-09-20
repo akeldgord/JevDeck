@@ -15,9 +15,9 @@ For the audit findings that triggered them, see the remediation specification
 1.0.0), not open source. It is an early prototype whose server-side core is real: PDF ingestion,
 invitation-only accounts and sessions, durable document and deck storage, provider-backed
 generation with a concept inventory and independent validation, enforced spending limits,
-durable job dispatch, persisted study, deck sharing and Anki packaging are implemented. What is
-not implemented is ingestion beyond PDF, supporting media, deck browsing, and the §5 quality
-gates themselves, which no run has yet passed. When a capability is unavailable the application
+durable job dispatch, persisted study, deck sharing, Anki packaging, multi-format ingestion, stored
+media and deck browsing are implemented. What is not implemented is OCR for scanned pages, image
+extraction from PDFs, and the §5 quality gates themselves, which no run has yet passed. When a capability is unavailable the application
 must say so rather than simulate success. Section 6 states the current status per capability.
 
 ---
@@ -141,9 +141,13 @@ renamed heading must not change format.
 format must support both generation and source inspection. Large documents are processed in
 bounded batches with persisted checkpoints and honest coverage gaps.
 
-**Delivered so far:** PDF only, plus honest coverage gaps within it: a page that yields no
-extractable text is stored as empty and reported, and an upload is not failed by one such page.
-A functioning PDF milestone is progress, not completion of the full product.
+**Delivered so far:** PDF, Word (.docx), PowerPoint (.pptx), Markdown, plain text and pasted
+notes, each read by its own reader into one storage shape. Coverage gaps are reported rather than
+passed over, and a page that yields no text is recorded as what it actually is: a page that is
+blank — a confirmed result — or a page whose content is a picture this build cannot read, which is
+a coverage gap. An upload is not failed by one such page. **Not delivered:** OCR, so a scanned
+page is reported unread rather than read; and image extraction from PDFs, so a PDF stores no media.
+A working PDF milestone is progress, not completion of the full product.
 
 ### 2.11 Delivery and distribution
 
@@ -232,6 +236,7 @@ evidence. The deep audits of 19 September 2026, with evidence per work package, 
 | Independent card validation | Implemented: structure, deterministic source checks, then a separate bounded provider call. A card that fails is withheld and counted. |
 | Source excerpt on each card | Implemented and served from durable storage, with the page it was found on |
 | Durable job dispatch | Implemented: leased, retried, restart-safe, with every provider attempt recorded |
+| Stopping and resuming a run | Implemented: a queued run stops outright, a held run stops before its next paid call, the terminal record says how far it got, and a stopped run is never handed to another worker. **Pause** keeps the run's progress and **Resume** continues it, as does the next attempt of an interrupted run: the concept batches and card batches a run already completed are not requested again. **Cancel** is the terminal version and discards the un-stored cards. `POST /api/jobs/:id/{pause,resume,cancel}`. |
 | Original-page viewer | Implemented for the stored original, with the highlight measured from the page's text layer. A passage that cannot be located is labelled "exact highlight unavailable" rather than drawn approximately. Missing: zoom/rotation/multiline fixtures (R4). |
 | Spaced repetition (SM-2) and cram mode | Implemented end to end: the study screen writes every rating to the server, undo replays the schedule, suspension is per user, and the cram choice is per session. Progress survives a reload and a server restart (`tests/api-r6.test.ts`, `tests/workflow.test.ts`). |
 | Study queue eligibility (due/new/suspended/daily limits) | Implemented: one eligibility function produces both the header count and the session queue, so they cannot disagree; new, due, suspended and later are distinguished and daily limits are applied. |
@@ -239,11 +244,11 @@ evidence. The deep audits of 19 September 2026, with evidence per work package, 
 | Durable document/deck storage | Implemented, including the original file, page text and section tree |
 | Usage ledger and budget enforcement | Implemented: an append-only ledger, per-user and installation-wide caps, and reserve-then-settle around every provider call so concurrent jobs cannot exceed the available reservation (`tests/api-r5.test.ts`) |
 | Backup and restore | Implemented and verified: one consistent SQLite artifact covering database and retained source bytes, with a round-trip test (`tests/backup-restore.test.ts`) |
-| Multiple decks per document, deck browsing | **Not implemented**: a document reuses its deck, and there is no screen that lists every deck. |
+| Deck browsing | Implemented: a Decks screen lists the caller's decks and the decks shared with them, with open/study/export/delete offered only where the server allows it, and the reason stated where it does not (`apps/web/src/lib/deckList.ts`, `tests/deckList.test.ts`, `tests/api-v2-5.test.ts`). |
 | Deck sharing | Implemented: owner-scoped grant and revoke, email-addressed, study scope only, with the source staying with the owner |
 | Anki `.apkg` export | Implemented: a real Anki collection in a ZIP, built server-side from stored rows (`tests/anki-apkg.test.ts`) |
-| Non-PDF input formats | **Not implemented** (R8). PDF only. |
-| Media extraction (figures, tables, scans) | **Not implemented** (R8). The `media` table exists and nothing writes it. |
+| Non-PDF input formats | Implemented: Word (.docx), PowerPoint (.pptx), Markdown, plain text and pasted notes, each with its own reader in `packages/ingestion` and its own coverage report. Every supported format stores both text and source, so both generation and source inspection work on it (`tests/ingestion.test.ts`, `tests/api-v2-5.test.ts`). **Not implemented:** OCR, so scans and images are refused with the step that would fix them. |
+| Stored media (figures, tables, scans) | Implemented for the formats that carry image bytes: `.docx` and `.pptx` images are stored beside the version they came from, listed with their page (or recorded as unanchored), and served one at a time, owner-only. **Not implemented:** image extraction from PDFs, so a PDF stores no media and says so in its limitations. The `.apkg` bundles no media either. |
 | Quality-gate harness | Implemented: `packages/evaluation` measures the §5 gates from a completed run's stored rows and reports an unmeasurable gate as unmet rather than passing it |
 | Quality gates (§5: 98% / 90% / no critical errors) | **Unmet.** No provider credential is configured in the development environment and no independent reviewer has reviewed cards from a hosted model, so the gates are unmet rather than passed. |
 | Containers, Compose, CI, security policy | Implemented: `Dockerfile`, `docker-compose.yml`, the CI workflow (install, typecheck, tests, build, bundle check) and `SECURITY.md` |

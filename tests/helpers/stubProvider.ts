@@ -15,6 +15,12 @@ export interface StubBehaviour {
   delayMs?: number;
   /** Answer with prose instead of JSON. */
   malformed?: boolean;
+  /**
+   * Answer with prose only for one task, leaving the others well-formed. Lets a test break the
+   * claim-support call on its own and prove that an unjudged card is not published, without
+   * failing the job earlier at concept extraction.
+   */
+  malformedTask?: string;
   /** Answer with a given HTTP status instead of a completion. */
   httpStatus?: number;
   /** Fail the first N calls, then behave normally. */
@@ -208,7 +214,7 @@ export function startStubProvider(initial: StubBehaviour = {}): StubProvider {
         });
       }
 
-      if (behaviour.malformed) {
+      if (behaviour.malformed || behaviour.malformedTask === task) {
         return completion('I am afraid I cannot do that, but here is some prose instead.');
       }
 

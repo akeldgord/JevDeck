@@ -209,6 +209,24 @@ export interface GenerationJob {
   pipelineVersion: string | null;
   errorCode: string | null;
   errorMessage: string | null;
+  /**
+   * When a stop was asked for, if one was. A cancelled run finishes as `failed` with
+   * `errorCode: 'cancelled_by_user'` — see the migration that adds this column for why the state
+   * vocabulary has no `cancelled` member of its own.
+   */
+  cancelRequestedAt: string | null;
+  /**
+   * When a pause was asked for, if one was.
+   *
+   * A pause is the resumable stop: the run moves to `state: 'paused'` with
+   * `errorCode: 'paused_by_user'`, keeps everything it had already paid for, and is queued again by
+   * `POST /api/jobs/:id/resume`.
+   */
+  pauseRequestedAt: string | null;
+  /** Whether the run has unfinished work stored, and so can be continued instead of restarted. */
+  hasCheckpoint: boolean;
+  /** When that stored progress was last written. */
+  checkpointUpdatedAt: string | null;
   coverageSummary: CoverageSummary | null;
   createdAt: string;
   startedAt: string | null;

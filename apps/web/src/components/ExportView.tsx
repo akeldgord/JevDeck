@@ -11,6 +11,7 @@ import {
   PackageOpen
 } from 'lucide-react';
 import { api } from '../lib/api';
+import { saveBytes } from '../lib/download';
 import { SimulatedBadge } from './DemoBanner';
 
 interface Props {
@@ -43,12 +44,7 @@ export const ExportView: React.FC<Props> = ({ deck, cards, isDemo, deckId, canEx
 
     try {
       const file = await api.downloadApkg(deckId);
-      const url = URL.createObjectURL(new Blob([file.bytes], { type: 'application/octet-stream' }));
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = file.fileName;
-      link.click();
-      URL.revokeObjectURL(url);
+      saveBytes(file.bytes, file.fileName, 'application/octet-stream');
       setPackageState('done');
     } catch (cause) {
       setPackageState('failed');
@@ -79,25 +75,19 @@ export const ExportView: React.FC<Props> = ({ deck, cards, isDemo, deckId, canEx
   const ankiTxt = exportDeckToAnkiTxt(deck, cards);
   const jsonExport = exportDeckToJson(deck, cards);
 
-  const handleDownloadTxt = () => {
-    const blob = new Blob([ankiTxt], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `${deck.title.replace(/\s+/g, '_')}_anki_export.txt`;
-    link.click();
-    URL.revokeObjectURL(url);
-  };
+  const handleDownloadTxt = () =>
+    saveBytes(
+      ankiTxt,
+      `${deck.title.replace(/\s+/g, '_')}_anki_export.txt`,
+      'text/plain;charset=utf-8'
+    );
 
-  const handleDownloadJson = () => {
-    const blob = new Blob([jsonExport], { type: 'application/json;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `${deck.title.replace(/\s+/g, '_')}_cards.json`;
-    link.click();
-    URL.revokeObjectURL(url);
-  };
+  const handleDownloadJson = () =>
+    saveBytes(
+      jsonExport,
+      `${deck.title.replace(/\s+/g, '_')}_cards.json`,
+      'application/json;charset=utf-8'
+    );
 
   const copyToClipboard = (text: string, format: 'anki' | 'json') => {
     navigator.clipboard.writeText(text);
@@ -116,7 +106,8 @@ export const ExportView: React.FC<Props> = ({ deck, cards, isDemo, deckId, canEx
           </h2>
           <p className="text-xs text-slate-400 mt-1">
             A real Anki package (<code className="font-mono">.apkg</code>) built on the server and
-            ready to import, or a tab-separated text file and a JSON bundle for other tools.
+            ready to import, with every card new — or a tab-separated text file and a JSON bundle
+            for other tools.
           </p>
         </div>
 
@@ -127,10 +118,12 @@ export const ExportView: React.FC<Props> = ({ deck, cards, isDemo, deckId, canEx
             Anki package (.apkg)
           </div>
           <p className="text-xs text-slate-400 leading-relaxed">
-            Built on the server from the stored deck, each card's verbatim citation and your own
-            review schedule, so the cards arrive with the intervals you have already earned.
-            Figures and tables are not bundled: this application does not extract media yet, so
-            the package has none rather than placeholders.
+            Built on the server from the stored deck and each card's verbatim citation. Every card
+            arrives <strong>new</strong>: an export is a fresh schedule, so your review history,
+            intervals and due dates are deliberately not carried across, and nothing here syncs
+            back. Images stored with a document are not bundled into the package either — an
+            imported card cites its page, and the figure stays in JevDeck rather than being copied
+            into an archive whose media handling this build does not implement.
           </p>
           <button
             onClick={() => void handleDownloadApkg()}

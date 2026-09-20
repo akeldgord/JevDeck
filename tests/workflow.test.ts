@@ -11,6 +11,11 @@ import { GenerationWorker } from '../apps/worker/src/worker';
 import { startStubProvider, type StubProvider } from './helpers/stubProvider';
 import { cardsFromStoredDeck } from '../apps/web/src/lib/storedSource';
 import { selectStudyQueue } from '../packages/scheduling/src';
+import { ingestDocument } from '../packages/ingestion/src';
+import { fromIngested } from '../apps/web/src/lib/parsedDocument';
+import { documentUploadPayload } from '../apps/web/src/lib/documentPayload';
+import { buildDeckList } from '../apps/web/src/lib/deckList';
+import { buildDocx, PNG } from './helpers/ooxmlFixture';
 
 /**
  * The whole product, walked end to end in one run: invite → upload → generate → inspect source →
@@ -50,6 +55,12 @@ const PAGES = [
     ].join(' '),
   },
 ];
+
+/** The two claims the Word document makes, so generation has something to work with. */
+const DOCX_PROSE =
+  'Glycolysis converts one molecule of glucose into two molecules of pyruvate in the cytosol.';
+const DOCX_PROSE_TWO =
+  'The citric acid cycle completes the oxidation of acetyl-CoA to carbon dioxide and water.';
 
 const SECTIONS = [
   { clientId: 'ch1', parentId: null, depth: 1, title: 'Membrane physiology', pageStart: 1, pageEnd: 1 },
@@ -200,6 +211,9 @@ const walked = {
   deckId: '',
   documentId: '',
   cardIds: [] as string[],
+  docxDeckId: '',
+  docxDocumentId: '',
+  docxCardIds: [] as string[],
   scheduleAfterFirstSession: [] as any[],
   reviewsAfterFirstSession: 0,
   exportedNotes: 0,
@@ -374,9 +388,9 @@ describe('Invite → upload → generate → inspect → study → reload → re
 
     const after = await student.call(`/api/decks/${walked.deckId}/schedule`);
     walked.scheduleAfterFirstSession = after.body.states;
-    walked.reviewsAfterFirstSession = after.body.reviewsToday;
+    walked.reviewsAfterFirstSession = after.body.reviewEventsToday;
 
-    expect(after.body.reviewsToday).toBe(rated.length);
+    expect(after.body.reviewEventsToday).toBe(rated.length);
     expect(after.body.states.length).toBe(rated.length);
   });
 
@@ -390,7 +404,7 @@ describe('Invite → upload → generate → inspect → study → reload → re
     expect(login.status).toBe(200);
 
     const schedule = await reloaded.call(`/api/decks/${walked.deckId}/schedule`);
-    expect(schedule.body.reviewsToday).toBe(walked.reviewsAfterFirstSession);
+    expect(schedule.body.reviewEventsToday).toBe(walked.reviewsAfterFirstSession);
     expect(schedule.body.states.length).toBe(walked.scheduleAfterFirstSession.length);
 
     const before = new Map(
@@ -429,7 +443,7 @@ describe('Invite → upload → generate → inspect → study → reload → re
     expect(login.status).toBe(200);
 
     const schedule = await restarted.call(`/api/decks/${walked.deckId}/schedule`);
-    expect(schedule.body.reviewsToday).toBe(walked.reviewsAfterFirstSession);
+    expect(schedule.body.reviewEventsToday).toBe(walked.reviewsAfterFirstSession);
     expect(schedule.body.states.length).toBe(walked.scheduleAfterFirstSession.length);
 
     const before = new Map(
@@ -448,7 +462,15 @@ describe('Invite → upload → generate → inspect → study → reload → re
     expect(reLogin.status).toBe(200);
   });
 
-  it('8. exports a package the owner can import, carrying the schedule they earned', async () => {
+  it('8. exports a package the owner can import, with every card new', async () => {
+    // The deck really is studied at this point in the workflow, so "arrives new" is a statement
+    // about the export rather than about a deck nobody has opened.
+    const schedule = await student.call(`/api/decks/${walked.deckId}/schedule`);
+    const studied = (schedule.body.states as Array<{ schedule_review_count: number }>).filter(
+      row => row.schedule_review_count > 0
+    );
+    expect(studied.length).toBe(2);
+
     const download = await student.download(`/api/decks/${walked.deckId}/export.apkg`);
     expect(download.status).toBe(200);
     expect(download.headers.get('content-type')).toContain('zip');
@@ -463,10 +485,10 @@ describe('Invite → upload → generate → inspect → study → reload → re
 
     try {
       const notes = archived.query('SELECT COUNT(*) AS n FROM notes').get() as { n: number };
-      const cards = archived.query('SELECT type, ivl FROM cards').all() as Array<{
-        type: number;
-        ivl: number;
-      }>;
+      const cards = archived
+        .query('SELECT type, queue, ivl, reps FROM cards')
+        .all() as Array<{ type: number; queue: number; ivl: number; reps: number }>;
+      const revlog = archived.query('SELECT COUNT(*) AS n FROM revlog').get() as { n: number };
       const col = archived.query('SELECT decks FROM col').get() as { decks: string };
 
       expect(notes.n).toBe(walked.cardIds.length);
@@ -475,10 +497,16 @@ describe('Invite → upload → generate → inspect → study → reload → re
         'Workflow deck'
       );
 
-      // The two cards studied in step 5 arrive as review cards; the rest arrive new.
-      const reviewed = cards.filter(card => card.type !== 0);
-      expect(reviewed.length).toBe(2);
-      for (const card of reviewed) expect(card.ivl).toBeGreaterThanOrEqual(1);
+      // Two cards were studied in step 5, and the deck's schedule says so. The package still
+      // arrives new, because an export is a fresh schedule: no interval, no due date, no review
+      // history, and nothing to synchronize back.
+      for (const card of cards) {
+        expect(card.type).toBe(0);
+        expect(card.queue).toBe(0);
+        expect(card.ivl).toBe(0);
+        expect(card.reps).toBe(0);
+      }
+      expect(revlog.n).toBe(0);
 
       walked.exportedNotes = notes.n;
     } finally {
@@ -539,9 +567,161 @@ describe('Invite → upload → generate → inspect → study → reload → re
     expect((await admin.call('/api/decks')).body.sharedDecks).toEqual([]);
   });
 
-  it('10. reports the whole walk as a coherent set of stored rows', async () => {
-    // One account pair, one document, one deck, cards that match, reviews that match, one share
-    // that was revoked, and a budget ledger that paid for every provider call.
+  it('10. walks a Word document the same way: read, uploaded, generated from, studied', async () => {
+    // The second leg exists to keep one claim honest: the product reads more than PDFs, and a
+    // non-PDF source goes through the same storage, citation, generation and inspection path. It
+    // starts from real bytes — a `.docx` assembled here and read by the ingestion package — so the
+    // walk proves the reader rather than a payload that was written to match the reader.
+    const bytes = await buildDocx([
+      { kind: 'heading', level: 1, text: 'Metabolism' },
+      { kind: 'paragraph', text: DOCX_PROSE },
+      { kind: 'image' },
+      { kind: 'pageBreak' },
+      { kind: 'heading', level: 2, text: 'The citric acid cycle' },
+      { kind: 'paragraph', text: DOCX_PROSE_TWO },
+    ]);
+
+    const source = await ingestDocument({
+      fileName: 'Workflow_Source.docx',
+      bytes,
+      mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    });
+    const payload = documentUploadPayload(fromIngested(source), 'workflow-docx-hash');
+
+    const uploaded = await student.call('/api/documents', { method: 'POST', body: payload });
+    expect(uploaded.status).toBe(201);
+    walked.docxDocumentId = uploaded.body.document.id;
+
+    // What the server stored is what the reader found: the format, the pagination rule, the pages
+    // and the image, rather than defaults filled in on upload.
+    const detail = await student.call(`/api/documents/${walked.docxDocumentId}`);
+    expect(detail.status).toBe(200);
+    expect(detail.body.document.sourceFormat).toBe('docx');
+    expect(detail.body.version.pagination).toBe('explicit');
+    expect(detail.body.blocks.length).toBe(source.pageCount);
+    expect(detail.body.media.length).toBe(1);
+
+    const deck = await student.call('/api/decks', {
+      method: 'POST',
+      body: { title: 'Word deck', coverage: 'comprehensive', documentId: walked.docxDocumentId },
+    });
+    expect(deck.status).toBe(201);
+    walked.docxDeckId = deck.body.deck.id;
+
+    // Generated through the same durable queue as the PDF deck.
+    const queued = await student.call(`/api/decks/${walked.docxDeckId}/generate`, {
+      method: 'POST',
+      body: { coverage: 'comprehensive', sectionIds: [] },
+    });
+    expect(queued.status).toBe(202);
+    await runWorker();
+
+    const job = await student.call(`/api/jobs/${queued.body.job.id}`);
+    expect(job.body.job.state).toBe('completed');
+    expect(job.body.job.coverageSummary.cardsCreated).toBeGreaterThan(0);
+
+    // Every card cites a page of the Word document, and the excerpt is really on that page: the
+    // citation is checked against the text the reader extracted, not against the payload.
+    const cards = await student.call(`/api/decks/${walked.docxDeckId}/cards`);
+    expect(cards.body.cards.length).toBeGreaterThan(0);
+    walked.docxCardIds = cards.body.cards.map((card: any) => card.id);
+
+    for (const card of cards.body.cards) {
+      const evidence = cards.body.evidence.find((row: any) => row.card_id === card.id);
+      expect(evidence).toBeTruthy();
+      const page = source.pages.find(entry => entry.pageNumber === evidence.page_index);
+      expect(page).toBeTruthy();
+      // Compared on collapsed whitespace: a Word paragraph arrives with its line breaks, and the
+      // excerpt is a single span of text on that page. Collapsing both is how the server's own
+      // grounding check compares them, so the test reads the citation the same way it does.
+      const flatten = (value: string) => value.replace(/\s+/g, ' ').trim();
+      expect(flatten(page!.text)).toContain(flatten(evidence.excerpt).slice(0, 40));
+    }
+
+    // Studied with the same endpoint, and the schedule is per deck: the PDF deck's counters are
+    // untouched by a session in the Word deck.
+    const before = await student.call(`/api/decks/${walked.deckId}/schedule`);
+    const review = await student.call(`/api/cards/${walked.docxCardIds[0]}/reviews`, {
+      method: 'POST',
+      body: { rating: 3, mode: 'normal' },
+    });
+    expect(review.status).toBe(200);
+    expect(review.body.daily.newCardsIntroducedToday).toBe(1);
+
+    const after = await student.call(`/api/decks/${walked.deckId}/schedule`);
+    expect(after.body.newCardsIntroducedToday).toBe(before.body.newCardsIntroducedToday);
+    expect(after.body.states.length).toBe(before.body.states.length);
+
+    // Both decks are browsable, and the rows the screen builds name the document behind each one
+    // from what the server returns rather than from anything the client remembers.
+    const decks = await student.call('/api/decks');
+    const documents = await student.call('/api/documents');
+    const rows = buildDeckList({
+      owned: decks.body.decks,
+      shared: decks.body.sharedDecks,
+      documentNames: new Map(
+        (documents.body.documents as Array<{ id: string; name: string }>).map(row => [
+          row.id,
+          row.name,
+        ])
+      ),
+      activeDeckId: walked.docxDeckId,
+    });
+
+    const byId = new Map(rows.owned.map(row => [row.id, row]));
+    expect(rows.owned).toHaveLength(2);
+    expect(rows.shared).toEqual([]);
+    expect(byId.get(walked.deckId)?.documentName).toBe('Workflow_Source.pdf');
+    expect(byId.get(walked.docxDeckId)?.documentName).toBe('Workflow_Source.docx');
+    expect(byId.get(walked.docxDeckId)?.isActive).toBe(true);
+    // Every action a row offers is one the server will actually allow for an owned deck.
+    expect(byId.get(walked.docxDeckId)?.can.open).toBe(true);
+    expect(byId.get(walked.docxDeckId)?.can.exportPackage).toBe(true);
+    expect(byId.get(walked.docxDeckId)?.can.study).toBe(true);
+    expect(byId.get(walked.docxDeckId)?.cardCount).toBe(walked.docxCardIds.length);
+    expect(documents.body.documents.map((row: any) => row.name).sort()).toEqual([
+      'Workflow_Source.docx',
+      'Workflow_Source.pdf',
+    ]);
+
+    // The embedded image is served to the owner, byte for byte, and to nobody without an account.
+    const mediaId = (detail.body.media as Array<{ id: string; pageAnchored: boolean }>)[0].id;
+    const image = await student.download(`/api/media/${mediaId}`);
+    expect(image.status).toBe(200);
+    expect(new Uint8Array(image.bytes)).toEqual(PNG);
+    expect((await new Client().download(`/api/media/${mediaId}`)).status).toBe(401);
+
+    // And the Word deck exports the same way, with every card new.
+    const exported = await student.download(`/api/decks/${walked.docxDeckId}/export.apkg`);
+    expect(exported.status).toBe(200);
+    const entries = readZip(exported.bytes);
+    expect([...entries.keys()].sort()).toEqual(['collection.anki2', 'media']);
+
+    await Bun.write(join(scratch, 'word.anki2'), entries.get('collection.anki2')!);
+    const archived = new Database(join(scratch, 'word.anki2'), { readonly: true });
+    try {
+      const rows = archived.query('SELECT type, queue, ivl, reps FROM cards').all() as Array<{
+        type: number;
+        queue: number;
+        ivl: number;
+        reps: number;
+      }>;
+      expect(rows.length).toBe(walked.docxCardIds.length);
+      for (const row of rows) {
+        expect(row.type).toBe(0);
+        expect(row.queue).toBe(0);
+        expect(row.ivl).toBe(0);
+        expect(row.reps).toBe(0);
+      }
+    } finally {
+      archived.close();
+    }
+  });
+
+  it('11. reports the whole walk as a coherent set of stored rows', async () => {
+    // Two accounts, two documents (a PDF and a Word file), one deck each, cards that match,
+    // reviews that match, one share that was revoked, and a budget ledger that paid for every
+    // provider call.
     const counts = {
       users: (db.query('SELECT COUNT(*) AS n FROM users').get() as { n: number }).n,
       documents: (db.query('SELECT COUNT(*) AS n FROM documents').get() as { n: number }).n,
@@ -559,10 +739,10 @@ describe('Invite → upload → generate → inspect → study → reload → re
     };
 
     expect(counts.users).toBe(2);
-    expect(counts.documents).toBe(1);
-    expect(counts.decks).toBe(1);
-    expect(counts.cards).toBe(walked.cardIds.length);
-    expect(counts.reviews).toBe(3); // two by the owner, one by the reader
+    expect(counts.documents).toBe(2);
+    expect(counts.decks).toBe(2);
+    expect(counts.cards).toBe(walked.cardIds.length + walked.docxCardIds.length);
+    expect(counts.reviews).toBe(4); // two by the owner, one by the reader, one in the Word deck
     expect(counts.shares).toBe(1);
     expect(counts.activeShares).toBe(0);
     expect(counts.charges).toBeGreaterThan(0);

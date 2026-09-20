@@ -17,7 +17,15 @@ import { runGenerationJob, type RunOutcome } from './pipeline';
  * worker that dies leaves its job reclaimable once the lease expires rather than losing it.
  */
 
-export type WorkerEventType = 'claimed' | 'completed' | 'failed' | 'retrying' | 'idle' | 'error';
+export type WorkerEventType =
+  | 'claimed'
+  | 'completed'
+  | 'cancelled'
+  | 'paused'
+  | 'failed'
+  | 'retrying'
+  | 'idle'
+  | 'error';
 
 export interface WorkerEvent {
   type: WorkerEventType;
@@ -87,6 +95,11 @@ export class GenerationWorker {
         this.emit({ type: 'completed', jobId: job.id, outcome });
       } else if (outcome.state === 'pending') {
         this.emit({ type: 'retrying', jobId: job.id, outcome });
+      } else if (outcome.state === 'paused') {
+        // Stopped on purpose and still resumable, which is a third thing for a log reader.
+        this.emit({ type: 'paused', jobId: job.id, outcome });
+      } else if (outcome.errorCode === 'cancelled_by_user') {
+        this.emit({ type: 'cancelled', jobId: job.id, outcome });
       } else {
         this.emit({ type: 'failed', jobId: job.id, outcome });
       }
@@ -100,7 +113,9 @@ export class GenerationWorker {
         message,
         retryable: true,
       });
-      this.emit({ type: state === 'pending' ? 'retrying' : 'failed', jobId: job.id, message });
+      const type: WorkerEventType =
+        state === 'pending' ? 'retrying' : state === 'paused' ? 'paused' : 'failed';
+      this.emit({ type, jobId: job.id, message });
 
       return { state, conceptCount: 0, cardCount: 0, errorCode: 'pipeline_error', message };
     }

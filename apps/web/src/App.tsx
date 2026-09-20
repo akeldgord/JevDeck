@@ -10,8 +10,14 @@ import {
 } from '@jevdeck/contracts';
 import { generateFlashcardsFromSections } from '@jevdeck/generation';
 import { applyStudyReview, selectStudyQueue, type SM2Rating } from '@jevdeck/scheduling';
-import { ParsedPdfResult } from './lib/pdfParser';
+import type { ParsedDocument } from './lib/documentParser';
+import { readReportFromParsed, readReportFromStored, type ReadReport } from './lib/readReport';
+import { buildDeckList } from './lib/deckList';
+import { documentUploadPayload, retainsOriginal } from './lib/documentPayload';
+import { saveBytes } from './lib/download';
 import {
+  DailyAllowance,
+  GenerationJob,
   JobConcept,
   JobStatus,
   PublicInvitation,
@@ -24,16 +30,11 @@ import {
 import {
   cardsFromStoredDeck,
   deckFromStoredDeck,
-  flattenSectionsForStorage,
-  emptyPagesFromStoredDocument,
   pagesFromStoredDocument,
   sectionsFromStoredDocument,
 } from './lib/storedSource';
-import { toBase64, sha256Hex } from './lib/bytes';
+import { sha256Hex } from './lib/bytes';
 import { isDemoMode } from './config/runtime';
-
-/** Mirrors the API's retention cap; larger files are stored as extracted text only. */
-const MAX_RETAINED_SOURCE_BYTES = 16 * 1024 * 1024;
 
 /** How often generation progress is read while a job is queued or running. */
 const GENERATION_POLL_INTERVAL_MS = 1_500;
@@ -48,12 +49,13 @@ import {
   AdminUserRow,
 } from './components/AdminPanel';
 import { AuthView } from './components/AuthView';
+import { DeckBrowser } from './components/DeckBrowser';
 import { DemoBanner } from './components/DemoBanner';
 import { SharePanel, SharedWithYou } from './components/DeckSharing';
 import { DualGroundingViewer } from './components/DualGroundingViewer';
 import { ExportView } from './components/ExportView';
 import { GenerationView } from './components/GenerationView';
-import { Header, HeaderUser } from './components/Header';
+import { Header, HeaderUser, type AppTab } from './components/Header';
 import { StudyInterface } from './components/StudyInterface';
 
 /**
@@ -75,7 +77,7 @@ function readInvitationToken(): string | null {
 export default function App() {
   const session = useSession();
   const capabilities = session.capabilities;
-  const [activeTab, setActiveTab] = useState<'generator' | 'study' | 'admin' | 'export'>('generator');
+  const [activeTab, setActiveTab] = useState<AppTab>('generator');
   const [inviteToken, setInviteToken] = useState<string | null>(() => readInvitationToken());
 
   // Document and section state. Empty until a document is loaded.
@@ -85,6 +87,10 @@ export default function App() {
   const [deck, setDeck] = useState<Deck | null>(demo?.deck ?? null);
   const [coverageMode, setCoverageMode] = useState<CoverageMode>('comprehensive');
   const [isGenerating, setIsGenerating] = useState(false);
+  /** True while a pause, resume or cancel request for the run on screen is in flight. */
+  const [jobActionBusy, setJobActionBusy] = useState(false);
+  /** What a pause or resume request answered when it was not the plain success case. */
+  const [jobActionNotice, setJobActionNotice] = useState<string | null>(null);
   const [hasCustomToc, setHasCustomToc] = useState(demo !== null);
   const [cards, setCards] = useState<Flashcard[]>(demo?.cards ?? []);
 
@@ -100,13 +106,20 @@ export default function App() {
 
   // The caller's own scheduling state, as stored. What makes a session survive a reload: the
   // cards carry their schedule, and the queue below is built from it rather than from a count.
-  const [reviewsToday, setReviewsToday] = useState(0);
-  const [newCardsToday, setNewCardsToday] = useState(0);
+  // Named for what each one counts: schedule-affecting review events, and distinct cards
+  // introduced to the schedule. The review limit counts the first; the new-card limit the second.
+  const [reviewEventsToday, setReviewEventsToday] = useState(0);
+  const [newCardsIntroducedToday, setNewCardsIntroducedToday] = useState(0);
   const [suspendedCardIds, setSuspendedCardIds] = useState<string[]>([]);
   const [studyBusy, setStudyBusy] = useState(false);
   const [studyError, setStudyError] = useState<string | null>(null);
-  /** Pages of the loaded document that yielded no extractable text. */
-  const [extractionGaps, setExtractionGaps] = useState<number[]>([]);
+  /**
+   * What the open document's reader read, and what it did not.
+   *
+   * Built from the parse for a fresh upload and from the stored rows after a reload, so the account
+   * of the read survives the session that produced it.
+   */
+  const [readReport, setReadReport] = useState<ReadReport | null>(null);
 
   // Durable sources. In production these come from the API; the React copy above is a view
   // of them, not the authority, and is refilled from the server after a reload.
@@ -141,6 +154,11 @@ export default function App() {
    */
   const activeDeckIdRef = useRef<string | null>(null);
   const [storageBusy, setStorageBusy] = useState(false);
+  /** The deck a browsing action is running on, so only its row shows as busy. */
+  const [deckBusyId, setDeckBusyId] = useState<string | null>(null);
+  const [deckError, setDeckError] = useState<string | null>(null);
+  const [deckNotice, setDeckNotice] = useState<string | null>(null);
+  const [refreshingDecks, setRefreshingDecks] = useState(false);
   const [storageError, setStorageError] = useState<string | null>(null);
   const [storageNotice, setStorageNotice] = useState<string | null>(null);
 
@@ -305,7 +323,7 @@ export default function App() {
    * replaces the card list. Cards therefore never carry over to a document they were not
    * generated from.
    */
-  const handleDocumentUploaded = (result: ParsedPdfResult) => {
+  const handleDocumentUploaded = (result: ParsedDocument) => {
     const stamp = Date.now();
 
     setDeck({
@@ -322,9 +340,10 @@ export default function App() {
     });
     setSections(result.sections);
     setPages(result.pages);
-    setPdfBytes(result.bytes);
+    // Only a PDF can be re-rendered as pages; every other format stores its text as the record.
+    setPdfBytes(result.rendersPages ? result.bytes : null);
     setHasCustomToc(result.hasToc);
-    setExtractionGaps(result.emptyPages);
+    setReadReport(readReportFromParsed(result));
     setCards([]);
     setInspectingCard(null);
     setActiveDocumentId(null);
@@ -350,32 +369,12 @@ export default function App() {
    * Failure is reported rather than swallowed: an upload that is only in memory is lost on
    * reload, and the person who just uploaded a document should know that.
    */
-  const persistDocument = async (result: ParsedPdfResult) => {
+  const persistDocument = async (result: ParsedDocument) => {
     setStorageBusy(true);
 
     try {
       const contentHash = await sha256Hex(result.bytes);
-      const pageTexts = result.pages.map(page => ({
-        pageIndex: page.pageNumber,
-        // The printed label where the PDF states one, so a citation can name the page the way the
-        // book does rather than only by position.
-        ...(page.pageLabel ? { pageLabel: page.pageLabel } : {}),
-        // Line-preserving extraction; the server derives and stores its own normalized copy.
-        text: page.text,
-      }));
-
-      const created = await api.createDocument({
-        name: result.fileName,
-        pageCount: result.pageCount,
-        contentHash,
-        // The original file is retained so pages can be re-rendered later. The API caps the
-        // upload, so an oversized file is stored as text only rather than failing outright.
-        ...(result.bytes.byteLength <= MAX_RETAINED_SOURCE_BYTES
-          ? { bytesBase64: toBase64(result.bytes) }
-          : {}),
-        pages: pageTexts,
-        sections: flattenSectionsForStorage(result.sections),
-      });
+      const created = await api.createDocument(documentUploadPayload(result, contentHash));
 
       const createdDeck = await api.createDeck({
         title: result.fileName.replace(/\.[^/.]+$/, ''),
@@ -387,9 +386,10 @@ export default function App() {
       setActiveDocumentId(created.document.id);
       setActiveDeckId(createdDeck.deck.id);
       setActiveDeckAccess('owner');
-      // Pages that produced no text are named, not silently ignored: a scanned plate and a blank
-      // divider both yield nothing, and the difference matters to how much of the book is covered.
-      setExtractionGaps(result.emptyPages);
+      // What was read is now the server's record, so the report is rebuilt from the stored rows
+      // rather than left showing the browser's copy of the parse.
+      const stored = await api.getDocument(created.document.id);
+      setReadReport(readReportFromStored(stored));
 
       setDeck(previous =>
         previous
@@ -401,10 +401,14 @@ export default function App() {
             }
           : previous
       );
+      const kept = retainsOriginal(result);
       setStorageNotice(
-        result.bytes.byteLength <= MAX_RETAINED_SOURCE_BYTES
-          ? 'Stored on the server with its original file and section tree.'
-          : 'Stored on the server as extracted text. The original file was above the 16 MiB retention limit.'
+        `${result.format} stored as read: ${result.summary.textPages} of ${result.pageCount} page(s) readable` +
+          (result.media.length > 0 ? `, ${result.media.length} image(s) kept` : '') +
+          '. ' +
+          (kept
+            ? 'The original file is kept with it.'
+            : 'The original file was above the 16 MiB retention limit, so the extracted text is the record.')
       );
 
       await loadStoredSources();
@@ -419,8 +423,13 @@ export default function App() {
     }
   };
 
-  /** Reloads a document the account already owns. */
-  const handleOpenStoredDocument = async (documentId: string) => {
+  /**
+   * Reloads a document the account already owns.
+   *
+   * Returns whether it opened, so a caller that wants to continue — opening a deck and going
+   * straight to study — does not walk into an empty screen when the load failed.
+   */
+  const handleOpenStoredDocument = async (documentId: string): Promise<boolean> => {
     setStorageBusy(true);
     setStorageError(null);
     setStorageNotice(null);
@@ -450,7 +459,9 @@ export default function App() {
       setPages(storedPages);
       setSections(storedSections);
       setHasCustomToc(storedSections.length > 0);
-      setExtractionGaps(emptyPagesFromStoredDocument(detail));
+      // The reader's own account of this document, from the stored rows: the page kinds it
+      // recorded, its stored limitations, and the images it kept.
+      setReadReport(readReportFromStored(detail));
       setInspectingCard(null);
       setActiveDocumentId(documentId);
       setActiveDeckId(usableDeck.id);
@@ -482,8 +493,10 @@ export default function App() {
       }
 
       setStorageNotice(`Loaded “${detail.document.name}” from stored data.`);
+      return true;
     } catch (cause) {
       setStorageError(cause instanceof Error ? cause.message : 'Could not open that document.');
+      return false;
     } finally {
       setStorageBusy(false);
     }
@@ -496,9 +509,9 @@ export default function App() {
    * server enforces. The deck's cards and this account's own schedule are read from the server, so
    * a shared deck studies like any other deck while its source stays unreadable.
    */
-  const handleOpenSharedDeck = async (deckId: string) => {
+  const handleOpenSharedDeck = async (deckId: string): Promise<boolean> => {
     const storedDeck = storedDecks.find(entry => entry.id === deckId);
-    if (!storedDeck) return;
+    if (!storedDeck) return false;
 
     setOpeningDeckId(deckId);
     setStorageBusy(true);
@@ -517,8 +530,10 @@ export default function App() {
       setPages([]);
       setSections([]);
       setHasCustomToc(false);
-      setExtractionGaps([]);
       setPdfBytes(null);
+      // The source document is not readable here, so there is no read report to show: a report
+      // built from a document this account cannot open would be a report about someone else's file.
+      setReadReport(null);
 
       setActiveDeckId(storedDeck.id);
       setActiveDeckAccess(storedDeck.access);
@@ -528,10 +543,12 @@ export default function App() {
 
       await loadDeckCards(storedDeck.id, storedDeck.documentId ?? '', new Map());
       setStorageNotice(`Opened “${storedDeck.title}”, shared with you for study.`);
+      return true;
     } catch (cause) {
       setStorageError(
         cause instanceof Error ? cause.message : 'That shared deck could not be opened.'
       );
+      return false;
     } finally {
       setStorageBusy(false);
       setOpeningDeckId(null);
@@ -558,8 +575,7 @@ export default function App() {
       setSuspendedCardIds(
         deckSchedule.states.filter(state => state.suspended === 1).map(state => state.card_id)
       );
-      setReviewsToday(deckSchedule.reviewsToday);
-      setNewCardsToday(deckSchedule.newCardsToday);
+      applyDailyAllowance(deckSchedule);
 
       setCards(
         cardsFromStoredDeck(stored.cards, stored.evidence, {
@@ -600,6 +616,18 @@ export default function App() {
   }, []);
 
   /**
+   * Today's allowance, straight from the response that changed it.
+   *
+   * Every path that can move the counters — loading a deck, rating a card, undoing one — carries
+   * the server's own recount, so the numbers on screen are the event history rather than this
+   * client's arithmetic on top of it.
+   */
+  const applyDailyAllowance = useCallback((daily: DailyAllowance) => {
+    setReviewEventsToday(daily.reviewEventsToday);
+    setNewCardsIntroducedToday(daily.newCardsIntroducedToday);
+  }, []);
+
+  /**
    * Records one rating.
    *
    * The server recomputes the schedule from the events it holds and returns the result, so what
@@ -622,7 +650,6 @@ export default function App() {
       throw new Error('Study progress cannot be saved without a signed-in session.');
     }
 
-    const wasNew = (card.repetition ?? 0) === 0 && !card.lastStudiedAt;
     setStudyBusy(true);
     setStudyError(null);
 
@@ -634,8 +661,10 @@ export default function App() {
       });
 
       applyCardState(card.id, outcome.state);
-      setReviewsToday(count => count + 1);
-      if (wasNew) setNewCardsToday(count => count + 1);
+      // Today's allowance as the server counted it, not as this client guessed. Incrementing here
+      // would be wrong for an isolated cram review (which counts nothing), for a repeat review of
+      // one new card (one card, two reviews), and for anything another client did.
+      applyDailyAllowance(outcome.daily);
       void loadUsage();
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : 'That rating was not saved.';
@@ -657,16 +686,131 @@ export default function App() {
       const result = await api.undoReview(cardId);
       applyCardState(cardId, result.state);
 
-      // Today's allowance is not decremented by guesswork: it is re-read from the events.
-      const deckSchedule = await api.deckSchedule(activeDeckId);
-      setReviewsToday(deckSchedule.reviewsToday);
-      setNewCardsToday(deckSchedule.newCardsToday);
+      // Today's allowance is not decremented by guesswork: removing the event may or may not have
+      // un-introduced the card, and the server recounts from what is left.
+      applyDailyAllowance(result.daily);
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : 'That review could not be undone.';
       setStudyError(message);
       throw new Error(message);
     } finally {
       setStudyBusy(false);
+    }
+  };
+
+  /**
+   * Opens the deck a browsing row names, with its source when this account owns it.
+   *
+   * A shared deck opens its cards and nothing else, because its document is not readable here —
+   * the server refuses it, so offering the source would be a dead end.
+   */
+  const handleOpenDeckRow = async (deckId: string): Promise<boolean> => {
+    const row = storedDecks.find(entry => entry.id === deckId);
+    if (!row) return false;
+
+    setDeckError(null);
+    setDeckNotice(null);
+
+    if (row.access === 'shared') return handleOpenSharedDeck(deckId);
+
+    if (!row.documentId) {
+      setDeckError(
+        'That deck’s document was deleted, so its source can no longer be opened. Its cards are still here.'
+      );
+      return false;
+    }
+
+    return handleOpenStoredDocument(row.documentId);
+  };
+
+  /**
+   * Opens a deck's source and moves to the screen that shows it.
+   *
+   * The deck list is a list, not a workspace: leaving the caller on it after "Open with source"
+   * would look like nothing happened, because the document and its sections belong to the
+   * generation screen. A study row lands on the session instead.
+   */
+  const handleOpenDeckWithSource = async (deckId: string) => {
+    if (await handleOpenDeckRow(deckId)) setActiveTab('generator');
+  };
+
+  /** Opens a deck and goes straight to studying it, or stays put if it could not be opened. */
+  const handleStudyDeckRow = async (deckId: string) => {
+    if (await handleOpenDeckRow(deckId)) setActiveTab('study');
+  };
+
+  /** Downloads one deck's package, from its own row. */
+  const handleExportDeckRow = async (deckId: string) => {
+    setDeckBusyId(deckId);
+    setDeckError(null);
+    setDeckNotice(null);
+
+    try {
+      const file = await api.downloadApkg(deckId);
+      saveBytes(file.bytes, file.fileName, 'application/octet-stream');
+      setDeckNotice(
+        `Downloaded “${file.fileName}”. Every card in it arrives new: no review history is transferred.`
+      );
+    } catch (cause) {
+      setDeckError(cause instanceof Error ? cause.message : 'That deck could not be exported.');
+    } finally {
+      setDeckBusyId(null);
+    }
+  };
+
+  /**
+   * Deletes a deck and its cards, leaving its document alone.
+   *
+   * The document is intentionally kept: it can back more than one deck, and silently removing a
+   * source because a deck was deleted would be a surprise.
+   */
+  const handleDeleteDeckRow = async (deckId: string) => {
+    const row = storedDecks.find(entry => entry.id === deckId);
+    if (!row) return;
+
+    const confirmed =
+      typeof window === 'undefined' ||
+      window.confirm(
+        `Delete “${row.title}” and its ${row.cardCount} card${row.cardCount === 1 ? '' : 's'}? The document it was generated from is kept.`
+      );
+    if (!confirmed) return;
+
+    setDeckBusyId(deckId);
+    setDeckError(null);
+    setDeckNotice(null);
+
+    try {
+      await api.deleteDeck(deckId);
+
+      // Nothing on the other tabs should keep pointing at a deck that no longer exists.
+      if (activeDeckId === deckId) {
+        setActiveDeckId(null);
+        setDeck(null);
+        setCards([]);
+        setPages([]);
+        setSections([]);
+        setPdfBytes(null);
+        setActiveDocumentId(null);
+        setReadReport(null);
+      }
+
+      setDeckNotice(`Deleted “${row.title}”. Its document is still stored.`);
+      await loadStoredSources();
+    } catch (cause) {
+      setDeckError(cause instanceof Error ? cause.message : 'That deck could not be deleted.');
+    } finally {
+      setDeckBusyId(null);
+    }
+  };
+
+  /** Re-reads the deck list from the server, which is the only authority on what exists. */
+  const handleRefreshDecks = async () => {
+    setDeckError(null);
+    setRefreshingDecks(true);
+    try {
+      await loadStoredSources();
+    } finally {
+      setRefreshingDecks(false);
     }
   };
 
@@ -713,6 +857,93 @@ export default function App() {
    * the cards shown afterwards are read back from the server, so nothing on screen is a guess.
    * Demo mode is the only path that produces cards locally, and it is labelled as a simulation.
    */
+  /**
+   * Follows a queued run to its end and loads what it produced.
+   *
+   * Separate from starting one because a resumed run has to be followed too: resuming puts the job
+   * back in the queue, and the screen has to pick its result up the same way it does for a run it
+   * started itself. Everything shown is read from the job record, so a run that was paused and
+   * continued reports its whole history rather than only the part after the resume.
+   */
+  const followRun = async (
+    runId: number,
+    runDeckId: string,
+    queued: GenerationJob
+  ): Promise<void> => {
+    /** True while this run is still the active one, for the deck the screens are showing. */
+    const stillCurrent = (): boolean =>
+      generationRunRef.current === runId && activeDeckIdRef.current === runDeckId;
+
+    if (!stillCurrent()) return;
+
+    let latest: JobStatus = { job: queued, omissions: [], coverageSummary: null };
+    setGeneration(latest);
+    setGenerationError(null);
+
+    const deadline = Date.now() + GENERATION_POLL_TIMEOUT_MS;
+    let state = queued.state;
+
+    while (state === 'pending' || state === 'processing') {
+      if (Date.now() > deadline) {
+        setGenerationError(
+          'Generation is taking longer than expected. It is still queued on the server; reopen this document to see the result.'
+        );
+        return;
+      }
+
+      await new Promise(resolve => setTimeout(resolve, GENERATION_POLL_INTERVAL_MS));
+      // Another document was opened: stop reporting on a deck that is no longer on screen.
+      if (!stillCurrent()) return;
+
+      latest = await api.getJob(queued.id);
+      setGeneration(latest);
+      state = latest.job.state;
+    }
+
+    if (state !== 'completed') {
+      // A stopped run records why, and a paused one records how far it got. Saying either is the
+      // point of recording it; the run's own controls offer the next step.
+      setGenerationError(
+        latest.job.errorMessage ?? 'Generation did not complete, and the job recorded no reason.'
+      );
+      return;
+    }
+
+    const [concepts, stored] = await Promise.all([
+      api.jobConcepts(queued.id),
+      api.deckCards(runDeckId),
+    ]);
+
+    if (!stillCurrent()) return;
+
+    setJobConcepts(concepts.concepts);
+    setCards(
+      cardsFromStoredDeck(stored.cards, stored.evidence, {
+        deckId: runDeckId,
+        documentId: stored.deck.documentId ?? deck?.documentId ?? '',
+        sectionTitleBySection: new Map(
+          sections.flatMap(section => [
+            [section.id, section.title] as [string, string],
+            ...(section.subsections ?? []).map(
+              child => [child.id, child.title] as [string, string]
+            ),
+          ])
+        ),
+      })
+    );
+    setDeck(previous =>
+      previous
+        ? {
+            ...previous,
+            cardCount: stored.deck.cardCount,
+            coverageMode,
+            updatedAt: stored.deck.updatedAt,
+          }
+        : previous
+    );
+    setActiveTab('study');
+  };
+
   const handleStartGeneration = async () => {
     if (!capabilities.generation.available) return;
     if (!deck || pages.length === 0) return;
@@ -776,88 +1007,122 @@ export default function App() {
     const runDeckId = activeDeckId;
     setIsGenerating(true);
 
-    /** True while this run is still the active one, for the deck the screens are showing. */
-    const stillCurrent = (): boolean =>
-      generationRunRef.current === runId && activeDeckIdRef.current === runDeckId;
-
     try {
       const { job } = await api.generateDeck(runDeckId, {
         coverage: coverageMode,
         sectionIds: selectedSectionIds(),
       });
 
-      if (!stillCurrent()) return;
-
-      let latest: JobStatus = { job, omissions: [], coverageSummary: null };
-      setGeneration(latest);
-
-      const deadline = Date.now() + GENERATION_POLL_TIMEOUT_MS;
-      let state = job.state;
-
-      while (state === 'pending' || state === 'processing') {
-        if (Date.now() > deadline) {
-          setGenerationError(
-            'Generation is taking longer than expected. It is still queued on the server; reopen this document to see the result.'
-          );
-          return;
-        }
-
-        await new Promise(resolve => setTimeout(resolve, GENERATION_POLL_INTERVAL_MS));
-        // Another document was opened: stop reporting on a deck that is no longer on screen.
-        if (!stillCurrent()) return;
-
-        latest = await api.getJob(job.id);
-        setGeneration(latest);
-        state = latest.job.state;
-      }
-
-      if (latest.job.state !== 'completed') {
-        // The job records why it failed. Showing that is the point of recording it.
-        setGenerationError(
-          latest.job.errorMessage ?? 'Generation did not complete, and the job recorded no reason.'
-        );
-        return;
-      }
-
-      const [concepts, stored] = await Promise.all([
-        api.jobConcepts(job.id),
-        api.deckCards(runDeckId),
-      ]);
-
-      if (!stillCurrent()) return;
-
-      setJobConcepts(concepts.concepts);
-      setCards(
-        cardsFromStoredDeck(stored.cards, stored.evidence, {
-          deckId: runDeckId,
-          documentId: stored.deck.documentId ?? deck.documentId,
-          sectionTitleBySection: new Map(
-            sections.flatMap(section => [
-              [section.id, section.title] as [string, string],
-              ...(section.subsections ?? []).map(
-                child => [child.id, child.title] as [string, string]
-              ),
-            ])
-          ),
-        })
-      );
-      setDeck(previous =>
-        previous
-          ? {
-              ...previous,
-              cardCount: stored.deck.cardCount,
-              coverageMode,
-              updatedAt: stored.deck.updatedAt,
-            }
-          : previous
-      );
-      setActiveTab('study');
+      await followRun(runId, runDeckId, job);
     } catch (cause) {
       setGenerationError(
         cause instanceof Error ? cause.message : 'Generation could not be started.'
       );
     } finally {
       // Only this run's own flag: a superseded run must not clear a newer one's.
+      if (generationRunRef.current === runId) setIsGenerating(false);
+    }
+  };
+
+  /**
+   * Asks the server to stop the run being followed, discarding it.
+   *
+   * The screen does not assume the run has stopped: it reports what the API says happened. A run
+   * nobody is processing is cancelled outright; one a worker holds is asked to stop, and the
+   * polling loop above ends when the job records its terminal state.
+   */
+  const handleCancelGeneration = async (): Promise<void> => {
+    const jobId = generation?.job.id;
+    if (!jobId) return;
+
+    setJobActionBusy(true);
+    setJobActionNotice(null);
+    try {
+      const { job } = await api.cancelJob(jobId);
+      setGeneration(previous => (previous ? { ...previous, job } : previous));
+
+      if (job.state === 'failed') {
+        setGenerationError(job.errorMessage ?? 'The run was cancelled.');
+      }
+    } catch (cause) {
+      setGenerationError(
+        cause instanceof Error ? cause.message : 'The run could not be cancelled.'
+      );
+    } finally {
+      setJobActionBusy(false);
+    }
+  };
+
+  /**
+   * Asks the server to stop the run being followed while keeping everything it has paid for.
+   *
+   * The polling loop that is watching the run ends when the job records its `paused` state, and
+   * the run panel then offers Resume.
+   */
+  const handlePauseGeneration = async (): Promise<void> => {
+    const jobId = generation?.job.id;
+    if (!jobId) return;
+
+    setJobActionBusy(true);
+    setJobActionNotice(null);
+    try {
+      const { job } = await api.pauseJob(jobId);
+      setGeneration(previous => (previous ? { ...previous, job } : previous));
+    } catch (cause) {
+      setJobActionNotice(cause instanceof Error ? cause.message : 'The run could not be paused.');
+    } finally {
+      setJobActionBusy(false);
+    }
+  };
+
+  /**
+   * Queues a stopped run again and follows it to its end.
+   *
+   * A resumed run is the same job continuing, not a new one, so it is followed with the same logic
+   * a freshly started run uses — the deck it belongs to, its own run id, and its result loaded from
+   * the stored deck once it finishes.
+   */
+  const handleResumeGeneration = async (): Promise<void> => {
+    const jobId = generation?.job.id;
+    const runDeckId = activeDeckId;
+    if (!jobId || !runDeckId) return;
+
+    setJobActionBusy(true);
+    setJobActionNotice(null);
+
+    let result: Awaited<ReturnType<typeof api.resumeJob>>;
+    try {
+      result = await api.resumeJob(jobId);
+    } catch (cause) {
+      setJobActionNotice(cause instanceof Error ? cause.message : 'The run could not be resumed.');
+      return;
+    } finally {
+      setJobActionBusy(false);
+    }
+
+    setGeneration(previous => (previous ? { ...previous, job: result.job } : previous));
+
+    if (result.outcome !== 'resumed') {
+      // Each refusal is a different answer about the run, and each is worth saying plainly rather
+      // than leaving a button that appears to have done nothing.
+      setJobActionNotice(
+        result.outcome === 'nothing_to_resume'
+          ? 'This run has no stored progress to continue from, so resuming it would start the work again. Generate again instead.'
+          : result.outcome === 'already_running'
+            ? 'This run is already queued on the server.'
+            : 'This run has already finished; there is nothing to resume.'
+      );
+      return;
+    }
+
+    const runId = generationRunRef.current + 1;
+    generationRunRef.current = runId;
+    setGenerationError(null);
+    setIsGenerating(true);
+
+    try {
+      await followRun(runId, runDeckId, result.job);
+    } finally {
       if (generationRunRef.current === runId) setIsGenerating(false);
     }
   };
@@ -989,10 +1254,10 @@ export default function App() {
         cards,
         mode: isCramSession ? 'cram' : 'normal',
         suspendedCardIds,
-        reviewsCompletedToday: reviewsToday,
-        newCardsCompletedToday: newCardsToday,
+        reviewEventsToday,
+        newCardsIntroducedToday,
       }),
-    [cards, isCramSession, newCardsToday, reviewsToday, suspendedCardIds]
+    [cards, isCramSession, newCardsIntroducedToday, reviewEventsToday, suspendedCardIds]
   );
 
   const dueCardCount = studyQueue.counts.due + studyQueue.counts.new;
@@ -1002,6 +1267,24 @@ export default function App() {
 
   /** Decks other accounts have shared with this one, for study only. */
   const sharedDecks = storedDecks.filter(entry => entry.access === 'shared');
+
+  /**
+   * The decks screen's rows.
+   *
+   * Derived from what the server returned, with the actions each row may offer matching what the
+   * server will allow — export and source access are owner-only, and a shared row says why instead
+   * of showing a button that would be refused.
+   */
+  const deckList = useMemo(
+    () =>
+      buildDeckList({
+        owned: storedDecks.filter(entry => entry.access === 'owner'),
+        shared: sharedDecks,
+        documentNames: new Map(storedDocuments.map(document => [document.id, document.name])),
+        activeDeckId,
+      }),
+    [activeDeckId, sharedDecks, storedDecks, storedDocuments]
+  );
 
   /** Why generation is unavailable right now, or `null` when it is available. */
   const budgetNotice = (() => {
@@ -1100,10 +1383,33 @@ export default function App() {
               jobStatus={generation}
               jobConcepts={jobConcepts}
               generationError={generationError}
+              onCancelGeneration={() => void handleCancelGeneration()}
+              onPauseGeneration={() => void handlePauseGeneration()}
+              onResumeGeneration={() => void handleResumeGeneration()}
+              generationActionBusy={jobActionBusy}
+              generationActionNotice={jobActionNotice}
               budgetNotice={budgetNotice}
-              extractionGaps={extractionGaps}
+              readReport={readReport}
               />
             </div>
+          )}
+
+          {activeTab === 'decks' && (
+            <DeckBrowser
+              list={deckList}
+              activeDeckId={activeDeckId}
+              busyDeckId={deckBusyId}
+              error={deckError}
+              notice={deckNotice}
+              isDemo={isDemoMode}
+              canPersist={canPersistStudy}
+              onOpen={deckId => void handleOpenDeckWithSource(deckId)}
+              onStudy={deckId => void handleStudyDeckRow(deckId)}
+              onExport={deckId => void handleExportDeckRow(deckId)}
+              onRemove={deckId => void handleDeleteDeckRow(deckId)}
+              onRefresh={() => void handleRefreshDecks()}
+              refreshing={refreshingDecks}
+            />
           )}
 
           {activeTab === 'study' && (

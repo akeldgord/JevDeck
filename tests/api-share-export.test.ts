@@ -309,28 +309,39 @@ describe('Export is a real package and belongs to the owner', () => {
     archived.close();
   });
 
-  it('carries the schedule the owner actually earned', async () => {
-    /** Reads the archived collection's card row, the one Anki's importer will use. */
-    async function readScheduledCard(archive: Uint8Array, label: string) {
+  it('exports a studied deck as new cards, and carries no review history across', async () => {
+    /** Reads the archived collection the way Anki's importer will: its cards and its review log. */
+    async function readArchived(archive: Uint8Array, label: string) {
       const collectionPath = join(scratch, `collection-${label}.anki2`);
       await Bun.write(collectionPath, readZip(archive).get('collection.anki2')!);
 
       const archived = new Database(collectionPath, { readonly: true });
-      const row = archived
-        .query('SELECT due, type, ivl, reps FROM cards')
-        .get() as { due: number; type: number; ivl: number; reps: number };
+      const cards = archived
+        .query(
+          'SELECT due, type, queue, ivl, factor, reps, lapses FROM cards ORDER BY id ASC'
+        )
+        .all() as Array<{
+        due: number;
+        type: number;
+        queue: number;
+        ivl: number;
+        factor: number;
+        reps: number;
+        lapses: number;
+      }>;
+      const revlog = archived.query('SELECT COUNT(*) AS n FROM revlog').get() as { n: number };
       archived.close();
 
-      return row;
+      return { cards, revlogCount: revlog.n };
     }
 
-    const before = await readScheduledCard(
-      (await admin.download(`/api/decks/${created.deckId}/export.apkg`)).bytes,
-      'before'
-    );
+    const download = async (label: string) =>
+      readArchived((await admin.download(`/api/decks/${created.deckId}/export.apkg`)).bytes, label);
+
+    const before = await download('before');
     // Unstudied here means new on arrival, which is what Anki expects of a fresh export.
-    expect(before.type).toBe(0);
-    expect(before.reps).toBe(0);
+    expect(before.cards[0].type).toBe(0);
+    expect(before.cards[0].reps).toBe(0);
 
     const review = await admin.call(`/api/cards/${created.cardId}/reviews`, {
       method: 'POST',
@@ -338,16 +349,29 @@ describe('Export is a real package and belongs to the owner', () => {
     });
     expect(review.status).toBe(200);
 
-    const after = await readScheduledCard(
-      (await admin.download(`/api/decks/${created.deckId}/export.apkg`)).bytes,
-      'after'
-    );
+    // The card really is studied in JevDeck now: an interval, a due date and a repetition count.
+    const schedule = await admin.call(`/api/decks/${created.deckId}/schedule`);
+    const studied = schedule.body.states.find((row: any) => row.card_id === created.cardId);
+    expect(studied.repetition).toBe(1);
+    expect(studied.due_at).not.toBeNull();
 
-    // The reviewed card arrives as a review card, on the interval SM-2 gave it.
-    expect(after.type).toBe(2);
-    expect(after.ivl).toBe(review.body.state.intervalDays);
-    expect(after.reps).toBe(1);
-    expect(after.due).toBeGreaterThan(0);
+    const after = await download('after');
+
+    // And it still arrives new. This is the contract, not an oversight: an export is a fresh
+    // schedule, so no interval, due date or repetition count is transferred — the previous version
+    // exported this card as a review card on its in-app interval, which promised a synchronization
+    // the product does not offer.
+    expect(after.cards.length).toBe(1);
+    expect(after.cards[0].type).toBe(0);
+    expect(after.cards[0].queue).toBe(0);
+    expect(after.cards[0].ivl).toBe(0);
+    expect(after.cards[0].factor).toBe(2500);
+    expect(after.cards[0].reps).toBe(0);
+    expect(after.cards[0].lapses).toBe(0);
+
+    // No review history either, in either package.
+    expect(before.revlogCount).toBe(0);
+    expect(after.revlogCount).toBe(0);
   });
 
   it('refuses export to anyone who is not the owner', async () => {

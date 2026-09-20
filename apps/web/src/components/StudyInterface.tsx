@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Flashcard } from '@jevdeck/contracts';
 import {
   calculateSM2,
+  describeDailyAllowance,
   describeQueue,
   type SM2Rating,
   type StudyQueue,
@@ -172,6 +173,12 @@ export const StudyInterface: React.FC<Props> = ({
   }, [currentCard, handleRate, handleUndo, isFlipped, showCramSettingsModal]);
 
   const queueSummary = useMemo(() => describeQueue(queue.counts), [queue.counts]);
+  // Stated in full rather than as "12 / 20": the limits count two different things, and a reader
+  // cannot tell from a bare fraction whether it is cards or ratings.
+  const allowanceSummary = useMemo(
+    () => describeDailyAllowance(queue.allowance, queue.limits),
+    [queue.allowance, queue.limits]
+  );
   const suspended = currentCard ? suspendedCardIds.includes(currentCard.id) : false;
 
   if (cards.length === 0) {
@@ -368,6 +375,18 @@ export const StudyInterface: React.FC<Props> = ({
           )}
         </div>
       </div>
+
+      {isCramSession ? (
+        // Cram does not spend a daily allowance, and saying so is the honest version of "no limits".
+        <div className="rounded-2xl border border-amber-900/40 bg-amber-950/10 px-4 py-2 text-[11px] text-amber-200/80">
+          Cram session: the daily limits do not apply, and nothing here is counted against today's
+          allowance.
+        </div>
+      ) : (
+        <div className="rounded-2xl border border-slate-800 bg-slate-900/40 px-4 py-2 text-[11px] text-slate-400">
+          Today's allowance: {allowanceSummary}.
+        </div>
+      )}
 
       {queueSummary && (
         <div className="rounded-2xl border border-slate-800 bg-slate-900/40 px-4 py-2 text-[11px] text-slate-400">

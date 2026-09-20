@@ -4,6 +4,7 @@ import {
   Brain,
   Shield,
   Download,
+  FolderOpen,
   Sparkles,
   DollarSign,
   UserRound,
@@ -11,7 +12,7 @@ import {
 } from 'lucide-react';
 import { SimulatedBadge } from './DemoBanner';
 
-export type AppTab = 'generator' | 'study' | 'admin' | 'export';
+export type AppTab = 'generator' | 'decks' | 'study' | 'admin' | 'export';
 
 export interface HeaderUser {
   name: string;
@@ -76,6 +77,12 @@ export const Header: React.FC<HeaderProps> = ({
               onClick={() => setActiveTab('generator')}
               icon={<BookOpen className="w-4 h-4" />}
               label="Generate & Sections"
+            />
+            <TabButton
+              active={activeTab === 'decks'}
+              onClick={() => setActiveTab('decks')}
+              icon={<FolderOpen className="w-4 h-4" />}
+              label="Decks"
             />
             <TabButton
               active={activeTab === 'study'}

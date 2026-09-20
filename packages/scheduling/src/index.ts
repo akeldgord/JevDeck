@@ -82,11 +82,11 @@ export function applyStudyReview(
   now: Date = new Date()
 ): Flashcard {
   if (isCramSession && !modifyScheduleInCram) {
-    // Cram session without schedule impact: keep existing repetition, interval, EF and dueDate intact!
-    return {
-      ...card,
-      lastStudiedAt: now.toISOString()
-    };
+    // Cram session without schedule impact: keep existing repetition, interval, EF and dueDate
+    // intact — and `lastStudiedAt` too. That field means "the schedule has seen this card", and it
+    // is what tells a new card from a studied one, so moving it here would take a card the learner
+    // never scheduled out of the new queue.
+    return { ...card };
   }
 
   const updated = calculateSM2(card, rating, now);
@@ -130,3 +130,18 @@ export {
   type StudyQueueCounts,
   type StudyQueueInput,
 } from './study';
+
+/**
+ * Daily accounting: what the limits count, and the day they reset on.
+ *
+ * Exported so the server (which counts the events) and the study screen (which explains them) are
+ * reading the same definitions rather than agreeing by convention.
+ */
+export {
+  STUDY_DAY_TIMEZONE,
+  describeDailyAllowance,
+  startOfStudyDay,
+  studyDayPeriod,
+  type DailyStudyCounts,
+  type StudyDayPeriod,
+} from './daily';

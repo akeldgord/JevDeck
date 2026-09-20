@@ -8,8 +8,9 @@
 const BASE64_LIMIT = 0x8000;
 
 /** Standard base64. Chunked so a large document does not blow the argument limit. */
-export function toBase64(bytes: ArrayBuffer): string {
-  const view = new Uint8Array(bytes);
+export function toBase64(bytes: ArrayBuffer | Uint8Array): string {
+  // `new Uint8Array(view)` copies a view's bytes; `new Uint8Array(buffer)` wraps a buffer.
+  const view = new Uint8Array(bytes as ArrayBuffer);
   let binary = '';
 
   for (let offset = 0; offset < view.length; offset += BASE64_LIMIT) {

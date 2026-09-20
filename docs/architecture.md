@@ -14,7 +14,8 @@ scheduling and export honestly; the server-side components it will need are not 
 
 | Layer | Status |
 | --- | --- |
-| `apps/web` | Implemented: PDF parsing, section selection, coverage choice, SM-2 study, cram mode, page viewer, text exports, invitation/sign-in flow, stored-document list |
+| `apps/web` | Implemented: multi-format ingestion (PDF, `.docx`, `.pptx`, Markdown, text, pasted notes), a "what was read" report with the reader's own limitations, section selection, coverage choice, SM-2 study, cram mode, page viewer, stored media, deck browsing, text exports, invitation/sign-in flow, stored-document list. `lib/documentParser.ts` only decides which reader to run; the shape every reader converges on, and the mapping into the upload payload, are in `lib/parsedDocument.ts` and `lib/documentPayload.ts`, so the non-PDF path does not need the browser's PDF engine |
+| `packages/ingestion` | Implemented: OOXML (`.docx`, `.pptx`), Markdown, text and pasted-note readers, a ZIP reader, image collection, and the coverage summary. Format detection and refusals name the formats that do work |
 | `packages/generation` | **Local demo simulator only.** Heuristic sentence selection and key-phrase deletion over extracted text. Not a provider-backed pipeline, and unreachable unless demo mode is enabled. |
 | `packages/contracts`, `packages/scheduling`, `packages/validation`, `packages/anki_export` | Implemented |
 | `apps/api` | Implemented: HTTP server, versioned migrations, accounts, sessions, invitations, owner-scoped documents/decks/cards/evidence/reviews/jobs, static hosting of the built web app |
@@ -88,6 +89,28 @@ Retryable failures return the job to `pending` behind a backoff and increment it
 exhausted attempts leave it `failed` with the reason recorded, and the reason is what the owner
 is shown.
 
+A run can also be stopped on purpose, in two ways. `POST /api/jobs/:id/pause` is the resumable one:
+the run moves to `paused`, releases its lease, records no finish time and keeps what it had already
+paid for. `POST /api/jobs/:id/cancel` is terminal and discards the un-stored cards, ending as
+`failed` with `error_code = 'cancelled_by_user'` — the state vocabulary has no `cancelled` member
+and the CHECK constraint cannot be widened by a migration that runs inside a transaction, so the
+code is what carries the distinction. Both are owner-scoped, and both work the same way against a
+worker: one nobody has claimed is stopped outright, and one a worker holds gets a request that the
+pipeline honours immediately before its next paid call and at each phase boundary. `claimNextJob`
+refuses a job with a cancel request and `failJob` refuses to return one to `pending`, which is what
+makes a cancellation terminal rather than a race the next poll can lose.
+
+**Progress is stored, so a stop is not a restart.** After every batch the pipeline writes a
+checkpoint onto the job — how many extraction batches are complete with the concepts they returned,
+how many generation batches are complete with the cards they produced and verified — and clears it
+when the run finishes. A later attempt loads it, validates it against the job's source version,
+coverage mode, selection and pipeline version, and skips the batches it covers. Everything
+downstream of those batches — the inventory, the coverage selection, the format decisions — is a
+pure function of the candidates and the stored source, so it is recomputed rather than stored, at
+no provider cost. A checkpoint that fails any identity check is ignored rather than repaired, and
+`resume` answers `nothing_to_resume` rather than queueing a run it cannot continue: silently
+starting the plan over is the one outcome this design exists to prevent.
+
 The pipeline is ordered so that the provider proposes and the stored source disposes:
 
 1. **Concept extraction.** The selected sections' stored page text is sent to the bounded
@@ -115,8 +138,29 @@ Spending is bounded by the same tables it reports from: a provider call is reser
 append-only usage ledger before it is made and settled after, so concurrent workers cannot pass
 the available headroom, and a refusal names the cap that stopped it.
 
-What the backend still does not do: serve extracted media, ingest anything but PDF, or hold a
-card-approval queue (deliberately — withheld cards are counted and explained instead).
+## Ingestion
+
+Every format is read by its own reader into one shape: pages with a kind, a section tree, the
+images the format carried, the original bytes, how page numbers came to exist, and a list of what
+the reader did not do. `packages/ingestion` holds the `.docx`, `.pptx`, Markdown, text and
+pasted-note readers and the OOXML container support; the PDF reader stays in the browser, where the
+PDF engine is, and `apps/web/src/lib/documentParser.ts` dispatches between them. The API validates
+the format and page-kind vocabulary against the same definitions the readers use.
+
+A page that yields no extractable text is one of two different facts and is stored as such: `blank`
+for a page with nothing on it, `image-only` for a page whose content is a picture this build cannot
+read. OCR is not implemented, so the second is a coverage gap, and the coverage report — not the
+page count — is where that shows. Text is the evidence: a page with text is a readable page
+whatever a caller labels it.
+
+Images are stored as rows beside the version that carried them and served one at a time from
+`GET /api/media/:id`, which resolves them through their document and answers 404 to anyone who does
+not own it. PDF images are not extracted, and the export bundles no media.
+
+## What the backend still does not do
+
+Read a scanned page, extract images from a PDF, or hold a card-approval queue (deliberately —
+withheld cards are counted and explained instead).
 
 ## The boundary that matters most
 
@@ -135,6 +179,7 @@ jevdeck/
     worker/                  # Durable queue and the generation pipeline
   packages/
     contracts/               # Shared schemas and DTOs
+    ingestion/               # Multi-format readers, container support, coverage summary
     generation/              # Concept inventory, coverage, format decision (pure)
     validation/              # Structure, grounding, claim support, duplicates
     providers/               # Provider adapters, prompt loading, output parsing
@@ -149,9 +194,9 @@ jevdeck/
   docs/                      # Specification, architecture, self-hosting, decisions
 ```
 
-Still absent: ingestion beyond PDF, media extraction, deck browsing, and a passing measurement of
-the §5 quality gates. Containers, Compose and CI now exist. Exact directory names are optional;
-functional boundaries and a runnable installation are not.
+Still absent: OCR, PDF image extraction, and a passing measurement of the §5 quality gates.
+Containers, Compose and CI exist. Exact directory names are optional; functional boundaries and a
+runnable installation are not.
 
 ### Where the evaluation lives
 

@@ -16,6 +16,7 @@
     { "path": "./packages/contracts" },
     { "path": "./packages/scheduling" },
     { "path": "./packages/validation" },
+    { "path": "./packages/ingestion" },
     { "path": "./packages/generation" },
     { "path": "./packages/providers" },
     { "path": "./packages/anki_export" },

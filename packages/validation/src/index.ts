@@ -130,50 +130,102 @@ export function quantitiesAgree(claim: string, source: string): { agree: boolean
 }
 
 /**
- * Similarity above which a source sentence is treated as the passage a claim restates.
+ * The version of the claim-support contract.
  *
- * Used only to scope the negation check. Below it, no sentence is clearly the one the claim rests
- * on, and the coarse whole-page comparison is kept.
+ * Stored on every card's validation result. A judgement made by one version of these rules is not
+ * the same judgement as a later version's, so a stored reason is only readable next to the rules
+ * that produced it. Bump this whenever `validateClaimSupport` changes what it concludes.
  */
-const NEGATION_SCOPE_SIMILARITY = 0.5;
+export const CLAIM_SUPPORT_VALIDATOR_VERSION = 'claim-support/v2';
 
-/** Splits stored page text into sentences. Abbreviations are not resolved; this is a scope hint. */
-function splitIntoSentences(value: string): string[] {
-  return collapse(value)
-    .split(/(?<=[.!?])\s+/)
-    .map(sentence => sentence.trim())
-    .filter(sentence => sentence.length > 0);
+/**
+ * Similarity above which a claim is treated as a restatement of an evidence sentence.
+ *
+ * This gates one inference only: two passages this close that disagree about polarity are stating
+ * opposites. Below it the claim may be a paraphrase, and paraphrase is judgement, not comparison.
+ */
+const RESTATEMENT_SIMILARITY = 0.6;
+
+interface SentenceSpan {
+  text: string;
+  start: number;
+  end: number;
 }
 
 /**
- * Whether a claim disagrees with the stored source about whether something is the case.
+ * Sentence-ish spans of collapsed text, with offsets so a cited range can be located.
  *
- * The coarse rule — does the claim's negation state differ from the page's — is wrong whenever the
- * page contains a negation the claim has nothing to do with. A dense textbook page almost always
- * does (`No other cell type was examined in this study.`), and a deterministic failure is not
- * overridable, so the coarse rule withholds correct cards systematically: a faithful restatement
- * of one sentence was rejected because a different sentence was negative.
- *
- * So the check is scoped. When one or more source sentences clearly restate the claim, the claim
- * is compared against those: it disagrees only if every one of them is negated while it is not, or
- * the reverse. A claim that faithfully restates a non-negative sentence is no longer rejected for
- * a negation elsewhere on the page.
- *
- * When no sentence is close enough to be the passage the claim rests on — a heavy paraphrase, a
- * claim that conflates two statements — the coarse whole-page comparison is kept, so an
- * unidentifiable claim is still treated strictly rather than waved through.
+ * Abbreviations are not resolved and a decimal point splits a sentence. This is a scope hint for
+ * evidence, not a linguistic analysis, and every use of it tolerates a boundary in the wrong place:
+ * the window includes the neighbours either way.
  */
-function negatesSource(claim: string, page: string): boolean {
-  const claimNegated = NEGATION_PATTERN.test(claim);
-  if (claimNegated === NEGATION_PATTERN.test(page)) return false;
+function sentenceSpans(text: string): SentenceSpan[] {
+  const spans: SentenceSpan[] = [];
 
-  const related = splitIntoSentences(page).filter(
-    sentence => diceCoefficient(sentence, claim) >= NEGATION_SCOPE_SIMILARITY
-  );
+  for (const match of text.matchAll(/\S[^.!?]*[.!?]+|\S[^.!?]*$/g)) {
+    const raw = match[0];
+    const trimmed = raw.trim();
+    if (trimmed.length === 0) continue;
 
-  if (related.length === 0) return true;
+    const start = (match.index ?? 0) + (raw.length - raw.trimStart().length);
+    spans.push({ text: trimmed, start, end: start + trimmed.length });
+  }
 
-  return related.every(sentence => NEGATION_PATTERN.test(sentence) !== claimNegated);
+  return spans;
+}
+
+export interface ResolvedCitation {
+  /** Offsets of the cited excerpt in the collapsed page text. */
+  spanStart: number;
+  spanEnd: number;
+  /** The sentences the cited span covers — the evidence proper. */
+  citedSentences: string[];
+  /**
+   * Those sentences plus one on each side, so a qualification stated next door stays visible.
+   *
+   * Read by the judge, not by the mechanical checks: a neighbouring sentence is context for a
+   * person to weigh, not a pattern for a regular expression to match.
+   */
+  context: string;
+}
+
+/**
+ * Resolves a cited excerpt against the stored page text.
+ *
+ * Returns `null` when the excerpt is not on the page it cites, which is mechanically provable and
+ * final: a card whose citation does not resolve has no evidence to be judged against, and no model
+ * call can supply one.
+ *
+ * This is the step the previous implementation skipped. It compared the claim against the whole
+ * page, so an unrelated sentence could veto a true claim — and, because the page-wide negation
+ * comparison returned early, a claim that *reversed* the sentence it cited was never compared to
+ * that sentence at all.
+ */
+export function resolveCitation(excerpt: string, page: string): ResolvedCitation | null {
+  const haystack = collapse(page);
+  const needle = collapse(excerpt).toLowerCase();
+  if (needle.length === 0) return null;
+
+  const at = haystack.toLowerCase().indexOf(needle);
+  if (at === -1) return null;
+
+  const spans = sentenceSpans(haystack);
+  const covered = spans.filter(span => span.start <= at + needle.length && span.end >= at);
+  const first = covered.length > 0 ? spans.indexOf(covered[0]) : 0;
+  const last = covered.length > 0 ? spans.indexOf(covered[covered.length - 1]) : 0;
+
+  const windowStart = spans[Math.max(0, first - 1)].start;
+  const windowEnd = spans[Math.min(spans.length - 1, last + 1)].end;
+
+  return {
+    spanStart: at,
+    spanEnd: at + needle.length,
+    citedSentences: spans.slice(first, last + 1).map(span => span.text),
+    // A slice of the page, not the sentences joined back together: the splitter treats `0.5` as a
+    // sentence end, and rejoining would quote `0. 5` to the judge. The evidence is the document's
+    // text or it is not evidence.
+    context: haystack.slice(windowStart, windowEnd),
+  };
 }
 
 /** True when the two passages assert opposite things, or state different numbers. */
@@ -431,108 +483,275 @@ export function validateCardStructure(card: ProviderCardShape, sourceExcerpt: st
 export interface ClaimSupportInput {
   /** Everything the card asserts, with cloze deletions restored. */
   claim: string;
-  /** The passage the card cites, taken from stored source. */
+  /** The passage the card cites, resolved against the stored page below. */
   sourceExcerpt: string;
-  /** The full stored page text, so conditions the excerpt dropped are still visible. */
+  /**
+   * The full stored page text. Used to resolve the citation and to tell a figure that is absent from
+   * the source from one that merely sits outside the cited span — never to judge the claim wholesale.
+   */
   pageText: string;
 }
+
+export type ClaimSupportVerdict = 'contradicted' | 'inconclusive';
+
+export interface ClaimSupportAssessment {
+  /**
+   * `contradicted` — a mechanically provable defect, final and not overridable by any model.
+   * `inconclusive` — no mechanical decision is possible; the claim needs a semantic judgement.
+   */
+  verdict: ClaimSupportVerdict;
+  /**
+   * Findings. `error` findings accompany `contradicted`. `warning` findings are recorded on the card
+   * and handed to the judge as things to look at; they never withhold a card on their own.
+   */
+  issues: ValidationIssue[];
+  /** What is left to judgement, or `null` when nothing was. */
+  inconclusiveReason: string | null;
+  /** The evidence the assessment was made against. Offsets, not text: the source holds the text. */
+  evidence: {
+    resolved: boolean;
+    spanStart: number | null;
+    spanEnd: number | null;
+    /** The evidence window that was read, for the judge and for storage. */
+    context: string;
+  };
+  /** True when the claim must be judged semantically before it may be published. */
+  requiresSemanticValidation: boolean;
+  validatorVersion: string;
+}
+
+/** Words that carry no evidential weight, so their absence from the evidence means nothing. */
+const FUNCTION_WORDS = new Set([
+  'what', 'which', 'when', 'where', 'why', 'how', 'according', 'source', 'passage', 'following',
+  'does', 'the', 'and', 'for', 'with', 'from', 'that', 'this', 'these', 'those', 'its', 'has',
+  'have', 'was', 'were', 'are', 'is', 'been', 'being', 'into', 'than', 'then', 'they', 'them',
+  'their', 'there', 'about', 'because', 'since', 'given', 'stated', 'described', 'term', 'value',
+]);
 
 /**
  * Deterministic support checks against the stored source.
  *
- * This runs before any model is asked, and its findings are not overridable: a claim whose
- * numbers, negation or modality do not match the stored page is unsupported regardless of what
- * a second model call says. The model is asked afterwards about what text comparison cannot see,
- * which is whether the claim means what the passage means.
+ * **Scope.** Every check is measured against the excerpt the card cites, resolved in the immutable
+ * source. Nothing reads the page as a whole — a page is not a fact, and the boolean presence of a
+ * word is not a contradiction. The sentences around the citation are carried separately for the
+ * judge to read, and are not compared mechanically.
+ *
+ * The previous version did read the page as a whole, and it cut both ways at once: a verbatim true
+ * statement was withheld because an unrelated sentence on the same page said "may", while a claim
+ * that *negated the very sentence it cited* passed untouched, because the page-wide negation check
+ * returned early and the scoped comparison never ran.
+ *
+ * **What this layer is allowed to conclude.**
+ *
+ *   - `contradicted`: the citation does not resolve in the source; the claim states a figure the
+ *     source states nowhere; the claim restates its evidence with the opposite polarity.
+ *
+ * Everything else is judgement — paraphrase, causal direction, population, conditions, a dropped
+ * qualifier, modality, an unfamiliar term — and is returned as `inconclusive` with the reason
+ * recorded, so it reaches the semantic judge explicitly instead of being settled by a pattern.
+ * This layer can withhold a card; it can never publish one on its own authority.
  */
-export function validateClaimSupport(input: ClaimSupportInput): StructuralCheck {
-  const issues: ValidationIssue[] = [];
+export function validateClaimSupport(input: ClaimSupportInput): ClaimSupportAssessment {
   const claim = collapse(input.claim);
   const page = collapse(input.pageText);
+  const cited = collapse(input.sourceExcerpt);
+  const citation = resolveCitation(cited, page);
+
+  const conclude = (
+    verdict: ClaimSupportVerdict,
+    issues: ValidationIssue[],
+    inconclusiveReason: string | null
+  ): ClaimSupportAssessment => ({
+    verdict,
+    issues,
+    inconclusiveReason,
+    evidence: {
+      resolved: citation !== null,
+      spanStart: citation?.spanStart ?? null,
+      spanEnd: citation?.spanEnd ?? null,
+      context: citation?.context ?? '',
+    },
+    requiresSemanticValidation: verdict === 'inconclusive',
+    validatorVersion: CLAIM_SUPPORT_VALIDATOR_VERSION,
+  });
 
   if (claim.length === 0) {
-    issues.push({
-      type: 'formatting',
-      code: 'claim_empty',
-      severity: 'error',
-      message: 'The card asserts nothing.',
-    });
-    return { ok: false, issues };
+    return conclude(
+      'contradicted',
+      [
+        {
+          type: 'formatting',
+          code: 'claim_empty',
+          severity: 'error',
+          message: 'The card asserts nothing.',
+        },
+      ],
+      null
+    );
   }
 
-  const quantityCheck = quantitiesAgree(claim, page);
-  if (!quantityCheck.agree) {
+  if (!citation) {
+    return conclude(
+      'contradicted',
+      [
+        {
+          type: 'unsupported_claim',
+          code: 'citation_not_in_source',
+          severity: 'error',
+          message: 'The excerpt this card cites does not appear in the page it refers to.',
+        },
+      ],
+      null
+    );
+  }
+
+  // The citation proper: what the card actually offers as its evidence. The wider window in
+  // `citation.context` travels with the card to the judge and is deliberately *not* read here — a
+  // hedge or a figure in the neighbouring sentence is something a person weighs, and mechanically
+  // matching it is how the previous version produced its false rejections.
+  const citedText = citation.citedSentences.join(' ');
+
+  // Everything below is recorded and passed on, never decided. Each reason names a question text
+  // comparison cannot answer, so the judge knows what to look at rather than re-reading everything.
+  const issues: ValidationIssue[] = [];
+  const reasons: string[] = [];
+
+  // A figure the source does not state cannot be supported by it. Measured against the cited
+  // evidence first: a number that lives elsewhere on the page is a citation-scope problem, not
+  // proof that the claim invented it, so it is recorded and left to judgement.
+  const scopeCheck = quantitiesAgree(claim, citedText);
+  if (!scopeCheck.agree) {
+    const missing = scopeCheck.missing.map(quantity => quantity.raw).join(', ');
+
+    if (!quantitiesAgree(claim, page).agree) {
+      return conclude(
+        'contradicted',
+        [
+          {
+            type: 'quantity_mismatch',
+            code: 'quantity_mismatch',
+            severity: 'error',
+            message: `The claim states ${missing}, which the stored source does not.`,
+          },
+        ],
+        null
+      );
+    }
+
     issues.push({
       type: 'quantity_mismatch',
-      code: 'quantity_mismatch',
-      severity: 'error',
-      message: `The claim states ${quantityCheck.missing.map(q => q.raw).join(', ')}, which the stored page does not.`,
+      code: 'quantity_outside_citation',
+      severity: 'warning',
+      message: `The claim states ${missing}, which the cited evidence does not — it appears elsewhere on the page.`,
     });
   }
 
-  if (negatesSource(claim, page)) {
-    issues.push({
-      type: 'negation_mismatch',
-      code: 'negation_mismatch',
-      severity: 'error',
-      message: 'The claim and the stored page disagree about whether something is the case.',
-    });
+  // Polarity is compared only against the cited sentences, and only when the claim restates one of
+  // them closely enough that "same words, opposite meaning" is the only reading left. A negation
+  // anywhere else — the cited evidence, the next sentence, the rest of the page — is not this
+  // claim's business.
+  const claimNegated = NEGATION_PATTERN.test(claim);
+  const restatement = Math.max(
+    0,
+    ...citation.citedSentences.map(sentence => diceCoefficient(sentence, claim))
+  );
+  const citedAllNegated = citation.citedSentences.every(sentence => NEGATION_PATTERN.test(sentence));
+  const citedNoneNegated = citation.citedSentences.every(sentence => !NEGATION_PATTERN.test(sentence));
+
+  if (
+    citation.citedSentences.length > 0 &&
+    restatement >= RESTATEMENT_SIMILARITY &&
+    ((citedAllNegated && !claimNegated) || (citedNoneNegated && claimNegated))
+  ) {
+    return conclude(
+      'contradicted',
+      [
+        {
+          type: 'negation_mismatch',
+          code: 'negation_mismatch',
+          severity: 'error',
+          message:
+            'The claim restates its evidence with the opposite polarity: one negates what the other states.',
+        },
+      ],
+      null
+    );
   }
 
-  if (ABSOLUTE_PATTERN.test(claim) && MODALITY_PATTERN.test(page)) {
+  if (restatement < RESTATEMENT_SIMILARITY) {
+    reasons.push('the claim is not a close restatement of its evidence, so paraphrase and direction need judgement');
+  }
+
+  if (ABSOLUTE_PATTERN.test(claim) && MODALITY_PATTERN.test(citedText)) {
     issues.push({
       type: 'modality_overstated',
       code: 'modality_overstated',
-      severity: 'error',
-      message: 'The stored page hedges this statement; the claim does not.',
+      severity: 'warning',
+      message: 'The evidence hedges this statement; the claim does not.',
     });
+    reasons.push('the evidence hedges where the claim does not');
   }
 
-  if (CONDITION_PATTERN.test(page) && !CONDITION_PATTERN.test(claim)) {
+  if (CONDITION_PATTERN.test(citedText) && !CONDITION_PATTERN.test(claim)) {
     issues.push({
       type: 'condition_dropped',
       code: 'condition_dropped',
       severity: 'warning',
-      message: 'The stored page limits this statement to a condition the claim does not carry.',
+      message: 'The evidence limits this statement to a condition the claim does not carry.',
     });
+    reasons.push('the evidence states a condition the claim does not carry');
   }
 
-  const pageVocabulary = new Set(contentWords(page));
-  const questionWords = new Set([
-    'what', 'which', 'when', 'where', 'why', 'how', 'according', 'source', 'passage', 'following',
-    'does', 'the', 'and', 'for', 'with', 'from', 'that', 'this', 'these', 'those', 'its', 'has',
-    'have', 'was', 'were', 'are', 'is', 'been', 'being', 'into', 'than', 'then', 'they', 'them',
-    'their', 'there', 'about', 'because', 'since', 'given', 'stated', 'described', 'term', 'value',
-  ]);
-
+  const evidenceVocabulary = new Set(contentWords(citedText));
   const unsupportedTerms = contentWords(claim).filter(
-    token => !pageVocabulary.has(token) && !questionWords.has(token)
+    token => !evidenceVocabulary.has(token) && !FUNCTION_WORDS.has(token)
   );
 
-  // A few unfamiliar words are normal connective tissue; many means the claim is about
-  // something the page never mentions.
+  // A few unfamiliar words are normal connective tissue; many means the claim is about something
+  // its evidence never mentions.
   if (unsupportedTerms.length > Math.max(3, contentWords(claim).length * 0.2)) {
     issues.push({
       type: 'term_not_in_source',
       code: 'term_not_in_source',
       severity: 'warning',
-      message: `The claim uses terms the stored page does not contain: ${unsupportedTerms.slice(0, 5).join(', ')}.`,
+      message: `The claim uses terms its evidence does not contain: ${unsupportedTerms.slice(0, 5).join(', ')}.`,
     });
+    reasons.push('the claim uses terms its evidence does not contain');
   }
 
-  return { ok: !issues.some(issue => issue.severity === 'error'), issues };
+  return conclude(
+    'inconclusive',
+    issues,
+    reasons.length > 0
+      ? reasons.join('; ')
+      : 'the claim and its evidence need a semantic comparison'
+  );
 }
 
-/** Combines deterministic and model-reported support findings. */
+/**
+ * Combines the deterministic verdict with the semantic judge's answer.
+ *
+ * Two asymmetries, both deliberate:
+ *
+ *   1. A deterministic contradiction is final. A model saying "supported" cannot rescue a card
+ *      whose citation is missing or whose polarity is reversed.
+ *   2. A claim whose determinism was inconclusive is published only if a judge actually assessed it
+ *      **and** supported it. A judge that never ran, failed, timed out or returned nothing leaves
+ *      the card withheld: `unknown` is not `supported`, and an unchecked card must not be stored.
+ */
 export function combineSupportFindings(
-  deterministic: StructuralCheck,
+  deterministic: ClaimSupportAssessment,
   model: { supported: boolean; issues: string[] } | null
 ): { supported: boolean; codes: string[] } {
   const codes = deterministic.issues.map(issue => issue.code);
 
-  if (!deterministic.ok) return { supported: false, codes };
+  if (deterministic.verdict === 'contradicted') return { supported: false, codes };
 
-  if (model && !model.supported) {
+  if (model === null) {
+    return { supported: false, codes: [...codes, 'semantic_validation_missing'] };
+  }
+
+  if (!model.supported) {
     return {
       supported: false,
       codes: model.issues.length > 0 ? model.issues : ['model_reported_unsupported'],

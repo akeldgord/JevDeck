@@ -712,6 +712,150 @@ describe('Validation withholds unsupported cards instead of storing them', () =>
 
     stub.setBehaviour({});
   });
+
+  it('hands the judge the server’s own evidence and names what it left open', async () => {
+    const document = await createDocument('r3-2-evidence.pdf');
+    const deckId = await createDeck(document.documentId, 'comprehensive');
+
+    await admin.call(`/api/decks/${deckId}/generate`, {
+      method: 'POST',
+      body: { coverage: 'comprehensive', sectionIds: document.sections },
+    });
+
+    const before = stub.requests.length;
+    const worker = buildWorker(db, 'wrk_evidence_scope');
+    const outcome = await worker.runOnce();
+
+    expect(outcome?.state).toBe('completed');
+    expect(outcome?.cardCount).toBeGreaterThan(0);
+
+    const supportCalls = stub.requests
+      .slice(before)
+      .filter(entry => entry.task === 'assess_claim_support');
+
+    expect(supportCalls.length).toBeGreaterThan(0);
+
+    for (const call of supportCalls) {
+      const body = call.body as {
+        claim: string;
+        citedExcerpt: string;
+        evidenceContext: string;
+        storedPageText: string;
+        openQuestions?: string[];
+      };
+
+      // The evidence is the document's own text at the span the server resolved, not a string the
+      // card supplied, and the judge is given the full page and the sentences around the citation.
+      expect(body.citedExcerpt.length).toBeGreaterThan(0);
+      expect(body.storedPageText).toContain(body.citedExcerpt);
+      expect(body.evidenceContext).toContain(body.citedExcerpt);
+
+      // Whatever the deterministic layer could not settle travels as a named question, never as an
+      // unstated assumption for the judge to guess at.
+      for (const question of body.openQuestions ?? []) {
+        expect(typeof question).toBe('string');
+        expect(question.length).toBeGreaterThan(0);
+      }
+    }
+
+    // The stored evidence is reconstructed from the page, so it resolves in the stored text.
+    const cards = await admin.call(`/api/decks/${deckId}/cards`);
+    expect(cards.body.cards.length).toBeGreaterThan(0);
+
+    for (const evidence of cards.body.evidence as Array<{ excerpt: string }>) {
+      expect(evidence.excerpt.trim().length).toBeGreaterThan(0);
+    }
+
+    // Every stored card carries the judgement that let it through: the rules that judged it, the
+    // span its evidence resolved to, and the model that answered the open question. A published
+    // card is never an unchecked one.
+    const stored = cards.body.cards as Array<{ validation: Record<string, any> | null }>;
+    expect(stored.length).toBeGreaterThan(0);
+
+    for (const card of stored) {
+      expect(card.validation).not.toBeNull();
+      expect(card.validation!.validator).toMatch(/^claim-support\/v\d+$/);
+      expect(card.validation!.verdict).toBe('inconclusive');
+      expect(card.validation!.citation.resolved).toBe(true);
+      expect(card.validation!.judge.model).toBe('stub-model');
+      expect(card.validation!.judge.supported).toBe(true);
+    }
+
+    stub.setBehaviour({});
+  });
+
+  it('does not consult the judge about a claim the source provably contradicts', async () => {
+    const document = await createDocument('r3-2-provably-wrong.pdf');
+    const deckId = await createDeck(document.documentId, 'comprehensive');
+
+    const queued = await admin.call(`/api/decks/${deckId}/generate`, {
+      method: 'POST',
+      body: { coverage: 'comprehensive', sectionIds: document.sections },
+    });
+
+    // A figure that appears nowhere in the document: mechanically provable, so it must be settled
+    // without a model call — and the judge must not get the chance to talk it back into the deck.
+    stub.setBehaviour({
+      mutateCard: card =>
+        card.format === 'qa'
+          ? { ...card, answer: 'The stated value is 999 mV and does not change.' }
+          : card,
+    });
+
+    const before = stub.requests.length;
+    const worker = buildWorker(db, 'wrk_provable_defect');
+    const outcome = await worker.runOnce();
+
+    expect(outcome?.state).toBe('completed');
+
+    const supportCalls = stub.requests
+      .slice(before)
+      .filter(entry => entry.task === 'assess_claim_support');
+
+    for (const call of supportCalls) {
+      expect(String(call.body.claim)).not.toContain('999 mV');
+    }
+
+    const status = await admin.call(`/api/jobs/${queued.body.job.id}`);
+    expect(status.body.coverageSummary.cardsWithheld).toBeGreaterThan(0);
+    expect(status.body.omissions.join(' ')).toContain('quantity_mismatch');
+
+    stub.setBehaviour({});
+  });
+
+  it('stores nothing when the judge’s answer cannot be used', async () => {
+    const document = await createDocument('r3-2-judge-failure.pdf');
+    const deckId = await createDeck(document.documentId, 'comprehensive');
+
+    const queued = await admin.call(`/api/decks/${deckId}/generate`, {
+      method: 'POST',
+      body: { coverage: 'comprehensive', sectionIds: document.sections },
+    });
+
+    // Concept extraction and card generation still work; only the judge answers with prose, so the
+    // pipeline reaches the last check and cannot complete it.
+    stub.setBehaviour({ malformedTask: 'assess_claim_support' });
+
+    const worker = buildWorker(db, 'wrk_judge_unusable');
+    const outcome = await worker.runOnce();
+
+    expect(outcome?.state).not.toBe('completed');
+    expect(outcome?.cardCount ?? 0).toBe(0);
+
+    const cards = await admin.call(`/api/decks/${deckId}/cards`);
+    expect(cards.body.cards).toEqual([]);
+
+    // The job failed on the last check rather than finishing without it. An unjudged card is
+    // pending, not published — the retry policy decides when it is attempted again.
+    const job = db
+      .query('SELECT state, error_code FROM generation_jobs WHERE id = ?')
+      .get(queued.body.job.id) as { state: string; error_code: string | null };
+
+    expect(job.state).not.toBe('completed');
+    expect(job.error_code).toBe('malformed_output');
+
+    stub.setBehaviour({});
+  });
 });
 
 describe('Standalone worker', () => {

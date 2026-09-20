@@ -158,6 +158,30 @@ export interface StoredDocumentSummary {
   contentHash: string;
   createdAt: string;
   sectionCount: number | null;
+  /** Which reader produced this document's pages, so a list can say what was read. */
+  sourceFormat: string;
+  /** Whether the format states its own page numbers, or these came from the import. */
+  pagination: string;
+  /** What the reader did not do, stored with the document. */
+  limitations: string[];
+  /** Pages with extractable text: the only pages that can support a card. */
+  textPages: number;
+  blankPages: number;
+  /** Pages holding content this build could not read, such as scans. */
+  unextractedPages: number;
+  mediaCount: number;
+}
+
+/** An image stored with a document. The bytes are fetched one at a time, never in this list. */
+export interface StoredMediaItem {
+  id: string;
+  pageIndex: number;
+  kind: 'figure' | 'table' | 'scan';
+  name: string;
+  contentType: string;
+  byteSize: number;
+  /** False when the format did not place the image on a page. */
+  pageAnchored: boolean;
 }
 
 /** Row shapes as stored. Source text is served verbatim, so the wire keeps the raw columns. */
@@ -166,7 +190,10 @@ export interface StoredSourceBlock {
   page_index: number;
   page_label: string | null;
   ordinal: number;
-  /** `text`, or `empty` for a page that yielded nothing extractable. */
+  /**
+   * `text`, `blank` for a page with nothing on it, or `image-only` for a page whose content is a
+   * picture this build cannot read. Those last two are different facts, not two spellings of empty.
+   */
   kind?: string;
   raw_text: string;
 }
@@ -183,9 +210,17 @@ export interface StoredSection {
 
 export interface StoredDocumentDetail {
   document: StoredDocumentSummary;
-  version: { id: string; version: number; contentHash: string; hasSourceBytes: boolean };
+  version: {
+    id: string;
+    version: number;
+    contentHash: string;
+    hasSourceBytes: boolean;
+    pagination: string;
+    limitations: string[];
+  };
   blocks: StoredSourceBlock[];
   sections: StoredSection[];
+  media: StoredMediaItem[];
 }
 
 export interface StoredDeck {
@@ -248,21 +283,46 @@ export interface StoredCardSchedule {
   due_at: string | null;
   suspended: number;
   updated_at: string;
-  /** Reviews recorded for this user and card; 0 after an undo, which makes the card new again. */
+  /** Reviews of any kind recorded for this user and card; 0 after an undo. */
   review_count?: number;
+  /**
+   * Reviews that changed the schedule. Zero means the card has never been scheduled, however many
+   * isolated cram reviews it has had — which is what keeps it in the new queue.
+   */
+  schedule_review_count?: number;
+  /** When the schedule last changed. Null until a review is allowed to affect it. */
+  last_scheduled_at?: string | null;
 }
 
-export interface DeckSchedule {
-  deckId: string;
+/**
+ * Today's study allowance, exactly as the server counted it from the review events.
+ *
+ * Served on every response that could change it — the schedule read, a settled review and an undo —
+ * so a client never has to derive it. Deriving it client-side is how the counters drift: an
+ * isolated cram review counts nothing, a repeated review counts once for cards and twice for
+ * reviews, and another signed-in client's reviews are invisible.
+ */
+export interface DailyAllowance {
+  /** Inclusive start of the day the limits reset on (UTC midnight), as ISO-8601. */
   periodStart: string;
+  /** Exclusive end of that day. The period is half-open: `[periodStart, periodEnd)`. */
+  periodEnd: string;
+  /** Schedule-affecting review events today; what the review limit counts. */
+  reviewEventsToday: number;
+  /** Distinct cards introduced to the schedule today; what the new-card limit counts. */
+  newCardsIntroducedToday: number;
+}
+
+export interface DeckSchedule extends DailyAllowance {
+  deckId: string;
   states: StoredCardSchedule[];
-  reviewsToday: number;
-  newCardsToday: number;
 }
 
 /** What one settled review did to the card's schedule. */
 export interface ReviewOutcome {
   cardId: string;
+  /** Today's allowance after this review, counted from the events by the server. */
+  daily: DailyAllowance;
   state: {
     repetition: number;
     intervalDays: number;
@@ -430,7 +490,26 @@ export const api = {
     pageCount: number;
     contentHash?: string;
     bytesBase64?: string;
-    pages: Array<{ pageIndex: number; pageLabel?: string; text: string }>;
+    /** Which reader produced these pages. */
+    sourceFormat?: 'pdf' | 'text' | 'markdown' | 'notes' | 'docx' | 'pptx';
+    /** Whether the page numbers are the document's own or this import's. */
+    pagination?: 'explicit' | 'virtual' | 'mixed';
+    /** What the reader did not do. Stored with the version, so the report cannot forget it. */
+    limitations?: string[];
+    pages: Array<{
+      pageIndex: number;
+      pageLabel?: string;
+      text: string;
+      /** Omitted for a page with text; required to distinguish a blank page from a scan. */
+      kind?: 'text' | 'blank' | 'image-only';
+    }>;
+    media?: Array<{
+      pageNumber: number;
+      kind: 'figure' | 'table' | 'scan';
+      name: string;
+      contentType: string;
+      bytesBase64: string;
+    }>;
     sections?: Array<{
       clientId: string;
       parentId: string | null;
@@ -485,6 +564,43 @@ export const api = {
   getDocument: (id: string, signal?: AbortSignal) =>
     request<StoredDocumentDetail>(`/api/documents/${id}`, { signal }),
 
+  /**
+   * One stored image.
+   *
+   * Raw bytes, like the original file, so it bypasses the shared request helper: the server
+   * resolves the image through its document and answers 404 for anyone who does not own it.
+   */
+  fetchMedia: async (id: string, signal?: AbortSignal): Promise<Blob> => {
+    let response: Response;
+    try {
+      response = await fetch(`${apiBaseUrl()}/api/media/${id}`, {
+        credentials: 'include',
+        signal,
+      });
+    } catch (error) {
+      throw new ApiUnreachableError(error);
+    }
+
+    if (!response.ok) {
+      throw new ApiClientError(
+        response.status,
+        'media_unavailable',
+        'That image is not available for this document.'
+      );
+    }
+
+    return response.blob();
+  },
+
+  /**
+   * Deletes a deck and its cards.
+   *
+   * The document is not deleted with it: a document can back more than one deck, and losing the
+   * source because a deck was removed would be a surprise nobody asked for.
+   */
+  deleteDeck: (deckId: string) =>
+    request<{ ok: boolean }>(`/api/decks/${deckId}`, { method: 'DELETE' }),
+
   listDecks: (signal?: AbortSignal) =>
     request<{ decks: StoredDeck[]; sharedDecks: StoredDeck[] }>('/api/decks', { signal }),
 
@@ -520,6 +636,45 @@ export const api = {
 
   jobConcepts: (id: string, signal?: AbortSignal) =>
     request<{ concepts: JobConcept[] }>(`/api/jobs/${id}/concepts`, { signal }),
+
+  /**
+   * Asks a generation run to stop.
+   *
+   * `outcome` says what actually happened: `cancelled` when the run was stopped outright (it had
+   * not started, so no provider call was in flight), `requested` when a worker holds it and will
+   * stop at its next paid call, and `already_finished` when there was nothing left to stop.
+   */
+  cancelJob: (id: string) =>
+    request<{ outcome: 'cancelled' | 'requested' | 'already_finished'; stopped: boolean; job: GenerationJob }>(
+      `/api/jobs/${id}/cancel`,
+      { method: 'POST' }
+    ),
+
+  /**
+   * Stops a run and keeps what it has already paid for, so it can be continued later.
+   *
+   * Unlike `cancelJob`, this is not an ending: the run keeps its checkpoint and `resumeJob` queues
+   * it again from there.
+   */
+  pauseJob: (id: string) =>
+    request<{ outcome: 'paused' | 'requested' | 'already_finished'; stopped: boolean; job: GenerationJob }>(
+      `/api/jobs/${id}/pause`,
+      { method: 'POST' }
+    ),
+
+  /**
+   * Queues a stopped run again so it continues from its stored progress.
+   *
+   * `outcome` is one of `resumed`, `already_running`, `completed` or `nothing_to_resume`; the last
+   * means there is no checkpoint, and the server refuses rather than quietly starting the run over.
+   */
+  resumeJob: (id: string) =>
+    request<{
+      outcome: 'resumed' | 'already_running' | 'completed' | 'nothing_to_resume';
+      fromCheckpoint: boolean;
+      resumed: boolean;
+      job: GenerationJob;
+    }>(`/api/jobs/${id}/resume`, { method: 'POST' }),
 
   /**
    * Queues card generation for a deck.
@@ -558,10 +713,12 @@ export const api = {
   ) => request<ReviewOutcome>(`/api/cards/${cardId}/reviews`, { method: 'POST', body }),
 
   undoReview: (cardId: string) =>
-    request<{ cardId: string; undone: { id: string; rating: number; mode: string }; state: ReviewOutcome['state'] }>(
-      `/api/cards/${cardId}/reviews/undo`,
-      { method: 'POST' }
-    ),
+    request<{
+      cardId: string;
+      undone: { id: string; rating: number; mode: string };
+      state: ReviewOutcome['state'];
+      daily: DailyAllowance;
+    }>(`/api/cards/${cardId}/reviews/undo`, { method: 'POST' }),
 
   setCardSuspended: (cardId: string, suspended: boolean) =>
     request<{ cardId: string; suspended: boolean }>(`/api/cards/${cardId}/suspend`, {

@@ -3,6 +3,15 @@ import { Database } from 'bun:sqlite';
 // formatter module, and importing the writer from there would drag `bun:sqlite` into the web bundle.
 import { buildApkg } from '@jevdeck/anki-export/apkg';
 import { COVERAGE_MODES, CoverageMode } from '@jevdeck/contracts';
+import {
+  MEDIA_KINDS,
+  PAGE_KINDS,
+  SUPPORTED_FORMATS,
+  type MediaKind,
+  type PageKind,
+  type Pagination,
+  type SourceFormat,
+} from '@jevdeck/ingestion';
 import { calculateSM2 } from '@jevdeck/scheduling';
 import {
   assertBudgetHeadroom,
@@ -12,8 +21,11 @@ import {
   readCoverageSummary,
   readUsageTotals,
   recordJobRefusal,
+  requestCancellation,
+  requestPause,
   requireJob,
   resolvePricing,
+  resumeJob,
   toContractJob,
 } from '@jevdeck/worker';
 import {
@@ -28,6 +40,7 @@ import {
   requireSession,
 } from '../http/context';
 import { badRequest, forbidden, notFound, paymentRequired, unavailable } from '../http/errors';
+import { readDailyStudyActivity } from '../study/accounting';
 import { Router } from '../http/router';
 import { newId, nowIso, sha256Hex } from '../util';
 
@@ -35,6 +48,67 @@ export const MAX_PAGES_PER_DOCUMENT = 5_000;
 export const MAX_SOURCE_BYTES = 16 * 1024 * 1024;
 export const MAX_PAGE_TEXT_LENGTH = 400_000;
 export const MAX_SECTIONS_PER_DOCUMENT = 5_000;
+export const MAX_MEDIA_PER_DOCUMENT = 500;
+export const MAX_MEDIA_BYTES_PER_DOCUMENT = 8 * 1024 * 1024;
+
+const SOURCE_FORMATS = SUPPORTED_FORMATS.map(entry => entry.format);
+const PAGINATIONS: readonly Pagination[] = ['explicit', 'virtual', 'mixed'];
+
+/**
+ * How a page with no extractable text is recorded.
+ *
+ * The route will not guess, because the two answers mean different things to a coverage report: a
+ * blank divider is a confirmed result, while a scanned plate is content this build could not read.
+ * A caller that knows which one it is says so; a caller that does not gets `blank`, which is the
+ * weaker claim. Text always wins over the label — extractable prose cannot be made to disappear by
+ * a caller calling the page blank.
+ */
+function readPageKind(value: unknown, text: string, field: string): PageKind {
+  if (text.length > 0) return 'text';
+  if (value === undefined || value === null) return 'blank';
+  if (!PAGE_KINDS.includes(value as PageKind)) {
+    throw badRequest(`\`${field}\` must be one of: ${PAGE_KINDS.join(', ')}.`, 'invalid_page_kind', {
+      field,
+    });
+  }
+  return value as PageKind;
+}
+
+function readSourceFormat(value: unknown): SourceFormat {
+  if (value === undefined || value === null) return 'pdf';
+  if (!SOURCE_FORMATS.includes(value as SourceFormat)) {
+    throw badRequest(
+      `\`sourceFormat\` must be one of: ${SOURCE_FORMATS.join(', ')}.`,
+      'invalid_source_format',
+      { field: 'sourceFormat' }
+    );
+  }
+  return value as SourceFormat;
+}
+
+function readPagination(value: unknown): Pagination {
+  if (value === undefined || value === null) return 'explicit';
+  if (!PAGINATIONS.includes(value as Pagination)) {
+    throw badRequest(`\`pagination\` must be one of: ${PAGINATIONS.join(', ')}.`, 'invalid_pagination', {
+      field: 'pagination',
+    });
+  }
+  return value as Pagination;
+}
+
+/** What the reader did not do, stored with the version so the coverage report cannot forget it. */
+function readLimitations(value: unknown): string[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    throw badRequest('`limitations` must be an array of strings.', 'invalid_limitations');
+  }
+  if (value.length > 40) {
+    throw badRequest('Too many limitations were listed.', 'limitations_too_many');
+  }
+  return value.map((entry, index) =>
+    asString(entry, `limitations[${index}]`, { maxLength: 400 })
+  );
+}
 
 interface DeckRow {
   id: string;
@@ -68,6 +142,47 @@ interface CardRow {
   updated_at: string;
   /** Joined from `sections`, or null when the card was not attributed to one. */
   section_title?: string | null;
+}
+
+/** A stored JSON string list, tolerated as absent or unparsable rather than crashing a read. */
+function parseStringList(value: unknown): string[] {
+  if (typeof value !== 'string' || value.length === 0) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.filter(entry => typeof entry === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * One row of the stored-documents list.
+ *
+ * The readable count is served beside the page count because they are different facts: a document
+ * of 300 pages with 40 scans has 260 pages cards can come from, and a list that showed only the
+ * page count would let the difference disappear.
+ */
+function publicDocumentSummary(row: Record<string, unknown>) {
+  const textPages = Number(row.text_pages ?? 0);
+  const blankPages = Number(row.blank_pages ?? 0);
+  const unextractedPages = Number(row.unextracted_pages ?? 0);
+
+  return {
+    id: row.id as string,
+    name: row.name as string,
+    pageCount: Number(row.page_count ?? 0),
+    byteSize: Number(row.byte_size ?? 0),
+    contentHash: row.content_hash as string,
+    createdAt: row.created_at as string,
+    sectionCount: Number(row.section_count ?? 0),
+    sourceFormat: (row.source_format as string) ?? 'pdf',
+    pagination: (row.pagination as string) ?? 'explicit',
+    limitations: parseStringList(row.limitations),
+    textPages,
+    blankPages,
+    unextractedPages,
+    mediaCount: Number(row.media_count ?? 0),
+  };
 }
 
 function publicDeck(row: DeckRow, access: 'owner' | 'shared') {
@@ -140,7 +255,12 @@ function requireReadableDeck(
 function requireOwnedDeck(db: Database, deckId: string, userId: string): DeckRow {
   const { deck, access } = requireReadableDeck(db, deckId, userId);
   if (access !== 'owner') {
-    throw forbidden('Only the owner can change this deck.', 'deck_not_owned');
+    // 403 rather than 404, and only here: a deck shared for study is one the caller can already
+    // see in their own list, so its existence is not a secret. What is refused is everything that
+    // belongs to the owner — changing it, exporting it, reading its source. A deck the caller
+    // cannot read at all never reaches this line: `requireReadableDeck` answers 404, so an
+    // identifier cannot be probed for existence.
+    throw forbidden('This deck belongs to another account. Only its owner can change it, export it or read its source.', 'deck_not_owned');
   }
   return deck;
 }
@@ -151,6 +271,20 @@ function safeFileName(name: string): string {
   return flattened.length > 0 ? flattened.slice(0, 200) : 'document.pdf';
 }
 
+/** The media type of a stored original, by the format that read it. */
+const SOURCE_CONTENT_TYPES: Record<string, string> = {
+  pdf: 'application/pdf',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  markdown: 'text/markdown; charset=utf-8',
+  text: 'text/plain; charset=utf-8',
+  notes: 'text/plain; charset=utf-8',
+};
+
+function sourceContentType(format: string): string {
+  return SOURCE_CONTENT_TYPES[format] ?? 'application/octet-stream';
+}
+
 export function registerResourceRoutes(router: Router): void {
   // -------------------------------------------------------------------------
   // Documents
@@ -158,18 +292,34 @@ export function registerResourceRoutes(router: Router): void {
 
   router.get('/api/documents', ctx => {
     const session = requireSession(ctx);
-    const documents = ctx.db
+
+    // The latest version only: a document that gains a second version must not appear twice, and
+    // the pagination and limitations that describe it are properties of that version.
+    const rows = ctx.db
       .query(
         `SELECT d.id, d.name, d.page_count, d.byte_size, d.content_hash, d.created_at,
-                (SELECT COUNT(*) FROM sections s WHERE s.document_version_id = v.id) AS section_count
+                d.source_format, v.pagination, v.limitations,
+                (SELECT COUNT(*) FROM sections s WHERE s.document_version_id = v.id) AS section_count,
+                (SELECT COUNT(*) FROM source_blocks b
+                  WHERE b.document_version_id = v.id AND b.kind = 'text') AS text_pages,
+                (SELECT COUNT(*) FROM source_blocks b
+                  WHERE b.document_version_id = v.id AND b.kind = 'blank') AS blank_pages,
+                (SELECT COUNT(*) FROM source_blocks b
+                  WHERE b.document_version_id = v.id AND b.kind = 'image-only') AS unextracted_pages,
+                (SELECT COUNT(*) FROM media m WHERE m.document_version_id = v.id) AS media_count
            FROM documents d
-           JOIN document_versions v ON v.document_id = d.id
+           JOIN document_versions v ON v.id = (
+             SELECT id FROM document_versions WHERE document_id = d.id ORDER BY version DESC LIMIT 1
+           )
           WHERE d.owner_id = ?
           ORDER BY d.created_at DESC`
       )
-      .all(session.user.id);
+      .all(session.user.id) as Array<Record<string, unknown>>;
 
-    return json({ documents });
+    // Served camel-cased, like every other document response, so a caller reads one shape.
+    return json({
+      documents: rows.map(row => publicDocumentSummary(row)),
+    });
   });
 
   router.post('/api/documents', async ctx => {
@@ -180,6 +330,13 @@ export function registerResourceRoutes(router: Router): void {
 
     const name = asString(body.name, 'name', { maxLength: 300 });
     const pageCount = asInteger(body.pageCount, 'pageCount', { min: 1, max: MAX_PAGES_PER_DOCUMENT });
+
+    // What read this document, how its page numbers came to exist, and what the reader did not do.
+    // All three are properties of this parse rather than of the document, so they are stored with
+    // the version; a coverage claim that cannot say which reader produced it is not checkable.
+    const sourceFormat = readSourceFormat(body.sourceFormat);
+    const pagination = readPagination(body.pagination);
+    const limitations = readLimitations(body.limitations);
 
     const pages = body.pages;
     if (!Array.isArray(pages) || pages.length === 0) {
@@ -211,17 +368,36 @@ export function registerResourceRoutes(router: Router): void {
     ctx.db.transaction(() => {
       ctx.db
         .prepare(
-          `INSERT INTO documents (id, owner_id, name, content_hash, byte_size, page_count, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`
+          `INSERT INTO documents
+             (id, owner_id, name, content_hash, byte_size, page_count, created_at, source_format)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
         )
-        .run(documentId, session.user.id, name, contentHash, sourceBytes?.byteLength ?? 0, pageCount, createdAt);
+        .run(
+          documentId,
+          session.user.id,
+          name,
+          contentHash,
+          sourceBytes?.byteLength ?? 0,
+          pageCount,
+          createdAt,
+          sourceFormat
+        );
 
       ctx.db
         .prepare(
-          `INSERT INTO document_versions (id, document_id, version, content_hash, source_bytes, created_at)
-           VALUES (?, ?, 1, ?, ?, ?)`
+          `INSERT INTO document_versions
+             (id, document_id, version, content_hash, source_bytes, created_at, pagination, limitations)
+           VALUES (?, ?, 1, ?, ?, ?, ?, ?)`
         )
-        .run(versionId, documentId, contentHash, sourceBytes, createdAt);
+        .run(
+          versionId,
+          documentId,
+          contentHash,
+          sourceBytes,
+          createdAt,
+          pagination,
+          JSON.stringify(limitations)
+        );
 
       const insertBlock = ctx.db.prepare(
         `INSERT INTO source_blocks
@@ -230,11 +406,13 @@ export function registerResourceRoutes(router: Router): void {
       );
 
       pages.forEach((page: unknown, index: number) => {
-        const entry = page as { pageIndex?: unknown; pageLabel?: unknown; text?: unknown };
+        const entry = page as { pageIndex?: unknown; pageLabel?: unknown; text?: unknown; kind?: unknown };
 
         // A page with nothing extractable is a real extraction result — a scanned plate, an
         // image-only page, a blank divider. It is stored as an empty block recorded as a gap
-        // rather than rejecting the whole upload, which would lose the readable pages too.
+        // rather than rejecting the whole upload, which would lose the readable pages too. Which
+        // of the two it is comes from the caller, which read the page; an empty block with no
+        // stated kind is recorded as blank rather than as content that was silently dropped.
         const raw = entry.text;
         if (typeof raw !== 'string') {
           throw badRequest(`\`pages[${index}].text\` must be a string.`, 'field_required', {
@@ -248,6 +426,7 @@ export function registerResourceRoutes(router: Router): void {
         }
 
         const text = raw.trim();
+        const kind = readPageKind(entry.kind, text, `pages[${index}].kind`);
         const pageIndex = asInteger(entry.pageIndex ?? index + 1, `pages[${index}].pageIndex`, {
           min: 1,
           max: MAX_PAGES_PER_DOCUMENT,
@@ -260,7 +439,7 @@ export function registerResourceRoutes(router: Router): void {
           pageIndex,
           pageLabel,
           index + 1,
-          text.length === 0 ? 'empty' : 'text',
+          kind,
           text,
           text.replace(/\s+/g, ' ').trim()
         );
@@ -317,6 +496,78 @@ export function registerResourceRoutes(router: Router): void {
         const parentId = idByClientKey.get(parentKey);
         if (parentId) linkSection.run(parentId, sectionId);
       }
+
+      // Images the format stated, stored so a card can point at the figure it came from. The
+      // bytes are kept beside the row rather than on disk because the row already carries the
+      // ownership path: media is reached through its version's document, exactly like the text.
+      const mediaDefs = Array.isArray(body.media) ? body.media : [];
+      if (mediaDefs.length > MAX_MEDIA_PER_DOCUMENT) {
+        throw badRequest(
+          `A document may carry at most ${MAX_MEDIA_PER_DOCUMENT} images.`,
+          'media_too_many'
+        );
+      }
+
+      const insertMedia = ctx.db.prepare(
+        `INSERT INTO media
+           (id, document_version_id, page_index, kind, caption, byte_size, created_at, name,
+            content_type, bytes, page_anchored)
+         VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`
+      );
+
+      let mediaBytes = 0;
+
+      mediaDefs.forEach((entry: unknown, index: number) => {
+        const row = entry as Record<string, unknown>;
+        const kind = row.kind;
+
+        if (typeof kind !== 'string' || !MEDIA_KINDS.includes(kind as MediaKind)) {
+          throw badRequest(
+            `\`media[${index}].kind\` must be one of: ${MEDIA_KINDS.join(', ')}.`,
+            'invalid_media_kind',
+            { field: `media[${index}].kind` }
+          );
+        }
+
+        const encoded = row.bytesBase64;
+        if (typeof encoded !== 'string' || encoded.length === 0) {
+          throw badRequest(
+            `\`media[${index}].bytesBase64\` must be a non-empty base64 string.`,
+            'field_required',
+            { field: `media[${index}].bytesBase64` }
+          );
+        }
+
+        const bytes = Buffer.from(encoded, 'base64');
+        mediaBytes += bytes.byteLength;
+        if (mediaBytes > MAX_MEDIA_BYTES_PER_DOCUMENT) {
+          throw badRequest(
+            'The images in that document are too large to store together.',
+            'media_too_large'
+          );
+        }
+
+        // Page 0 means the format did not anchor the image to a page. Storing that as a statement
+        // rather than defaulting to page 1 keeps a citation from pointing at a page that does not
+        // hold the figure.
+        const pageNumber = asInteger(row.pageNumber ?? 0, `media[${index}].pageNumber`, {
+          min: 0,
+          max: MAX_PAGES_PER_DOCUMENT,
+        });
+
+        insertMedia.run(
+          newId('med'),
+          versionId,
+          pageNumber,
+          kind,
+          bytes.byteLength,
+          createdAt,
+          asString(row.name, `media[${index}].name`, { maxLength: 300 }),
+          asString(row.contentType, `media[${index}].contentType`, { maxLength: 120 }),
+          bytes,
+          pageNumber > 0 ? 1 : 0
+        );
+      });
     })();
 
     return json(
@@ -332,6 +583,10 @@ export function registerResourceRoutes(router: Router): void {
         versionId,
         blockCount: pages.length,
         sectionCount: Array.isArray(body.sections) ? body.sections.length : 0,
+        sourceFormat,
+        pagination,
+        limitations,
+        mediaCount: Array.isArray(body.media) ? body.media.length : 0,
       },
       201
     );
@@ -349,16 +604,33 @@ export function registerResourceRoutes(router: Router): void {
     const document = ctx.db
       .query('SELECT * FROM documents WHERE id = ? AND owner_id = ?')
       .get(ctx.params.id, session.user.id) as
-      | { id: string; name: string; page_count: number; content_hash: string; byte_size: number; created_at: string }
+      | {
+          id: string;
+          name: string;
+          page_count: number;
+          content_hash: string;
+          byte_size: number;
+          created_at: string;
+          source_format: string;
+        }
       | null;
 
     if (!document) throw notFound('That document does not exist.', 'document_not_found');
 
     const version = ctx.db
       .query(
-        'SELECT id, version, content_hash, (source_bytes IS NOT NULL) AS has_source_bytes FROM document_versions WHERE document_id = ? ORDER BY version DESC LIMIT 1'
+        `SELECT id, version, content_hash, pagination, limitations,
+                (source_bytes IS NOT NULL) AS has_source_bytes
+           FROM document_versions WHERE document_id = ? ORDER BY version DESC LIMIT 1`
       )
-      .get(document.id) as { id: string; version: number; content_hash: string; has_source_bytes: number };
+      .get(document.id) as {
+      id: string;
+      version: number;
+      content_hash: string;
+      pagination: Pagination;
+      limitations: string;
+      has_source_bytes: number;
+    };
 
     const blocks = ctx.db
       .query(
@@ -378,6 +650,15 @@ export function registerResourceRoutes(router: Router): void {
       )
       .all(version.id);
 
+    // Media is listed without its bytes: a reader needs to know a figure exists and where it sits,
+    // and the bytes arrive one at a time from the media route below.
+    const media = ctx.db
+      .query(
+        `SELECT id, page_index, kind, name, content_type, byte_size, page_anchored
+           FROM media WHERE document_version_id = ? ORDER BY page_index ASC, kind ASC, name ASC`
+      )
+      .all(version.id) as Array<Record<string, unknown>>;
+
     return json({
       document: {
         id: document.id,
@@ -386,15 +667,29 @@ export function registerResourceRoutes(router: Router): void {
         contentHash: document.content_hash,
         byteSize: document.byte_size,
         createdAt: document.created_at,
+        sourceFormat: document.source_format ?? 'pdf',
       },
       version: {
         id: version.id,
         version: version.version,
         contentHash: version.content_hash,
         hasSourceBytes: version.has_source_bytes === 1,
+        pagination: version.pagination,
+        limitations: parseStringList(version.limitations),
       },
       blocks,
       sections,
+      media: media.map(row => ({
+        id: row.id,
+        pageIndex: row.page_index,
+        kind: row.kind,
+        name: row.name,
+        contentType: row.content_type,
+        byteSize: row.byte_size,
+        // False when the format did not place the image on a page, so the screen can say so
+        // instead of pinning it to whatever page happens to be nearby.
+        pageAnchored: row.page_anchored === 1,
+      })),
     });
   });
 
@@ -410,14 +705,20 @@ export function registerResourceRoutes(router: Router): void {
 
     const record = ctx.db
       .query(
-        `SELECT v.source_bytes AS source_bytes, v.content_hash AS content_hash, d.name AS name
+        `SELECT v.source_bytes AS source_bytes, v.content_hash AS content_hash, d.name AS name,
+                d.source_format AS source_format
            FROM document_versions v
            JOIN documents d ON d.id = v.document_id
           WHERE d.id = ? AND d.owner_id = ?
           ORDER BY v.version DESC LIMIT 1`
       )
       .get(ctx.params.id, session.user.id) as
-      | { source_bytes: Uint8Array | null; content_hash: string; name: string }
+      | {
+          source_bytes: Uint8Array | null;
+          content_hash: string;
+          name: string;
+          source_format: string;
+        }
       | null;
 
     if (!record) throw notFound('That document does not exist.', 'document_not_found');
@@ -435,11 +736,56 @@ export function registerResourceRoutes(router: Router): void {
     return new Response(bytes.buffer as ArrayBuffer, {
       status: 200,
       headers: {
-        'content-type': 'application/pdf',
+        // The type of the format that was actually read, not an assumption that every stored
+        // original is a PDF: a .docx served as application/pdf would be a download that lies.
+        'content-type': sourceContentType(record.source_format),
         'content-disposition': `inline; filename="${safeFileName(record.name)}"`,
         // A private document must not sit in a shared cache.
         'cache-control': 'private, no-store',
         etag: `"${record.content_hash}"`,
+      },
+    });
+  });
+
+  /**
+   * One stored image, byte for byte.
+   *
+   * Owner-only, and by the same rule as the source text rather than by a second one: the image is
+   * reached through its version's document, so a deck shared for study carries no readable media
+   * either. A caller who guesses an identifier that is not theirs gets 404, never 403.
+   */
+  router.get('/api/media/:id', ctx => {
+    const session = requireSession(ctx);
+
+    const record = ctx.db
+      .query(
+        `SELECT m.name AS name, m.content_type AS content_type, m.bytes AS bytes,
+                m.byte_size AS byte_size
+           FROM media m
+           JOIN document_versions v ON v.id = m.document_version_id
+           JOIN documents d ON d.id = v.document_id
+          WHERE m.id = ? AND d.owner_id = ?`
+      )
+      .get(ctx.params.id, session.user.id) as
+      | { name: string; content_type: string; bytes: Uint8Array | null; byte_size: number }
+      | null;
+
+    if (!record) throw notFound('That image does not exist.', 'media_not_found');
+    if (!record.bytes) {
+      throw notFound('The image bytes were not retained for this document.', 'media_not_retained');
+    }
+
+    const bytes = new Uint8Array(record.bytes);
+
+    return new Response(bytes.buffer as ArrayBuffer, {
+      status: 200,
+      headers: {
+        'content-type': record.content_type || 'application/octet-stream',
+        'content-length': String(record.byte_size),
+        'content-disposition': `inline; filename="${safeFileName(record.name || 'image')}"`,
+        // Private, like every other document response: a figure from a private document must not
+        // land in a shared cache.
+        'cache-control': 'private, no-store',
       },
     });
   });
@@ -777,10 +1123,12 @@ export function registerResourceRoutes(router: Router): void {
   /**
    * The deck as a real Anki package.
    *
-   * Owner only: a deck shared for study is not the sharer's to re-export. The package carries the
-   * caller's own schedule, so a download reflects the progress they actually made, and it is built
-   * from stored rows — the cards, their evidence and the deck — with nothing reconstructed from
-   * the request.
+   * Owner only: a deck shared for study is not the sharer's to re-export.
+   *
+   * The package is built from stored rows — the cards, their evidence and the deck — with nothing
+   * reconstructed from the request, and it carries no scheduling state at all: every card arrives
+   * as new. That is a deliberate contract, not an omission. The caller's own reviews are not
+   * transferred, and the route no longer reads `user_card_state` to pretend otherwise.
    */
   router.get('/api/decks/:id/export.apkg', ctx => {
     const session = requireSession(ctx);
@@ -798,26 +1146,12 @@ export function registerResourceRoutes(router: Router): void {
       )
       .all(deck.id) as Array<{ card_id: string; page_index: number; excerpt: string }>;
 
-    const schedule = ctx.db
-      .query(
-        `SELECT card_id, repetition, interval_days, due_at FROM user_card_state
-          WHERE user_id = ?`
-      )
-      .all(session.user.id) as Array<{
-      card_id: string;
-      repetition: number;
-      interval_days: number;
-      due_at: string | null;
-    }>;
-
     const evidenceByCard = new Map(evidence.map(entry => [entry.card_id, entry]));
-    const scheduleByCard = new Map(schedule.map(entry => [entry.card_id, entry]));
 
     const exported = buildApkg({
       deck: { id: deck.id, title: deck.title, description: deck.description },
       cards: cards.map(card => {
         const citation = evidenceByCard.get(card.id);
-        const state = scheduleByCard.get(card.id);
 
         return {
           id: card.id,
@@ -830,13 +1164,6 @@ export function registerResourceRoutes(router: Router): void {
           excerpt: citation?.excerpt ?? null,
           pageNumber: citation?.page_index ?? null,
           sectionTitle: card.section_title ?? null,
-          schedule: state
-            ? {
-                repetition: state.repetition,
-                intervalDays: state.interval_days,
-                dueAt: state.due_at,
-              }
-            : null,
         };
       }),
     });
@@ -903,6 +1230,81 @@ export function registerResourceRoutes(router: Router): void {
       // Plain-language lines for the UI, including why any card was withheld.
       omissions: row.omission_reasons ? (JSON.parse(row.omission_reasons) as string[]) : [],
       coverageSummary: readCoverageSummary(row),
+    });
+  });
+
+  /**
+   * Stops a generation run the caller owns.
+   *
+   * Owner-scoped by the lookup itself, so someone else's job id is a 404 rather than a refusal
+   * that confirms the id exists. Cancelling is idempotent in the sense that matters: a job already
+   * finished is reported as such and left exactly as it is, because rewriting a completed run's
+   * record to say it was cancelled would be a lie about what happened.
+   *
+   * A pending job stops immediately — no worker holds it, so no provider call is in flight. A job
+   * being processed is asked to stop, and the worker that holds it stops before its next paid
+   * call; the response says which of the two happened rather than pretending the run is over.
+   */
+  router.post('/api/jobs/:id/cancel', async ctx => {
+    assertOriginAllowed(ctx);
+    const session = requireSession(ctx);
+    requireCsrf(ctx, session);
+
+    const outcome = requestCancellation(ctx.db, ctx.params.id, session.user.id);
+    if (!outcome) throw notFound('That job does not exist.', 'job_not_found');
+
+    return json({
+      outcome,
+      stopped: outcome === 'cancelled',
+      job: toContractJob(requireJob(ctx.db, ctx.params.id)),
+    });
+  });
+
+  /**
+   * Stops a generation run the caller owns, keeping what it had already paid for.
+   *
+   * The difference from `cancel` is what happens to the work: a paused run keeps its checkpoint
+   * and can be continued by `resume`, while a cancelled one is terminal. A run nobody holds stops
+   * outright; one a worker holds is asked to stop before its next provider call, exactly as a
+   * cancellation is, and the response says which happened rather than guessing.
+   */
+  router.post('/api/jobs/:id/pause', async ctx => {
+    assertOriginAllowed(ctx);
+    const session = requireSession(ctx);
+    requireCsrf(ctx, session);
+
+    const outcome = requestPause(ctx.db, ctx.params.id, session.user.id);
+    if (!outcome) throw notFound('That job does not exist.', 'job_not_found');
+
+    return json({
+      outcome,
+      stopped: outcome === 'paused',
+      job: toContractJob(requireJob(ctx.db, ctx.params.id)),
+    });
+  });
+
+  /**
+   * Queues a stopped run again so it continues from where it left off.
+   *
+   * Every outcome is a `200`, because each one is a truthful answer about the run rather than a
+   * failure of the request: `resumed` (it is queued again, from stored progress), `already_running`
+   * (it is in the queue already), `completed` (there is nothing to continue) and
+   * `nothing_to_resume` (no checkpoint, so continuing it would silently start the plan over — which
+   * is the outcome this endpoint exists to refuse).
+   */
+  router.post('/api/jobs/:id/resume', async ctx => {
+    assertOriginAllowed(ctx);
+    const session = requireSession(ctx);
+    requireCsrf(ctx, session);
+
+    const result = resumeJob(ctx.db, ctx.params.id, session.user.id);
+    if (!result) throw notFound('That job does not exist.', 'job_not_found');
+
+    return json({
+      outcome: result.outcome,
+      fromCheckpoint: result.fromCheckpoint,
+      resumed: result.outcome === 'resumed',
+      job: toContractJob(requireJob(ctx.db, ctx.params.id)),
     });
   });
 
@@ -1006,6 +1408,10 @@ export function registerResourceRoutes(router: Router): void {
         scheduleModified: appliesToSchedule,
         reviewedAt: reviewedAtIso,
       },
+      // Today's allowance after this review, counted from the events. Returned rather than left for
+      // the caller to infer: a client that increments its own counters gets them wrong on the first
+      // cram review it keeps out of the schedule, and cannot see another client's reviews at all.
+      daily: dailyActivityFor(ctx.db, session.user.id, card.deck_id),
     });
   });
 
@@ -1043,7 +1449,14 @@ export function registerResourceRoutes(router: Router): void {
       return replayCardSchedule(ctx.db, session.user.id, card.id);
     })();
 
-    return json({ cardId: card.id, undone: { id: last.id, rating: last.rating, mode: last.mode }, state });
+    return json({
+      cardId: card.id,
+      undone: { id: last.id, rating: last.rating, mode: last.mode },
+      state,
+      // The allowance is re-read, not decremented by guesswork: an undone review may or may not have
+      // introduced the card, and only the event history knows which.
+      daily: dailyActivityFor(ctx.db, session.user.id, card.deck_id),
+    });
   });
 
   /**
@@ -1083,52 +1496,41 @@ export function registerResourceRoutes(router: Router): void {
 
     const states = ctx.db
       .query(
-        // `review_count` is served because a scheduling row exists only after a review, while
-        // `repetition = 0` is also the state of a card whose only review was undone. Without the
-        // count a client cannot tell "never reviewed" from "reviewed and reset", and would show an
-        // undone card as studied.
+        // Three review facts are served, and they are not interchangeable:
+        //
+        //   `review_count`          — every review of any kind, so a client can tell "never
+        //                             reviewed" from "reviewed and reset".
+        //   `schedule_review_count` — the reviews that actually changed the schedule. Zero means
+        //                             the card has never been scheduled, whatever else happened.
+        //   `last_scheduled_at`     — when that last happened, which is what makes a card studied
+        //                             rather than new.
+        //
+        // Separating them is what keeps an isolated cram review out of the schedule: it is a real
+        // review, recorded and shown in the history, but it must not make a card the learner never
+        // scheduled look studied, and it must not make today's allowance shrink.
         `SELECT s.card_id, s.repetition, s.interval_days, s.ease_factor, s.due_at, s.suspended,
                 s.updated_at,
                 (SELECT COUNT(*) FROM review_events r
-                  WHERE r.user_id = s.user_id AND r.card_id = s.card_id) AS review_count
+                  WHERE r.user_id = s.user_id AND r.card_id = s.card_id) AS review_count,
+                (SELECT COUNT(*) FROM review_events r
+                  WHERE r.user_id = s.user_id AND r.card_id = s.card_id
+                    AND r.schedule_modified = 1) AS schedule_review_count,
+                (SELECT MAX(r.reviewed_at) FROM review_events r
+                  WHERE r.user_id = s.user_id AND r.card_id = s.card_id
+                    AND r.schedule_modified = 1) AS last_scheduled_at
            FROM user_card_state s
            JOIN cards c ON c.id = s.card_id
           WHERE s.user_id = ? AND c.deck_id = ?`
       )
       .all(session.user.id, deck.id);
 
-    const dayStart = startOfUtcDay(new Date()).toISOString();
-
-    const reviewsToday = ctx.db
-      .query(
-        `SELECT COUNT(*) AS n FROM review_events r
-           JOIN cards c ON c.id = r.card_id
-          WHERE r.user_id = ? AND c.deck_id = ? AND r.reviewed_at >= ?`
-      )
-      .get(session.user.id, deck.id, dayStart) as { n: number };
-
-    // "New cards introduced today": reviews today of cards that had no earlier review, which is
-    // the count the daily new-card limit is about. Derived from the events, not from a counter
-    // that could drift away from them.
-    const newCardsToday = ctx.db
-      .query(
-        `SELECT COUNT(*) AS n FROM review_events r
-           JOIN cards c ON c.id = r.card_id
-          WHERE r.user_id = ? AND c.deck_id = ? AND r.reviewed_at >= ?
-            AND NOT EXISTS (
-              SELECT 1 FROM review_events earlier
-               WHERE earlier.user_id = r.user_id AND earlier.card_id = r.card_id
-                 AND earlier.reviewed_at < ?
-            )`
-      )
-      .get(session.user.id, deck.id, dayStart, dayStart) as { n: number };
-
+    // Whatever the learner has done today that counts, counted from the events themselves. The
+    // two definitions, and the UTC-midnight boundary the period is measured over, live in
+    // `@jevdeck/scheduling`'s `daily` module so the screen explaining them cannot drift from this.
     return json({
       deckId: deck.id,
-      periodStart: dayStart,
       states,
-      reviewsToday: reviewsToday.n,
-      newCardsToday: newCardsToday.n,
+      ...dailyActivityFor(ctx.db, session.user.id, deck.id),
     });
   });
 
@@ -1150,6 +1552,34 @@ export function registerResourceRoutes(router: Router): void {
   });
 }
 
+/**
+ * One shape for today's allowance, wherever it is served.
+ *
+ * The schedule read, a settled review and an undo all answer the same question, so they answer it
+ * with the same fields from the same query — a client never has to reconcile two spellings of it.
+ */
+function dailyActivityFor(
+  db: Database,
+  userId: string,
+  deckId: string | null
+): {
+  periodStart: string;
+  periodEnd: string;
+  reviewEventsToday: number;
+  newCardsIntroducedToday: number;
+} {
+  // A card whose deck was deleted has no deck allowance to report; zero is the truthful answer, and
+  // it keeps the response shape stable for the caller.
+  const activity = deckId ? readDailyStudyActivity(db, userId, deckId) : null;
+
+  return {
+    periodStart: activity?.start ?? '',
+    periodEnd: activity?.end ?? '',
+    reviewEventsToday: activity?.reviewEvents ?? 0,
+    newCardsIntroducedToday: activity?.newCardsIntroduced ?? 0,
+  };
+}
+
 interface CardSchedule {
   repetition: number;
   intervalDays: number;
@@ -1165,7 +1595,13 @@ interface CardSchedule {
  *
  * Replay rather than accumulate, because the events are the record: an undone review leaves the
  * same state as if it had never been given, and a schedule can always be explained by the events
- * behind it. An isolated cram review moves `lastStudiedAt` and nothing else.
+ * behind it.
+ *
+ * `lastStudiedAt` is the last **schedule-affecting** review, not the last time the card was on
+ * screen. It is what tells a never-scheduled card apart from one being reviewed, so an isolated
+ * cram session must not move it: a card the learner crammed but never scheduled is still new, and
+ * counting it as introduced would remove it from the new queue without ever having added it to the
+ * schedule.
  */
 function replayCardSchedule(db: Database, userId: string, cardId: string): CardSchedule {
   const events = db
@@ -1188,9 +1624,11 @@ function replayCardSchedule(db: Database, userId: string, cardId: string): CardS
   let lastStudiedAt: string | null = null;
 
   for (const event of events) {
-    lastStudiedAt = event.reviewed_at;
-
+    // An isolated cram review is recorded and replayed past: the card was seen, the schedule was
+    // not touched, and nothing about the card's position in the schedule changes.
     if (event.mode === 'cram' && event.schedule_modified === 0) continue;
+
+    lastStudiedAt = event.reviewed_at;
 
     const next = calculateSM2(
       { repetition, intervalDays, easeFactor },
@@ -1299,7 +1737,4 @@ function upsertCardState(
   );
 }
 
-/** Midnight UTC, the boundary the per-day study limits reset on. */
-function startOfUtcDay(date: Date): Date {
-  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
-}
+

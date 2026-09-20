@@ -6,9 +6,14 @@ that matters most.
 
 - `claim` — everything the card asserts, as the learner will see it: the question and answer of
   a Q&A card, or the full sentence of a cloze card with the deletion written back in.
-- `citedExcerpt` — the passage the card cites. It is taken from the stored source, not from the
-  card.
+- `citedExcerpt` — the passage the card cites. This is the **server's reconstruction** of the
+  stored source at the span the card's citation resolved to, not text the card supplied.
+- `evidenceContext` — the cited evidence with one sentence on each side of it. A qualification
+  stated just before or after the citation is part of what the claim must respect.
 - `storedPageText` — the full text of the page the claim is attributed to.
+- `openQuestions` — present only when a deterministic check could not settle something: a hedge, a
+  dropped condition, a claim that is not a close restatement of its evidence. These are the points
+  to decide. They are not verdicts — a claim listed here may well be supported.
 
 ## How to decide
 
@@ -16,6 +21,10 @@ Read `storedPageText` first. It is the authority; `citedExcerpt` is a pointer in
 
 The claim is **supported** only if every part of it can be read in `storedPageText`, with the
 same meaning and the same limits.
+
+Work through `openQuestions` before concluding. A sentence elsewhere on the page that has nothing
+to do with the claim is not evidence against it, and neither is an unrelated negation or hedge.
+Judge the claim against the passage it cites and the sentences immediately around it.
 
 Mark it unsupported when any of these is true:
 

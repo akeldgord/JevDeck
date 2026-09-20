@@ -11,6 +11,7 @@
     "@jevdeck/anki-export": "workspace:*",
     "@jevdeck/contracts": "workspace:*",
     "@jevdeck/generation": "workspace:*",
+    "@jevdeck/ingestion": "workspace:*",
     "@jevdeck/providers": "workspace:*",
     "@jevdeck/scheduling": "workspace:*",
     "@jevdeck/validation": "workspace:*",

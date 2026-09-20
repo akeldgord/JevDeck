@@ -20,6 +20,7 @@
   "references": [
     { "path": "../../packages/contracts" },
     { "path": "../../packages/generation" },
+    { "path": "../../packages/ingestion" },
     { "path": "../../packages/scheduling" },
     { "path": "../../packages/validation" },
     { "path": "../../packages/anki_export" }

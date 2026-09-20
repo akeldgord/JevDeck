@@ -17,6 +17,7 @@
         "@jevdeck/anki-export": "workspace:*",
         "@jevdeck/contracts": "workspace:*",
         "@jevdeck/generation": "workspace:*",
+        "@jevdeck/ingestion": "workspace:*",
         "@jevdeck/providers": "workspace:*",
         "@jevdeck/scheduling": "workspace:*",
         "@jevdeck/validation": "workspace:*",
@@ -34,6 +35,7 @@
         "@jevdeck/anki-export": "workspace:*",
         "@jevdeck/contracts": "workspace:*",
         "@jevdeck/generation": "workspace:*",
+        "@jevdeck/ingestion": "workspace:*",
         "@jevdeck/scheduling": "workspace:*",
         "@jevdeck/validation": "workspace:*",
         "clsx": "^2.1.1",
@@ -98,6 +100,16 @@
       "dependencies": {
         "@jevdeck/contracts": "workspace:*",
         "@jevdeck/validation": "workspace:*",
+      },
+      "devDependencies": {
+        "typescript": "^5.6.2",
+      },
+    },
+    "packages/ingestion": {
+      "name": "@jevdeck/ingestion",
+      "version": "0.1.0",
+      "dependencies": {
+        "@jevdeck/contracts": "workspace:*",
       },
       "devDependencies": {
         "typescript": "^5.6.2",
@@ -231,6 +243,8 @@
     "@jevdeck/evaluation": ["@jevdeck/evaluation@workspace:packages/evaluation"],
 
     "@jevdeck/generation": ["@jevdeck/generation@workspace:packages/generation"],
+
+    "@jevdeck/ingestion": ["@jevdeck/ingestion@workspace:packages/ingestion"],
 
     "@jevdeck/providers": ["@jevdeck/providers@workspace:packages/providers"],
 

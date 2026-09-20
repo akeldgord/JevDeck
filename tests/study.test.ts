@@ -3,9 +3,12 @@ import type { Flashcard } from '../packages/contracts/src';
 import {
   DEFAULT_NEW_LIMIT,
   DEFAULT_REVIEW_LIMIT,
+  STUDY_DAY_TIMEZONE,
   cardStudyState,
+  describeDailyAllowance,
   describeQueue,
   selectStudyQueue,
+  studyDayPeriod,
 } from '../packages/scheduling/src';
 
 /**
@@ -151,8 +154,8 @@ describe('The session queue', () => {
       cards,
       now: NOW,
       newLimitPerDay: 2,
-      newCardsCompletedToday: 2,
-      reviewsCompletedToday: 0,
+      newCardsIntroducedToday: 2,
+      reviewEventsToday: 0,
     });
 
     expect(queue.queue.filter(entry => entry.id.startsWith('new')).length).toBe(0);
@@ -163,8 +166,8 @@ describe('The session queue', () => {
     const queue = selectStudyQueue({
       cards,
       now: NOW,
-      reviewsCompletedToday: DEFAULT_REVIEW_LIMIT,
-      newCardsCompletedToday: DEFAULT_NEW_LIMIT,
+      reviewEventsToday: DEFAULT_REVIEW_LIMIT,
+      newCardsIntroducedToday: DEFAULT_NEW_LIMIT,
     });
 
     expect(queue.queue.length).toBe(0);
@@ -177,8 +180,8 @@ describe('The session queue', () => {
       now: NOW,
       mode: 'cram',
       suspendedCardIds: ['suspended'],
-      reviewsCompletedToday: DEFAULT_REVIEW_LIMIT,
-      newCardsCompletedToday: DEFAULT_NEW_LIMIT,
+      reviewEventsToday: DEFAULT_REVIEW_LIMIT,
+      newCardsIntroducedToday: DEFAULT_NEW_LIMIT,
     });
 
     expect(queue.queue.length).toBe(5);
@@ -194,5 +197,38 @@ describe('The session queue', () => {
     );
 
     expect(backwards).toEqual(forwards);
+  });
+});
+
+describe('The day the limits reset on, and what they count', () => {
+  it('is one documented instant, twenty-four hours long and half-open', () => {
+    // Mid-afternoon UTC: the period still starts at that day's midnight, not at the review.
+    const period = studyDayPeriod(NOW);
+
+    expect(STUDY_DAY_TIMEZONE).toBe('UTC');
+    expect(period.start).toBe('2026-03-15T00:00:00.000Z');
+    expect(period.end).toBe('2026-03-16T00:00:00.000Z');
+    expect(new Date(period.end).getTime() - new Date(period.start).getTime()).toBe(86_400_000);
+  });
+
+  it('puts an instant just before midnight in the day that is ending', () => {
+    const lateLastNight = new Date('2026-03-15T23:59:59.999Z');
+    expect(studyDayPeriod(lateLastNight).start).toBe('2026-03-15T00:00:00.000Z');
+    // Exactly midnight belongs to the next day, which is what makes the boundary unambiguous.
+    expect(studyDayPeriod(new Date('2026-03-16T00:00:00.000Z')).start).toBe(
+      '2026-03-16T00:00:00.000Z'
+    );
+  });
+
+  it('states both counts rather than a bare fraction', () => {
+    const line = describeDailyAllowance(
+      { reviewEventsToday: 12, newCardsIntroducedToday: 3 },
+      { newLimitPerDay: 20, reviewLimitPerDay: 200 }
+    );
+
+    // A reader cannot tell "3 / 20" from "12 / 20" which is cards and which is ratings, and the
+    // difference is the whole point. Both are named.
+    expect(line).toContain('3 of 20 new cards introduced today');
+    expect(line).toContain('12 of 200 reviews today');
   });
 });

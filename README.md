@@ -27,7 +27,7 @@ is in the later records beside it.
 
 | Capability | Notes |
 | --- | --- |
-| PDF upload and text extraction | Runs in your browser via `pdfjs-dist`. Outline/TOC sections are extracted, with nested subsections preserved. |
+| Document upload and text extraction | PDF (in your browser via `pdfjs-dist`), Word, PowerPoint, Markdown, plain text and pasted notes, each read by its own reader. Outline/TOC sections are extracted where the format states them, with nested subsections preserved. Pages that yielded no text are reported as blank or as unread content, separately. |
 | Section selection | Choose which chapters or subsections to cover. |
 | Coverage choice | **Two** modes: **high-yield** and **comprehensive**. |
 | Persistent backend | SQLite with versioned, checksum-verified migrations. Accounts, sessions, invitations, documents and versions, sections, source blocks, decks, cards, evidence, per-user schedules, review events and generation jobs are stored server-side. |
@@ -38,14 +38,18 @@ is in the later records beside it.
 | Study queue | One eligibility function produces both the header's due count and the session queue, so they cannot disagree. New, due, suspended and later are distinguished, and daily limits are applied and explained rather than silently truncating a session. |
 | Original-page viewer | Renders the real uploaded page and locates the cited passage on it. A passage that cannot be located is labelled "exact highlight unavailable" instead of drawing an approximate rectangle. |
 | Text exports | Tab-separated Anki import file and a JSON bundle. |
-| Anki `.apkg` export | A real Anki collection in a ZIP, built server-side from the stored rows and this account's schedule. |
+| Anki `.apkg` export | A real Anki collection in a ZIP, built server-side from the stored cards and their citations. Every card arrives **new**: the export is a fresh schedule, so review history, intervals and due dates are deliberately not transferred, and nothing syncs back. Multiple cloze deletions in one note become multiple Anki cards. |
 | Deck sharing | Owner-scoped grant and revoke, addressed by email, study scope only: a shared deck's cards can be studied while the owner's document stays unreadable. |
 | Budget accounting | An append-only usage ledger with per-user and installation-wide monthly caps, reserved before each provider call and settled after it, so concurrent jobs cannot exceed the available reservation. |
+| Input formats | PDF, Word (`.docx`), PowerPoint (`.pptx`), Markdown, plain text and pasted notes, each read by its own reader into one storage shape. A page that yields no text is recorded as **blank** (a confirmed result) or as **unread content** (a picture this build could not read), and the two are reported separately. Formats this build cannot read are refused with the step that would fix it. OCR is not implemented, so a scanned page is reported unread rather than read. |
+| Stored media | Images a `.docx` or `.pptx` actually carries are stored beside their version, listed with the page they sit on (or recorded as unanchored when the format did not place them), and served one at a time to the account that owns the document. PDF images are **not** extracted, and the `.apkg` bundles no media. |
+| Deck browsing | A **Decks** tab lists the caller's decks and the decks shared with them, with open, study, export and delete offered only where the server allows it, and the reason stated where it does not. Deleting a deck deletes its cards and keeps its document. |
 | Backup and restore | One consistent SQLite artifact covering the database and the retained original files, with a verified round trip. |
 | Containers and CI | A `Dockerfile`, a Compose file with a data volume and health check, and a CI workflow that installs from the lockfile, typechecks, tests and builds. |
 | Evaluation harness | Measures the quality gates in §5 from a completed run's stored rows, and reports a gate it cannot measure as unmet rather than passing it. |
 | **Card generation through a real AI provider** | `packages/providers` speaks the OpenAI chat-completions and Anthropic messages envelopes, so OpenAI, Anthropic, vLLM, Ollama or LocalAI all work. Prompts are versioned files; a missing prompt is a hard failure rather than a hidden default. Without a configured credential generation is **unavailable**, the refusal is recorded with its reason, and no placeholder card is produced. |
 | **Durable job dispatch** | A job is a database row, claimed with an atomic conditional update and held under a lease. A crash leaves it reclaimable once the lease expires, and a retry backs off rather than hammering a rate-limited provider. Every attempt is recorded with its prompt hash, tokens and outcome. |
+| **Stopping and resuming a run** | A queued run stops outright; one a worker holds is asked to stop and does so before its next provider call, so stopping ends the spending rather than reporting a stop that already happened. **Pause** keeps everything the run had already paid for and **Resume** continues it from there — the concept extraction and card generation it completed are not requested again. **Cancel** is the terminal version: the cards are discarded. Either way the record says how far the run got, and the queue will not hand a stopped run to another worker. The same stored progress makes an interrupted run — a crash, a lease expiry, one failed call — resume on its next attempt instead of re-paying for the batches it had finished. |
 | **Concept inventory and honest coverage** | The provider proposes concepts; the stored source disposes. An excerpt that is not in the stored page is discarded, and every concept records the decision taken about it. High-yield keeps the central concepts, comprehensive keeps every eligible one, and the resulting coverage summary reports what was found, included, kept and withheld. |
 | **Content-driven card format** | The format is decided from the passage's wording first and the concept's kind second, never from the section title, and the reason is stored on the card. A card the provider writes in the wrong format is re-asked once, then withheld. |
 | **Independent validation** | A card is checked structurally, against the stored page (quantities, negation, modality, dropped conditions, terms absent from the source) and then by a separate bounded provider call. A deterministic failure rejects the card whatever the model says. |
@@ -54,9 +58,9 @@ is in the later records beside it.
 
 | Capability | Blocked on |
 | --- | --- |
-| Multiple decks per document, deck browsing | A document reuses its deck, and no screen lists every deck |
-| Additional input formats (slides, Word, pasted notes, scans/OCR) | Ingestion work; PDF only today |
-| Media extraction (figures, tables) | Ingestion work; the `media` table exists and nothing writes it |
+| Reading scanned pages (OCR) | Ingestion work. A scan is stored as a page and reported as unread content; nothing on it can be turned into cards, and the report says so rather than counting it as covered |
+| Image extraction from PDFs | PDF work. A `.docx` or `.pptx` image is stored and served; a figure inside a PDF page is not, and the reader records that limitation with the document |
+| Media in the Anki package | The package cites each card's page and bundles no media files, rather than shipping placeholders |
 | A passing §5 quality gate | No provider credential in the development environment and no independent review of cards from a hosted model. All three gates are **unmet**, not passed. |
 | Zoom/rotation/multiline highlight fixtures | R4 follow-up; the highlight that is drawn is measured, but those cases are untested |
 | A tracked `.env.example` | The file tooling in this workspace refuses any `.env*` path. The variables are documented in the table below and in `docs/self-hosting.md`. |
@@ -164,6 +168,32 @@ as demo content, and the app does not talk to the API at all.
 > variables directly in `.env.local` (git-ignored); this table and `docs/self-hosting.md`
 > document every variable.
 
+## Operational limits
+
+The values below are the ones actually enforced in code — each is a constant a request is checked
+against, not a guideline. They are published so a self-hoster can size an installation rather than
+discover a ceiling by hitting it.
+
+| Limit | Value | Enforced by |
+| --- | --- | --- |
+| Original file kept for the source viewer | 16 MiB per document | `MAX_SOURCE_BYTES` — above it the upload is accepted but the bytes are dropped, the extracted text becomes the record, and the document says so |
+| Request body | 24 MiB | `MAX_JSON_BODY_BYTES`, refused by `content-length` before it is read |
+| Stored images per document | 8 MiB total | `MAX_MEDIA_BYTES_PER_DOCUMENT` |
+| Sections selectable in one run | 500 | the generate route truncates the selection list |
+| Source sent in one extraction call | 60,000 characters | `MAX_SOURCE_CHARS_PER_CALL`; a page larger than that is sent whole rather than truncated |
+| Concepts per run | 120 | `MAX_CONCEPTS` |
+| Concepts per card-generation call | 10 | `CARD_BATCH_SIZE` |
+| Repair attempts per card | 1 | `MAX_REPAIR_ATTEMPTS` |
+| Provider call timeout | 90 s (`JEVDECK_PROVIDER_TIMEOUT_MS`) | the transport aborts the request |
+| Job attempts | 3 | `DEFAULT_MAX_ATTEMPTS`, behind a 5 s backoff |
+
+**What is not established.** There is no measured page-count or worker-memory ceiling, so this
+project does not claim one: “unlimited textbook support” is not a support claim it can back. Large
+documents are bounded by the per-call source limit and by the worker holding the run in memory. A
+long run can be paused and resumed, and an interrupted one continues from its last completed batch
+rather than from the start, but the size a single worker can be *expected* to finish has not been
+measured. Those remain open work rather than unstated limits.
+
 ## Documentation
 
 - [`SPEC.md`](SPEC.md) — requirements of record
@@ -185,6 +215,7 @@ JevDeck/
     worker/                  # Durable job queue and the real generation pipeline
   packages/
     contracts/               # Shared TypeScript schemas and DTOs
+    ingestion/               # Multi-format readers (.docx, .pptx, Markdown, text), coverage summary
     generation/              # Concept inventory, coverage rules, format decision (pure)
     validation/              # Grounding, ambiguity, duplicate and claim-support checks
     providers/               # Provider adapters, prompt loading, strict output parsing

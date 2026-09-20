@@ -1,11 +1,31 @@
 import React from 'react';
-import { AlertTriangle, CheckCircle2, Clock, Layers, ListTree, XCircle } from 'lucide-react';
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Clock,
+  Layers,
+  ListTree,
+  Pause,
+  Play,
+  Square,
+  XCircle,
+} from 'lucide-react';
 import { JobConcept, JobStatus } from '../lib/api';
 
 interface Props {
   jobStatus: JobStatus | null;
   concepts: JobConcept[];
   error: string | null;
+  /** Stops the run being followed, discarding it. Absent when there is nothing to stop. */
+  onCancel?: () => void;
+  /** Stops the run being followed, keeping its progress so it can be resumed. */
+  onPause?: () => void;
+  /** Queues a stopped run again, to continue from its stored progress. */
+  onResume?: () => void;
+  /** True while a stop or resume request is in flight, so a control cannot be pressed twice. */
+  busy?: boolean;
+  /** What the last pause or resume request answered, when it was not the plain success case. */
+  actionNotice?: string | null;
 }
 
 /** Human wording for each coverage decision. The codes themselves are internal. */
@@ -55,15 +75,78 @@ function Stat({ label, value }: { label: string; value: number | string }) {
  * an empty run says it found nothing, a failed run says why, and a concept that was left out shows
  * the decision that left it out.
  */
-export const GenerationResult: React.FC<Props> = ({ jobStatus, concepts, error }) => {
+export const GenerationResult: React.FC<Props> = ({
+  jobStatus,
+  concepts,
+  error,
+  onCancel,
+  onPause,
+  onResume,
+  busy = false,
+  actionNotice = null,
+}) => {
+  // A run stopped on purpose reads differently from one that broke, and the recorded code is what
+  // tells them apart — the state alone does not, because a cancelled run is terminal too.
+  const wasCancelled = jobStatus?.job.errorCode === 'cancelled_by_user';
+  const wasPaused = jobStatus?.job.state === 'paused' || jobStatus?.job.errorCode === 'paused_by_user';
+  // A checkpoint is what makes a stopped run continuable: without one there is nothing to resume
+  // from, and the server refuses rather than silently starting the run again.
+  const canResume = Boolean(
+    onResume && jobStatus?.job.hasCheckpoint && jobStatus.job.state !== 'completed'
+  );
+
   if (error) {
     return (
-      <div className="bg-slate-900/70 border border-red-900/60 rounded-2xl p-6 space-y-2">
-        <h2 className="text-sm font-bold text-red-200 flex items-center gap-2">
-          <AlertTriangle className="w-4 h-4" />
-          Generation did not finish
+      <div
+        className={`bg-slate-900/70 border rounded-2xl p-6 space-y-3 ${
+          wasCancelled || wasPaused ? 'border-slate-800' : 'border-red-900/60'
+        }`}
+      >
+        <h2
+          className={`text-sm font-bold flex items-center gap-2 ${
+            wasCancelled || wasPaused ? 'text-slate-200' : 'text-red-200'
+          }`}
+        >
+          {wasPaused ? (
+            <Pause className="w-4 h-4" />
+          ) : wasCancelled ? (
+            <Square className="w-4 h-4" />
+          ) : (
+            <AlertTriangle className="w-4 h-4" />
+          )}
+          {wasPaused
+            ? 'Generation is paused'
+            : wasCancelled
+              ? 'Generation was cancelled'
+              : 'Generation did not finish'}
         </h2>
-        <p className="text-xs text-red-200/90 leading-relaxed">{error}</p>
+        <p
+          className={`text-xs leading-relaxed ${
+            wasCancelled || wasPaused ? 'text-slate-400' : 'text-red-200/90'
+          }`}
+        >
+          {error}
+        </p>
+
+        {canResume && (
+          <div className="space-y-2">
+            <button
+              type="button"
+              onClick={onResume}
+              disabled={busy}
+              className="inline-flex items-center gap-2 rounded-lg border border-emerald-800 bg-emerald-950/50 px-3 py-1.5 text-xs font-semibold text-emerald-200 transition-colors hover:bg-emerald-950 disabled:opacity-60"
+            >
+              <Play className="w-3.5 h-3.5" />
+              {busy ? 'Resuming…' : 'Resume run'}
+            </button>
+            <p className="text-[11px] text-slate-500">
+              Resuming continues from the concepts and cards this run had already paid for, rather
+              than generating them again.
+            </p>
+          </div>
+        )}
+
+        {actionNotice && <p className="text-[11px] text-amber-300/90">{actionNotice}</p>}
       </div>
     );
   }
@@ -91,29 +174,73 @@ export const GenerationResult: React.FC<Props> = ({ jobStatus, concepts, error }
 
         <span
           className={`text-xs px-2.5 py-1 rounded-full border font-semibold flex items-center gap-1.5 ${
-            job.state === 'completed'
-              ? 'bg-emerald-950/50 border-emerald-800 text-emerald-300'
-              : job.state === 'failed'
-                ? 'bg-red-950/50 border-red-900 text-red-300'
-                : 'bg-slate-800 border-slate-700 text-slate-300'
+            wasCancelled || wasPaused
+              ? 'bg-slate-800 border-slate-700 text-slate-300'
+              : job.state === 'completed'
+                ? 'bg-emerald-950/50 border-emerald-800 text-emerald-300'
+                : job.state === 'failed'
+                  ? 'bg-red-950/50 border-red-900 text-red-300'
+                  : 'bg-slate-800 border-slate-700 text-slate-300'
           }`}
         >
-          {job.state === 'completed' ? (
+          {wasPaused ? (
+            <Pause className="w-3.5 h-3.5" />
+          ) : wasCancelled ? (
+            <Square className="w-3.5 h-3.5" />
+          ) : job.state === 'completed' ? (
             <CheckCircle2 className="w-3.5 h-3.5" />
           ) : job.state === 'failed' ? (
             <XCircle className="w-3.5 h-3.5" />
           ) : (
             <Clock className="w-3.5 h-3.5" />
           )}
-          {job.state}
+          {wasPaused ? 'paused' : wasCancelled ? 'cancelled' : job.state}
         </span>
       </div>
 
       {running && (
-        <p className="text-xs text-slate-400 leading-relaxed">
-          The job is queued on the server and runs whether or not this page stays open. Progress
-          below is read from the job record, not estimated.
-        </p>
+        <div className="space-y-3">
+          <p className="text-xs text-slate-400 leading-relaxed">
+            The job is queued on the server and runs whether or not this page stays open. Progress
+            below is read from the job record, not estimated.
+          </p>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {onPause && (
+              <button
+                type="button"
+                onClick={onPause}
+                disabled={busy || job.pauseRequestedAt != null || job.cancelRequestedAt != null}
+                className="inline-flex items-center gap-2 rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-semibold text-slate-200 transition-colors hover:bg-slate-700 disabled:opacity-60"
+              >
+                <Pause className="w-3.5 h-3.5" />
+                {job.pauseRequestedAt != null || busy ? 'Stopping…' : 'Pause run'}
+              </button>
+            )}
+
+            {onCancel && (
+              <button
+                type="button"
+                onClick={onCancel}
+                disabled={busy || job.cancelRequestedAt != null}
+                className="inline-flex items-center gap-2 rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-semibold text-slate-200 transition-colors hover:bg-slate-700 disabled:opacity-60"
+              >
+                <Square className="w-3.5 h-3.5" />
+                {job.cancelRequestedAt != null || busy ? 'Stopping…' : 'Cancel run'}
+              </button>
+            )}
+          </div>
+
+          {(job.pauseRequestedAt != null || job.cancelRequestedAt != null) && (
+            <p className="text-[11px] text-amber-300/90">
+              A stop has been requested. The run stops before its next provider call, so no further
+              spending is started. Pausing keeps what the run had already done; cancelling discards
+              the cards it had not yet stored.
+            </p>
+          )}
+
+          {actionNotice && <p className="text-[11px] text-amber-300/90">{actionNotice}</p>}
+        </div>
       )}
 
       {job.provider && (

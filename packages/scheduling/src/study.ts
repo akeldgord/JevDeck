@@ -1,5 +1,6 @@
 import { Flashcard } from '@jevdeck/contracts';
 import { isCardDue } from './index';
+import type { DailyStudyCounts } from './daily';
 
 /**
  * Study eligibility: which cards a session may show, and why.
@@ -12,6 +13,10 @@ import { isCardDue } from './index';
  * `later` when it is scheduled for the future, and `suspended` when the learner has taken it out
  * of rotation. Daily limits are applied here too, because a limit the queue does not respect is
  * not a limit.
+ *
+ * What those limits count — distinct introduced cards for the new-card limit, review events for
+ * the review limit — and the day they reset on are defined once in `./daily`, and the counts are
+ * supplied by the caller from the stored events rather than accumulated here.
  */
 
 export type StudyCardState = 'new' | 'due' | 'later' | 'suspended';
@@ -28,10 +33,16 @@ export interface StudyQueueInput {
   mode?: 'normal' | 'cram';
   /** Card ids the learner has suspended. */
   suspendedCardIds?: Iterable<string>;
-  /** Reviews already completed today, for the daily limits. */
-  reviewsCompletedToday?: number;
-  /** First-ever reviews completed today, which is what the new-card limit counts. */
-  newCardsCompletedToday?: number;
+  /**
+   * Schedule-affecting review *events* already recorded today. The review limit counts events, not
+   * distinct cards: rating one card four times is four reviews' worth of effort. See `./daily`.
+   */
+  reviewEventsToday?: number;
+  /**
+   * **Distinct** cards whose first schedule-affecting review is today. The new-card limit counts
+   * these, so reviewing one new card repeatedly introduces it once.
+   */
+  newCardsIntroducedToday?: number;
   newLimitPerDay?: number;
   reviewLimitPerDay?: number;
 }
@@ -53,6 +64,11 @@ export interface StudyQueue {
   counts: StudyQueueCounts;
   limits: { newLimitPerDay: number; reviewLimitPerDay: number };
   mode: 'normal' | 'cram';
+  /**
+   * What today's allowance was measured from, echoed back so the study screen can state it.
+   * A cram session does not consume an allowance and is not reported against one.
+   */
+  allowance: DailyStudyCounts;
 }
 
 /** The state of one card, from its own schedule. */
@@ -136,15 +152,20 @@ export function selectStudyQueue(input: StudyQueueInput): StudyQueue {
   due.sort(byDueDate);
   fresh.sort((a, b) => (a.createdAt ?? '').localeCompare(b.createdAt ?? '') || a.id.localeCompare(b.id));
 
+  const allowance: DailyStudyCounts = {
+    reviewEventsToday: Math.max(0, input.reviewEventsToday ?? 0),
+    newCardsIntroducedToday: Math.max(0, input.newCardsIntroducedToday ?? 0),
+  };
+
   if (mode === 'cram') {
     // Cramming is a deliberate exception: the whole deck, in a stable order, no limits.
     const queue = [...due, ...fresh, ...later];
     counts.eligible = queue.length;
-    return { queue, counts, limits: { newLimitPerDay, reviewLimitPerDay }, mode };
+    return { queue, counts, limits: { newLimitPerDay, reviewLimitPerDay }, mode, allowance };
   }
 
-  const reviewRoom = Math.max(0, reviewLimitPerDay - (input.reviewsCompletedToday ?? 0));
-  const newRoom = Math.max(0, newLimitPerDay - (input.newCardsCompletedToday ?? 0));
+  const reviewRoom = Math.max(0, reviewLimitPerDay - allowance.reviewEventsToday);
+  const newRoom = Math.max(0, newLimitPerDay - allowance.newCardsIntroducedToday);
 
   const admittedDue = due.slice(0, reviewRoom);
   const admittedNew = fresh.slice(0, newRoom);
@@ -158,6 +179,7 @@ export function selectStudyQueue(input: StudyQueueInput): StudyQueue {
     counts,
     limits: { newLimitPerDay, reviewLimitPerDay },
     mode,
+    allowance,
   };
 }
 

@@ -40,7 +40,18 @@ export interface EvaluationReport {
     documentVersionId: string;
     /** Distinct physical pages, not source blocks: a page may hold several blocks. */
     pages: number;
+    /** Every page that yielded no text, however it came to yield none. */
     pagesWithNoText: number;
+    /** Of those, pages with nothing on them at all. A confirmed result, not a gap. */
+    pagesBlank: number;
+    /**
+     * Of those, pages whose content is a picture this build cannot read.
+     *
+     * Kept apart from the blank pages because they are opposite facts: one says the document had
+     * nothing there, the other says the system could not read what was there. A single "empty"
+     * count is what let an earlier report imply coverage it had not achieved.
+     */
+    pagesUnextracted: number;
     pagesWithPrintedLabels: number;
   };
   output: {
@@ -83,6 +94,19 @@ export interface BuildReportInput {
   generatedAt?: string;
 }
 
+/**
+ * What the reader concluded about one page, from the blocks stored for it.
+ *
+ * Text wins: a page that yielded any text is a readable page, whatever else was stored beside it.
+ * With no text, the recorded kind decides, and an unknown kind is reported as blank rather than as
+ * content that went missing.
+ */
+function pageConclusion(blocks: Array<{ kind: string; rawText: string }>): 'text' | 'blank' | 'image-only' {
+  if (blocks.some(block => block.rawText.trim().length > 0 || block.kind === 'text')) return 'text';
+  if (blocks.some(block => block.kind === 'image-only')) return 'image-only';
+  return 'blank';
+}
+
 export function buildReport(input: BuildReportInput): EvaluationReport {
   const { run } = input;
 
@@ -118,6 +142,8 @@ export function buildReport(input: BuildReportInput): EvaluationReport {
     blocksByPage.set(page.pageIndex, blocks);
   }
 
+  const pageConclusions = [...blocksByPage.values()].map(blocks => pageConclusion(blocks));
+
   const summary = {
     pass: gates.filter(gate => gate.status === 'pass').length,
     fail: gates.filter(gate => gate.status === 'fail').length,
@@ -143,10 +169,12 @@ export function buildReport(input: BuildReportInput): EvaluationReport {
     material: {
       documentVersionId: run.job.documentVersionId,
       pages: blocksByPage.size,
-      // A page counts as empty when nothing on it yielded text.
-      pagesWithNoText: [...blocksByPage.values()].filter(blocks =>
-        blocks.every(block => block.kind === 'empty')
-      ).length,
+      // A page yields no text when none of its blocks holds any. The stored kind is what
+      // distinguishes the two reasons; `empty` is read as blank for rows written before the
+      // split existed.
+      pagesWithNoText: pageConclusions.filter(conclusion => conclusion !== 'text').length,
+      pagesBlank: pageConclusions.filter(conclusion => conclusion === 'blank').length,
+      pagesUnextracted: pageConclusions.filter(conclusion => conclusion === 'image-only').length,
       pagesWithPrintedLabels: [...blocksByPage.values()].filter(blocks =>
         blocks.some(block => block.pageLabel !== null)
       ).length,

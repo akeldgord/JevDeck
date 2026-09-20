@@ -1,5 +1,5 @@
 import { loadPromptLibrary, PromptLibrary } from './prompts';
-import { createProvider } from './provider';
+import { createProvider, type TokenCounter } from './provider';
 import {
   createAnthropicTransport,
   createOpenAiCompatibleTransport,
@@ -115,6 +115,13 @@ export function describeProviderConfig(config: ProviderConfig): {
 export interface CreateProviderFromConfigOptions {
   prompts?: PromptLibrary;
   fetchImpl?: typeof fetch;
+  /**
+   * A provider-compatible token counter, when the installation has one.
+   *
+   * Without it the budget falls back to a conservative character bound and records that the
+   * figure was a bound rather than a count.
+   */
+  countTokens?: TokenCounter;
 }
 
 /**
@@ -155,5 +162,6 @@ export function createGenerationProvider(
     transport,
     prompts,
     temperature: config.temperature,
+    countTokens: options.countTokens,
   });
 }

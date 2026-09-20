@@ -1,4 +1,10 @@
-export { ProviderError, isProviderError, type ProviderErrorCode } from './errors';
+export {
+  ProviderError,
+  isProviderError,
+  withBilling,
+  type BillingOutlook,
+  type ProviderErrorCode,
+} from './errors';
 export {
   DEFAULT_PROMPTS_DIR,
   PromptLibrary,
@@ -13,6 +19,7 @@ export {
   createProvider,
   estimateMaxOutputTokens,
   type CreateProviderOptions,
+  type TokenCounter,
 } from './provider';
 export {
   createAnthropicTransport,
@@ -44,6 +51,7 @@ export type {
   ConceptExtractionResult,
   ConceptToGenerate,
   GenerationProvider,
+  PreparedCall,
   ProviderInfo,
   SourcePage,
   SourceSectionScope,

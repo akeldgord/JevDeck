@@ -8,9 +8,23 @@ import { createHash } from 'node:crypto';
  * files). This module builds that container for real: the collection is created with the Anki
  * schema and opened by Anki's own importer, rather than exported as text with an `.apkg` name.
  *
- * Scoped to what the application actually holds. Cards, their source citation and the deck come
- * across; media does not, because the pipeline does not extract figures or tables yet, and
- * writing an empty media map is the honest representation of that rather than a placeholder.
+ * ## The export is a fresh start, by contract
+ *
+ * Every card is written as **new**: `type = 0`, `queue = 0`, `ivl = 0`, `factor = 2500`,
+ * `reps = 0`, `lapses = 0`, and `due` set to the card's position in the new queue. Nothing a
+ * learner did in JevDeck is transferred — no intervals, no due dates, no review history, and no
+ * `revlog` rows at all. `ApkgCard` has no schedule field, so no caller can pass one: the previous
+ * version accepted one and exported studied cards as review cards on their in-app intervals, which
+ * promised a synchronization the product does not offer and cannot keep.
+ *
+ * What configures the arrival is the deck, in `col.dconf`: 20 new cards a day, in the order added.
+ * A learner who wants to carry progress across should expect to earn it again here, and the export
+ * screen says so rather than implying otherwise.
+ *
+ * Scoped to what the application actually holds otherwise: cards, their source citation and the
+ * deck come across; media does not, because the pipeline does not extract figures or tables yet,
+ * and writing an empty media map is the honest representation of that rather than a placeholder.
+ * Offline media is therefore not provided by this export, and must not be advertised as if it were.
  *
  * The container is written with stored (uncompressed) entries. The ZIP specification allows it,
  * every reader accepts it, and it removes any chance of a deflate bug corrupting a deck.
@@ -36,12 +50,6 @@ export interface ApkgCard {
   excerpt?: string | null;
   pageNumber?: number | null;
   sectionTitle?: string | null;
-  /** The learner's schedule, when one exists. Absent means the card is exported as new. */
-  schedule?: {
-    repetition: number;
-    intervalDays: number;
-    dueAt: string | null;
-  } | null;
 }
 
 export interface ApkgInput {
@@ -54,10 +62,33 @@ export interface ApkgInput {
 export interface ApkgResult {
   bytes: Uint8Array;
   fileName: string;
+  /** Anki cards written. A cloze note with three deletions becomes three cards, so this exceeds `noteCount`. */
   cardCount: number;
+  /** Notes written: one per exported flashcard, whatever its format. */
   noteCount: number;
   /** Files inside the container, in the order they are written. */
   entries: string[];
+}
+
+/** Anki's internal ease for a card that has never been reviewed: 2.5, in per-mille. */
+export const NEW_CARD_FACTOR = 2500;
+
+/**
+ * The distinct cloze deletion indices in a cloze card, ascending.
+ *
+ * Anki makes one card per distinct index — `{{c1::…}}` and `{{c2::…}}` are two cards of one note,
+ * and a note numbered `{{c1::…}} {{c3::…}}` is two cards, not three. Writing a single card `ord 0`
+ * for every note, as the previous version did, silently dropped every deletion after the first.
+ */
+export function clozeIndices(clozeText: string): number[] {
+  const indices = new Set<number>();
+
+  for (const match of clozeText.matchAll(/\{\{c(\d+)::/g)) {
+    const index = Number(match[1]);
+    if (Number.isInteger(index) && index > 0) indices.add(index);
+  }
+
+  return [...indices].sort((a, b) => a - b);
 }
 
 // ---------------------------------------------------------------------------
@@ -353,10 +384,20 @@ function fieldSeparatorSafe(value: string): string {
   return value.replace(/\u001f/g, ' ');
 }
 
+/**
+ * Anki's tag list for a note: space-separated, one ` tags ` string on the row.
+ *
+ * Whitespace becomes `_` because a space would end the tag. Nothing else is removed: Anki allows
+ * Unicode tags, and stripping to `[\w-]` silently turned `café` into `caf` and `mémoire` into
+ * `m_moire`. Only control characters go, because a stray field separator or newline would corrupt
+ * the row it is written into.
+ */
 function noteTags(tags: string[] | undefined): string {
   const cleaned = (tags ?? [])
-    .map(tag => tag.replace(/\s+/g, '_').replace(/[^\w-]/g, ''))
+    .map(tag => tag.trim().replace(/\s+/g, '_'))
+    .map(tag => tag.replace(/[\u0000-\u001f\u007f]/g, ''))
     .filter(tag => tag.length > 0);
+
   return cleaned.length === 0 ? '' : ` ${cleaned.join(' ')} `;
 }
 
@@ -372,10 +413,19 @@ function citation(card: ApkgCard): string {
 /**
  * Builds the collection database.
  *
- * A note and a card are written per exported card, and cloze cards are written into a cloze
- * model so Anki renders the deletions rather than showing the `{{c1::…}}` syntax as text.
+ * One note per exported card, and one card per note — except for cloze notes, which get one card
+ * per distinct deletion index, as Anki itself does. Cloze cards are written into a cloze model so
+ * Anki renders the deletions rather than showing the `{{c1::…}}` syntax as text.
+ *
+ * Every card is written new. There is no branch here that reads a schedule, because there is no
+ * schedule in the input: `due` is the card's position in the new queue, and everything else is the
+ * value Anki uses for a card nobody has studied.
  */
-export function buildCollection(cards: ApkgCard[], deckTitle: string, now: Date): Uint8Array {
+export function buildCollection(
+  cards: ApkgCard[],
+  deckTitle: string,
+  now: Date
+): { bytes: Uint8Array; noteCount: number; cardCount: number } {
   const db = new Database(':memory:');
   const createdAt = Math.floor(now.getTime() / 1000);
 
@@ -465,13 +515,19 @@ export function buildCollection(cards: ApkgCard[], deckTitle: string, now: Date)
     );
     const insertCard = db.prepare(
       `INSERT INTO cards (id, nid, did, ord, mod, usn, type, queue, due, ivl, factor, reps, lapses, left, odue, odid, flags, data)
-       VALUES (?, ?, ?, 0, ?, 0, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, '')`
+       VALUES (?, ?, ?, ?, ?, 0, 0, 0, ?, 0, ?, 0, 0, 0, 0, 0, 0, '')`
     );
 
+    // Note ids and card ids share one space in Anki, so cards are numbered after every note rather
+    // than interleaved with them: `noteId + 1` for the next note would collide with the first card
+    // of a note that has several deletions.
+    const noteIdBase = createdAt * 1000;
+    let cardId = noteIdBase + cards.length;
     let ordinal = 0;
+    let cardCount = 0;
 
     for (const card of cards) {
-      const noteId = createdAt * 1000 + ordinal + 1;
+      const noteId = noteIdBase + ordinal + 1;
       const isCloze = card.format === 'cloze';
 
       const text = isCloze
@@ -501,36 +557,30 @@ export function buildCollection(cards: ApkgCard[], deckTitle: string, now: Date)
         fieldChecksum(sortField)
       );
 
-      // The learner's own schedule travels with the card: a reviewed card arrives as a review
-      // card with its interval, and an unreviewed one as new.
-      const schedule = card.schedule ?? null;
-      const reviewed = schedule !== null && schedule.repetition > 0;
+      // New, in the order the cards were added: `due` is a position in the new queue, not a date.
+      // `factor = 2500` is Anki's 2.5 starting ease; `ivl`, `reps` and `lapses` stay zero so the
+      // card arrives genuinely unseen, whatever the learner did with it in JevDeck.
+      const indices = isCloze ? clozeIndices(card.clozeText ?? '') : [1];
 
-      let due = ordinal;
-      if (reviewed && schedule?.dueAt) {
-        const dueDays = Math.round(
-          (new Date(schedule.dueAt).getTime() - now.getTime()) / 86_400_000
+      for (const index of indices) {
+        cardId += 1;
+        insertCard.run(
+          cardId,
+          noteId,
+          DECK_ID,
+          // Anki's card ordinal is the zero-based cloze index; a basic note has one card, ord 0.
+          isCloze ? index - 1 : 0,
+          createdAt,
+          ordinal,
+          NEW_CARD_FACTOR
         );
-        due = Math.max(0, dueDays);
+        cardCount += 1;
       }
-
-      insertCard.run(
-        noteId + 1,
-        noteId,
-        DECK_ID,
-        createdAt,
-        reviewed ? 2 : 0, // type: 0 new, 2 review
-        reviewed ? 2 : 0, // queue: 0 new, 2 review
-        due,
-        schedule?.intervalDays ?? 0,
-        schedule ? 2500 : 0,
-        schedule?.repetition ?? 0
-      );
 
       ordinal += 1;
     }
 
-    return db.serialize();
+    return { bytes: db.serialize(), noteCount: cards.length, cardCount };
   } finally {
     db.close();
   }
@@ -539,7 +589,11 @@ export function buildCollection(cards: ApkgCard[], deckTitle: string, now: Date)
 /** Builds a complete `.apkg` for a deck. */
 export function buildApkg(input: ApkgInput): ApkgResult {
   const now = input.now ?? new Date();
-  const collection = buildCollection(input.cards, input.deck.title, now);
+  const { bytes: collection, noteCount, cardCount } = buildCollection(
+    input.cards,
+    input.deck.title,
+    now
+  );
 
   // Anki's importer reads `media` as a JSON object mapping the names inside the package to real
   // file names. An empty object means the deck genuinely has no media.
@@ -553,8 +607,10 @@ export function buildApkg(input: ApkgInput): ApkgResult {
   return {
     bytes,
     fileName: `${safeFileStem(input.deck.title)}.apkg`,
-    cardCount: input.cards.length,
-    noteCount: input.cards.length,
+    // Counted from the collection that was written, not assumed from the input: a cloze note with
+    // two deletions is one note and two cards, and reporting "two cards" for it would be wrong.
+    cardCount,
+    noteCount,
     entries: ['collection.anki2', 'media'],
   };
 }

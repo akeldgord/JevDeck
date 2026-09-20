@@ -24,6 +24,13 @@ export interface ChatResponse {
   usage: TokenUsage;
 }
 
+/**
+ * One network call.
+ *
+ * The transport answers for the HTTP exchange only. A response that arrived but cannot be read is
+ * raised as a `ProviderError` that still says whether it was dispatched and what it cost, because
+ * the caller has to settle the bill before it can decide what to do about the content.
+ */
 export type ChatTransport = (request: ChatRequest) => Promise<ChatResponse>;
 
 export interface TransportConfig {
@@ -38,30 +45,38 @@ function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/, '');
 }
 
+/**
+ * Maps an HTTP status to a failure.
+ *
+ * A credential rejection and a rate limit are refused *before* the provider does paid work, so
+ * they are billed as nothing; a server error is the undecidable case and stays counted.
+ */
 function mapHttpFailure(status: number, body: string, providerLabel: string): ProviderError {
   if (status === 401 || status === 403) {
     return new ProviderError(
       'unauthorized',
       `${providerLabel} rejected the configured API key (HTTP ${status}).`,
-      { status }
+      { status, dispatched: true, billing: 'none' }
     );
   }
   if (status === 429) {
     return new ProviderError(
       'rate_limited',
       `${providerLabel} rate-limited the request (HTTP 429).`,
-      { status }
+      { status, dispatched: true, billing: 'none' }
     );
   }
   if (status >= 500) {
     return new ProviderError(
       'http_error',
       `${providerLabel} returned HTTP ${status}.`,
-      { status }
+      { status, dispatched: true, billing: 'unknown' }
     );
   }
   return new ProviderError('http_error', `${providerLabel} returned HTTP ${status}: ${body.slice(0, 300)}`, {
     status,
+    dispatched: true,
+    billing: 'unknown',
   });
 }
 
@@ -93,7 +108,14 @@ async function postJson(
       aborted
         ? `${options.providerLabel} did not respond within ${Math.round(options.timeoutMs / 1000)}s.`
         : `${options.providerLabel} could not be reached.`,
-      { details: cause instanceof Error ? cause.message : String(cause) }
+      // Neither case can be proven free. A timeout happened after the request was on the wire; a
+      // generic network failure is indistinguishable from a socket that dropped mid-response. Both
+      // stay counted, which is the conservative direction for a spending cap.
+      {
+        details: cause instanceof Error ? cause.message : String(cause),
+        dispatched: true,
+        billing: 'unknown',
+      }
     );
   } finally {
     clearTimeout(timer);
@@ -107,32 +129,64 @@ async function postJson(
   try {
     json = JSON.parse(raw);
   } catch {
-    throw new ProviderError('malformed_output', `${options.providerLabel} returned a non-JSON response.`);
+    throw new ProviderError('malformed_output', `${options.providerLabel} returned a non-JSON response.`, {
+      dispatched: true,
+      billing: 'unknown',
+    });
   }
 
   if (typeof json !== 'object' || json === null || Array.isArray(json)) {
-    throw new ProviderError('malformed_output', `${options.providerLabel} returned an unexpected envelope.`);
+    throw new ProviderError('malformed_output', `${options.providerLabel} returned an unexpected envelope.`, {
+      dispatched: true,
+      billing: 'unknown',
+    });
   }
 
   return { json: json as Record<string, unknown>, raw };
 }
 
-function readChoiceText(json: Record<string, unknown>, providerLabel: string): string {
+/**
+ * Reads the completion text.
+ *
+ * `usage` is passed in so a response we cannot read still says what it cost: the envelope was
+ * parsed, so the provider processed the request, and writing that off as free would under-count
+ * the ledger.
+ */
+function readChoiceText(
+  json: Record<string, unknown>,
+  providerLabel: string,
+  usage: TokenUsage
+): string {
+  const billable = usage.inputTokens > 0 || usage.outputTokens > 0;
+  const billing = billable ? ('charged' as const) : ('unknown' as const);
+
   const choices = json.choices;
   if (!Array.isArray(choices) || choices.length === 0) {
-    throw new ProviderError('malformed_output', `${providerLabel} returned no completion choices.`);
+    throw new ProviderError('malformed_output', `${providerLabel} returned no completion choices.`, {
+      dispatched: true,
+      billing,
+      usage,
+    });
   }
 
   const first = choices[0] as { message?: { content?: unknown }; finish_reason?: unknown };
 
   // A refusal is a legitimate outcome and must not be mistaken for an empty card list.
   if (first.finish_reason === 'content_filter') {
-    throw new ProviderError('refused', `${providerLabel} refused the request (content filter).`);
+    throw new ProviderError('refused', `${providerLabel} refused the request (content filter).`, {
+      dispatched: true,
+      billing,
+      usage,
+    });
   }
 
   const content = first.message?.content;
   if (typeof content !== 'string' || content.trim().length === 0) {
-    throw new ProviderError('malformed_output', `${providerLabel} returned an empty completion.`);
+    throw new ProviderError('malformed_output', `${providerLabel} returned an empty completion.`, {
+      dispatched: true,
+      billing,
+      usage,
+    });
   }
 
   return content;
@@ -152,7 +206,10 @@ function readUsage(value: unknown, providerLabel: string, keys: [string, string]
   }
 
   if (!Number.isFinite(input) || !Number.isFinite(output)) {
-    throw new ProviderError('malformed_output', `${providerLabel} returned non-numeric token usage.`);
+    throw new ProviderError('malformed_output', `${providerLabel} returned non-numeric token usage.`, {
+      dispatched: true,
+      billing: 'unknown',
+    });
   }
 
   return { inputTokens: Math.trunc(input), outputTokens: Math.trunc(output) };
@@ -195,10 +252,9 @@ export function createOpenAiCompatibleTransport(
       fetchImpl,
     });
 
-    return {
-      text: readChoiceText(json, label),
-      usage: readUsage(json.usage, label, ['prompt_tokens', 'completion_tokens']),
-    };
+    const usage = readUsage(json.usage, label, ['prompt_tokens', 'completion_tokens']);
+
+    return { text: readChoiceText(json, label, usage), usage };
   };
 }
 
@@ -226,9 +282,17 @@ export function createAnthropicTransport(config: TransportConfig): ChatTransport
       fetchImpl,
     });
 
+    const usage = readUsage(json.usage, label, ['input_tokens', 'output_tokens']);
+    const billable = usage.inputTokens > 0 || usage.outputTokens > 0;
+    const billing = billable ? ('charged' as const) : ('unknown' as const);
+
     const content = json.content;
     if (!Array.isArray(content) || content.length === 0) {
-      throw new ProviderError('malformed_output', `${label} returned no content blocks.`);
+      throw new ProviderError('malformed_output', `${label} returned no content blocks.`, {
+        dispatched: true,
+        billing,
+        usage,
+      });
     }
 
     const text = content
@@ -238,9 +302,13 @@ export function createAnthropicTransport(config: TransportConfig): ChatTransport
       .trim();
 
     if (text.length === 0) {
-      throw new ProviderError('malformed_output', `${label} returned an empty completion.`);
+      throw new ProviderError('malformed_output', `${label} returned an empty completion.`, {
+        dispatched: true,
+        billing,
+        usage,
+      });
     }
 
-    return { text, usage: readUsage(json.usage, label, ['input_tokens', 'output_tokens']) };
+    return { text, usage };
   };
 }

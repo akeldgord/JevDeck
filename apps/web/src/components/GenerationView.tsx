@@ -11,9 +11,11 @@ import {
   Info,
   FileSearch,
 } from 'lucide-react';
-import { PdfUploader } from './PdfUploader';
+import { SourceUploader } from './SourceUploader';
 import { UnavailablePanel } from './UnavailablePanel';
-import { ParsedPdfResult } from '../lib/pdfParser';
+import { ReadReportPanel } from './ReadReportPanel';
+import type { ParsedDocument } from '../lib/documentParser';
+import { formatLabel, type ReadReport } from '../lib/readReport';
 import { JobConcept, JobStatus, StoredDocumentSummary } from '../lib/api';
 import { GenerationResult } from './GenerationResult';
 import { Database, Loader2, AlertCircle as AlertIcon, CheckCircle2 } from 'lucide-react';
@@ -31,7 +33,7 @@ interface Props {
   hasCustomToc: boolean;
   /** Whether the source document text is available to ground generation. */
   hasDocumentText: boolean;
-  onDocumentUploaded: (result: ParsedPdfResult) => void;
+  onDocumentUploaded: (document: ParsedDocument) => void;
   /** Whether provider-backed generation exists on this installation. */
   generationCapability: Capability;
   /** Whether uploaded documents are stored server-side. */
@@ -53,6 +55,16 @@ interface Props {
   jobConcepts: JobConcept[];
   /** Why generation could not be started or did not finish. */
   generationError: string | null;
+  /** Stops the run being followed, discarding what it had not stored. */
+  onCancelGeneration: () => void;
+  /** Stops the run being followed, keeping its progress so it can be resumed. */
+  onPauseGeneration: () => void;
+  /** Queues a stopped run again, to continue from its stored progress. */
+  onResumeGeneration: () => void;
+  /** True while a pause, resume or cancel request is in flight. */
+  generationActionBusy: boolean;
+  /** What a pause or resume request answered when it was not the plain success case. */
+  generationActionNotice: string | null;
   /**
    * What this account has spent this period, against its limit.
    *
@@ -61,12 +73,12 @@ interface Props {
    */
   budgetNotice: string | null;
   /**
-   * Pages of the loaded document that produced no extractable text.
+   * What the open document's reader actually read, or `null` when no document is open.
    *
-   * Shown because a page that yielded nothing may be a blank divider or a scan of essential
-   * material, and the person is the only one who can tell which.
+   * Built from the parse for a fresh upload and from the stored rows for a reopened document, so
+   * the account of the read is the same either way — and always the reader's, never a projection.
    */
-  extractionGaps: number[];
+  readReport: ReadReport | null;
 }
 
 /**
@@ -112,8 +124,13 @@ export const GenerationView: React.FC<Props> = ({
   jobStatus,
   jobConcepts,
   generationError,
+  onCancelGeneration,
+  onPauseGeneration,
+  onResumeGeneration,
+  generationActionBusy,
+  generationActionNotice,
   budgetNotice,
-  extractionGaps,
+  readReport,
 }) => {
   const selectedCount = sections.filter(s => s.selected).length;
   const hasDocument = documentName.length > 0;
@@ -123,7 +140,7 @@ export const GenerationView: React.FC<Props> = ({
   return (
     <div className="space-y-6">
       {/* Upload Zone */}
-      <PdfUploader onDocumentParsed={onDocumentUploaded} isProcessing={isGenerating} />
+      <SourceUploader onDocumentParsed={onDocumentUploaded} isProcessing={isGenerating} />
 
       {!storageCapability.available && (
         <UnavailablePanel
@@ -180,7 +197,17 @@ export const GenerationView: React.FC<Props> = ({
                         {document.name}
                       </div>
                       <div className="text-[11px] font-mono text-slate-500">
-                        {document.pageCount} pages · {describeStored(document)}
+                        {/* Readable pages beside the total: a document of scans has fewer pages
+                            cards can come from, and the list must not hide that. */}
+                        {formatLabel(document.sourceFormat)} · {document.pageCount} pages ·{' '}
+                        {document.textPages} readable
+                        {document.unextractedPages > 0
+                          ? ` · ${document.unextractedPages} unread`
+                          : ''}
+                        {document.mediaCount > 0 ? ` · ${document.mediaCount} images` : ''}
+                      </div>
+                      <div className="text-[11px] font-mono text-slate-500">
+                        {describeStored(document)}
                       </div>
                     </div>
                     <button
@@ -211,7 +238,7 @@ export const GenerationView: React.FC<Props> = ({
                 <div className="flex flex-wrap items-center gap-2">
                   <h1 className="text-xl font-bold text-slate-100">{documentName}</h1>
                   <span className="text-xs px-2 py-0.5 rounded-full bg-slate-800 border border-slate-700 text-slate-300">
-                    PDF ({pageCount} pages)
+                    {readReport ? readReport.formatLabel : 'Document'} ({pageCount} pages)
                   </span>
                   {hasCustomToc ? (
                     <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-950 border border-emerald-800 text-emerald-400 font-medium">
@@ -270,8 +297,8 @@ export const GenerationView: React.FC<Props> = ({
               <FileSearch className="w-8 h-8 text-slate-600 mx-auto" />
               <p className="text-sm font-semibold text-slate-300">No document loaded</p>
               <p className="text-xs text-slate-500 max-w-sm mx-auto">
-                Upload a PDF above. JevDeck reads its table of contents and page text in your
-                browser, then lists the sections it found.
+                Upload a document above, or paste text. JevDeck reads its text and its outline in
+                your browser, then lists the sections it found and reports what it could not read.
               </p>
             </div>
           ) : (
@@ -413,7 +440,10 @@ export const GenerationView: React.FC<Props> = ({
               {!hasDocumentText && (
                 <div className="flex items-center gap-2 text-xs text-amber-400/90 bg-amber-950/30 p-2.5 rounded-lg border border-amber-900/40">
                   <AlertCircle className="w-4 h-4 flex-shrink-0" />
-                  <span>Upload a PDF first — cards are generated from the text of the document itself.</span>
+                  <span>
+                    Upload a document first — cards are generated from the text that was read, not
+                    from a summary of the file.
+                  </span>
                 </div>
               )}
             </div>
@@ -421,18 +451,7 @@ export const GenerationView: React.FC<Props> = ({
         </div>
       </div>
 
-      {extractionGaps.length > 0 && (
-        <div className="rounded-2xl border border-amber-900/50 bg-amber-950/20 px-4 py-3 text-[11px] text-amber-200">
-          <span className="font-semibold">
-            {extractionGaps.length} page{extractionGaps.length === 1 ? '' : 's'} produced no
-            extractable text
-          </span>{' '}
-          (page{extractionGaps.length === 1 ? '' : 's'}{' '}
-          {extractionGaps.slice(0, 12).join(', ')}
-          {extractionGaps.length > 12 ? ', …' : ''}). These may be blank dividers, or scans this
-          application cannot read — nothing on them can be turned into cards or counted as covered.
-        </div>
-      )}
+      {readReport && <ReadReportPanel report={readReport} />}
 
       {budgetNotice && (
         <div className="rounded-2xl border border-slate-800 bg-slate-900/40 px-4 py-3 text-[11px] text-slate-400">
@@ -446,6 +465,11 @@ export const GenerationView: React.FC<Props> = ({
           jobStatus={jobStatus}
           concepts={jobConcepts}
           error={generationError}
+          onCancel={onCancelGeneration}
+          onPause={onPauseGeneration}
+          onResume={onResumeGeneration}
+          busy={generationActionBusy}
+          actionNotice={generationActionNotice}
         />
       )}
     </div>

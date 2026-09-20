@@ -247,8 +247,8 @@ describe('Study progress is stored on the server', () => {
     const schedule = await admin.call(`/api/decks/${deckId}/schedule`);
     expect(schedule.status).toBe(200);
     expect(schedule.body.states).toEqual([]);
-    expect(schedule.body.reviewsToday).toBe(0);
-    expect(schedule.body.newCardsToday).toBe(0);
+    expect(schedule.body.reviewEventsToday).toBe(0);
+    expect(schedule.body.newCardsIntroducedToday).toBe(0);
 
     const cards = await admin.call(`/api/decks/${deckId}/cards`);
     const view = cardsFromStoredDeck(cards.body.cards, cards.body.evidence, {
@@ -286,8 +286,8 @@ describe('Study progress is stored on the server', () => {
     expect(state.repetition).toBe(1);
     expect(state.interval_days).toBe(1);
     expect(state.review_count).toBe(1);
-    expect(schedule.body.reviewsToday).toBe(1);
-    expect(schedule.body.newCardsToday).toBe(1);
+    expect(schedule.body.reviewEventsToday).toBe(1);
+    expect(schedule.body.newCardsIntroducedToday).toBe(1);
 
     // Rebuilt the way the browser does it, the card is no longer new: the queue now shows it as
     // scheduled rather than due, which is what makes a reload honest.
@@ -346,8 +346,8 @@ describe('Study progress is stored on the server', () => {
 
     const schedule = await admin.call(`/api/decks/${deckId}/schedule`);
     // The event is gone from the record, not merely overwritten.
-    expect(schedule.body.reviewsToday).toBe(0);
-    expect(schedule.body.newCardsToday).toBe(0);
+    expect(schedule.body.reviewEventsToday).toBe(0);
+    expect(schedule.body.newCardsIntroducedToday).toBe(0);
     expect(schedule.body.states[0].review_count).toBe(0);
 
     const cards = await admin.call(`/api/decks/${deckId}/cards`);

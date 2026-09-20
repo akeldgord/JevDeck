@@ -325,6 +325,39 @@ function clearPeriod(periodKey: string): void {
   db.prepare('DELETE FROM usage_records WHERE period_key = ?').run(periodKey);
 }
 
+/**
+ * The figure a job's calls reserved, taken from the reservations themselves.
+ *
+ * Deliberately not recomputed from the attempt's recorded request size with a default output
+ * ceiling: the reservation stores the basis it was derived from — the exact `max_tokens` that went
+ * on the wire, and the token count when the provider supplied one — so this checks what was
+ * dispatched instead of reproducing the estimate it is meant to be checking.
+ */
+function reservedMinorForJob(jobId: string): number {
+  const rows = db
+    .query(
+      `SELECT model, request_chars, counted_input_tokens, max_output_tokens
+         FROM budget_reservations WHERE job_id = ?`
+    )
+    .all(jobId) as Array<{
+    model: string | null;
+    request_chars: number | null;
+    counted_input_tokens: number | null;
+    max_output_tokens: number | null;
+  }>;
+
+  return rows.reduce((total, row) => {
+    const pricing = resolvePricing(process.env, row.model ?? 'stub-model');
+    return (
+      total +
+      estimateAttemptMinor(pricing, row.request_chars ?? 0, {
+        maxOutputTokens: row.max_output_tokens ?? undefined,
+        countedInputTokens: row.counted_input_tokens,
+      })
+    );
+  }, 0);
+}
+
 beforeAll(async () => {
   stub = startStubProvider();
 
@@ -376,13 +409,6 @@ describe('Prices and estimates', () => {
     expect(pricing.priceVersion).toContain('gpt-4o-mini');
   });
 
-  it('reserves a conservative price for an unknown model rather than nothing', () => {
-    const pricing = resolvePricing({}, 'some-self-hosted-model');
-    expect(pricing.inputPerMillionMinor).toBeGreaterThan(0);
-    expect(pricing.outputPerMillionMinor).toBeGreaterThan(0);
-    expect(pricing.priceVersion).toContain('unknown-model');
-  });
-
   it('lets an explicit price override the table', () => {
     const pricing = resolvePricing(
       { JEVDECK_PROVIDER_PRICE_INPUT_PER_MTOK: '0.25', JEVDECK_PROVIDER_PRICE_OUTPUT_PER_MTOK: '1.5' },
@@ -390,7 +416,49 @@ describe('Prices and estimates', () => {
     );
     expect(pricing.inputPerMillionMinor).toBe(25);
     expect(pricing.outputPerMillionMinor).toBe(150);
-    expect(pricing.priceVersion).toBe('prices-v1+env');
+    expect(pricing.priceVersion).toBe('prices-v2+env+gpt-4o-mini+model:gpt-4o-mini');
+    // A configured price is a price; it carries no limitation to disclose.
+    expect(pricing.fallback).toBe(false);
+    expect(pricing.limitation).toBeNull();
+  });
+
+  it('reserves a conservative price for an unknown model, and says that it is a fallback', () => {
+    const pricing = resolvePricing({}, 'some-self-hosted-model');
+    expect(pricing.inputPerMillionMinor).toBeGreaterThan(0);
+    expect(pricing.outputPerMillionMinor).toBeGreaterThan(0);
+    expect(pricing.priceVersion).toContain('unknown-model');
+    // The figure is enforced, but it is not presented as the provider's tariff: for a model nobody
+    // priced, the ledger cannot promise invoice matching and must say so.
+    expect(pricing.fallback).toBe(true);
+    expect(pricing.limitation).toContain('No price is configured');
+  });
+
+  it('records the effective model in the price version, so a past figure is explainable', () => {
+    // Two models priced from the same table row are still distinguishable afterwards: the version
+    // names the model that was billed, not only the rate that was applied.
+    const first = resolvePricing({}, 'gpt-4o-mini');
+    const second = resolvePricing({}, 'gpt-4o-mini-2024-07-18');
+    expect(first.priceVersion).not.toBe(second.priceVersion);
+    expect(first.priceVersion).toContain('model:gpt-4o-mini');
+    expect(second.priceVersion).toContain('model:gpt-4o-mini-2024-07-18');
+  });
+
+  it('treats the character-based token figure as a bound rather than an average', () => {
+    const pricing = resolvePricing({}, 'gpt-4o-mini');
+    // Two characters per token, not four: the point of a bound is to cover the text that tokenises
+    // worst, and an average does not.
+    expect(pricing.charsPerToken).toBe(2);
+
+    // An explicit count beats the bound, and is used as given rather than derived from length.
+    const counted = estimateAttemptMinor(pricing, 4_000, { countedInputTokens: 200_000 });
+    const bounded = estimateAttemptMinor(pricing, 4_000);
+    expect(counted).toBeGreaterThan(bounded);
+
+    // With a count in hand the character length is not consulted at all, so the two lengths price
+    // the same: the figure describes the tokens, not the bytes.
+    expect(estimateAttemptMinor(pricing, 4_000, { countedInputTokens: 0 })).toBe(
+      estimateAttemptMinor(pricing, 0, { countedInputTokens: 0 })
+    );
   });
 
   it('estimates from a request size and never below the real cost of that request', () => {
@@ -577,7 +645,7 @@ describe('Settlement records what was actually spent', () => {
       inputTokens: 120,
       outputTokens: 80,
       source: 'provider_reported',
-      priceVersion: 'prices-v1+env',
+      priceVersion: 'prices-v2+env+unknown-model+model:stub-model',
       currency: 'USD',
     });
 
@@ -592,7 +660,7 @@ describe('Settlement records what was actually spent', () => {
     expect(ledger.length).toBe(1);
     expect(ledger[0].amount_minor).toBe(30);
     expect(ledger[0].source).toBe('provider_reported');
-    expect(ledger[0].price_version).toBe('prices-v1+env');
+    expect(ledger[0].price_version).toBe('prices-v2+env+unknown-model+model:stub-model');
 
     const released = reserveBudget(db, {
       userId,
@@ -610,7 +678,7 @@ describe('Settlement records what was actually spent', () => {
       outcome: 'released',
       amountMinor: 0,
       source: 'estimated',
-      priceVersion: 'prices-v1+env',
+      priceVersion: 'prices-v2+env+unknown-model+model:stub-model',
       currency: 'USD',
     });
 
@@ -642,7 +710,7 @@ describe('Settlement records what was actually spent', () => {
       outcome: 'reconciling',
       amountMinor: 70,
       source: 'estimated',
-      priceVersion: 'prices-v1+env',
+      priceVersion: 'prices-v2+env+unknown-model+model:stub-model',
       currency: 'USD',
     });
 
@@ -674,7 +742,7 @@ describe('Settlement records what was actually spent', () => {
         outcome: 'charged',
         amountMinor: 25,
         source: 'provider_reported',
-        priceVersion: 'prices-v1+env',
+        priceVersion: 'prices-v2+env+unknown-model+model:stub-model',
         currency: 'USD',
       });
 
@@ -724,8 +792,11 @@ describe('Settlement records what was actually spent', () => {
     expect(snapshot.user.limitMinor).toBe(500);
     expect(snapshot.user.committedMinor).toBe(0);
     expect(snapshot.user.remainingMinor).toBe(500);
-    // The stub's price applies, so the reported price version is the configured one.
-    expect(snapshot.priceVersion).toBe('prices-v1+env');
+    // The configured price applies, and the version names the model it was applied to.
+    expect(snapshot.priceVersion).toBe('prices-v2+env+unknown-model+model:stub-model');
+    // This account has not overspent, and its price is configured, so there is nothing to disclose.
+    expect(snapshot.incidents.count).toBe(0);
+    expect(snapshot.priceLimitation).toBeNull();
   });
 });
 
@@ -927,7 +998,7 @@ describe('The pipeline accounts for every call it makes', () => {
         inputTokens: 90_000,
         outputTokens: 4_000,
         source: 'provider_reported',
-        priceVersion: 'prices-v1+env',
+        priceVersion: 'prices-v2+env+unknown-model+model:stub-model',
         currency: 'USD',
       });
 
@@ -1077,11 +1148,9 @@ describe('Concurrent demand cannot exceed the headroom', () => {
   it('shares one pool of headroom between two jobs started at once, and never exceeds it', async () => {
     const periodKey = periodKeyFor(new Date());
     const originalLimit = readLimits(db, adminId).userLimitMinor;
-    const pricing = resolvePricing(process.env, 'stub-model');
 
-    // Measure what one whole job reserves, with no cap in the way. The figure is the same
-    // arithmetic the pipeline uses, applied to the request sizes it recorded, so it is not the
-    // test's own guess at what a call costs.
+    // Measure what one whole job reserves, with no cap in the way. The figure comes from the
+    // reservations the pipeline wrote, not from the test's own guess at what a call costs.
     db.prepare('UPDATE users SET monthly_spend_limit_minor = 0 WHERE id = ?').run(adminId);
 
     const measuredDeck = await createDeckWithDocument('R5 concurrency measure.pdf');
@@ -1089,16 +1158,13 @@ describe('Concurrent demand cannot exceed the headroom', () => {
     const measured = await runOneJob({ jobId: measuredJob });
     expect(measured.state).toBe('completed');
 
-    const measuredAttempts = db
-      .query('SELECT request_chars FROM provider_attempts WHERE job_id = ?')
-      .all(measuredJob) as Array<{ request_chars: number }>;
-    const oneJobReservationMinor = measuredAttempts.reduce(
-      (total, attempt) => total + estimateAttemptMinor(pricing, attempt.request_chars),
-      0
-    );
+    const measuredCalls = db
+      .query('SELECT COUNT(*) AS n FROM provider_attempts WHERE job_id = ?')
+      .get(measuredJob) as { n: number };
+    const oneJobReservationMinor = reservedMinorForJob(measuredJob);
 
     // More than one call per job, so the sharing below has something to share.
-    expect(measuredAttempts.length).toBeGreaterThan(1);
+    expect(measuredCalls.n).toBeGreaterThan(1);
     expect(oneJobReservationMinor).toBeGreaterThan(0);
 
     // Exactly one job's worth of headroom, and two jobs wanting all of it.
@@ -1184,13 +1250,8 @@ describe('Concurrent demand cannot exceed the headroom', () => {
     const measureJob = enqueueFor(measureDeck);
     expect((await runOneJob({ jobId: measureJob })).state).toBe('completed');
 
-    const measuredAttempts = db
-      .query('SELECT request_chars FROM provider_attempts WHERE job_id = ?')
-      .all(measureJob) as Array<{ request_chars: number }>;
-    const oneJobReservationMinor = measuredAttempts.reduce(
-      (total, attempt) => total + estimateAttemptMinor(pricing, attempt.request_chars),
-      0
-    );
+    const oneJobReservationMinor = reservedMinorForJob(measureJob);
+    expect(oneJobReservationMinor).toBeGreaterThan(0);
 
     const committedNow = readUsageTotals(db, periodKey, adminId).committedMinor;
     db.prepare('UPDATE users SET monthly_spend_limit_minor = ? WHERE id = ?').run(
@@ -1427,7 +1488,8 @@ function insertChargedSpend(input: {
     `INSERT INTO usage_records
        (id, user_id, job_id, provider_attempt_id, period_key, amount_minor, currency, source,
         price_version, recorded_at)
-     VALUES (?, ?, NULL, NULL, ?, ?, 'USD', 'provider_reported', 'prices-v1+env', ?)`
+     VALUES (?, ?, NULL, NULL, ?, ?, 'USD', 'provider_reported',
+              'prices-v2+env+unknown-model+model:stub-model', ?)`
   ).run(usageId, input.userId, input.periodKey, input.amountMinor, now);
 
   return () => {

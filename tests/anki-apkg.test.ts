@@ -5,7 +5,9 @@ import { join } from 'node:path';
 import { Database } from 'bun:sqlite';
 import {
   ANKI_SCHEMA_VERSION,
+  NEW_CARD_FACTOR,
   buildApkg,
+  clozeIndices,
   crc32,
   type ApkgCard,
 } from '../packages/anki_export/src/apkg';
@@ -88,9 +90,42 @@ const CARDS: ApkgCard[] = [
     excerpt: 'The peak of the action potential reaches approximately 40 mV before it repolarises.',
     pageNumber: 18,
     sectionTitle: 'Action potentials',
-    schedule: { repetition: 2, intervalDays: 6, dueAt: '2026-04-01T00:00:00.000Z' },
+  },
+  {
+    // Two deletions in one sentence: Anki makes two cards from one note.
+    id: 'card-cloze-two',
+    format: 'cloze',
+    clozeText: '{{c1::Sodium}} influx depolarises the membrane, and {{c2::potassium}} efflux repolarises it.',
+    tags: ['ion channels'],
+    excerpt: 'Sodium influx depolarises the membrane, and potassium efflux repolarises it.',
+    pageNumber: 21,
+    sectionTitle: 'Action potentials',
+  },
+  {
+    // Non-sequential deletions: two cards at ordinals 0 and 2, not three cards.
+    id: 'card-cloze-gapped',
+    format: 'cloze',
+    clozeText: 'First {{c1::alpha}}, then {{c3::gamma}}.',
+    excerpt: 'First alpha, then gamma.',
+    pageNumber: 22,
+    sectionTitle: 'Action potentials',
+  },
+  {
+    // Content that breaks naive writers: Unicode, quotes, newlines, an angle bracket and the
+    // field separator Anki uses inside `notes.flds`.
+    id: 'card-unicode',
+    format: 'qa',
+    question: 'Which value is quoted in the café study — “μM”, ①, or \u001f?',
+    answer: 'First line.\nSecond line, with <b>tags</b> and “curly quotes”.',
+    tags: ['café', 'symbols'],
+    excerpt: 'The café study reported ① μM and “curly quotes”.',
+    pageNumber: 30,
+    sectionTitle: 'Units',
   },
 ];
+
+/** Notes and cards the fixture above must produce: notes, then their card counts. */
+const EXPECTED = { notes: 5, cards: 7 };
 
 const NOW = new Date('2026-03-15T00:00:00.000Z');
 
@@ -117,7 +152,9 @@ describe('The ZIP container is a real archive', () => {
 
     // The file name is safe for a download and typed correctly.
     expect(result.fileName).toBe('NeuroPhysiology Deck 1.apkg');
-    expect(result.cardCount).toBe(2);
+    // Seven cards from five notes: the two multi-deletion notes each become two cards.
+    expect(result.noteCount).toBe(EXPECTED.notes);
+    expect(result.cardCount).toBe(EXPECTED.cards);
   });
 });
 
@@ -167,22 +204,15 @@ describe('The collection is one Anki will import', () => {
     }
   });
 
-  it('writes one note and one card per card, with the fields Anki reads', () => {
+  it('writes the fields Anki reads, with the citation and tags intact', () => {
     const db = openCollection();
 
     try {
       const notes = db
         .query('SELECT * FROM notes ORDER BY id ASC')
-        .all() as Array<{ id: number; mid: number; flds: string; tags: string; csum: number }>;
-      const cards = db
-        .query('SELECT * FROM cards ORDER BY id ASC')
-        .all() as Array<{ nid: number; type: number; queue: number; due: number; ivl: number; reps: number }>;
+        .all() as Array<{ id: number; mid: number; flds: string; tags: string; csum: number; guid: string }>;
 
-      expect(notes.length).toBe(2);
-      expect(cards.length).toBe(2);
-
-      // One card per note, pointing at it.
-      expect(cards.map(card => card.nid)).toEqual(notes.map(note => note.id));
+      expect(notes.length).toBe(EXPECTED.notes);
 
       const [qaNote, clozeNote] = notes;
       const qaFields = qaNote.flds.split('\u001f');
@@ -211,28 +241,146 @@ describe('The collection is one Anki will import', () => {
     }
   });
 
-  it('carries a studied schedule across and leaves an unreviewed card new', () => {
+  it('preserves Unicode, multiline content and quotes without corrupting the row', () => {
     const db = openCollection();
 
     try {
-      const cards = db
-        .query('SELECT * FROM cards ORDER BY id ASC')
-        .all() as Array<{ type: number; queue: number; due: number; ivl: number; reps: number }>;
+      const notes = db
+        .query('SELECT * FROM notes ORDER BY id ASC')
+        .all() as Array<{ flds: string; tags: string }>;
+      const unicodeNote = notes.find(note => note.flds.includes('μM'));
 
-      // The first card was never reviewed: Anki should see a new card.
-      expect(cards[0].type).toBe(0);
-      expect(cards[0].queue).toBe(0);
-      expect(cards[0].reps).toBe(0);
+      expect(unicodeNote).toBeDefined();
 
-      // The second carries two repetitions, a six-day interval and a due date in the future.
-      expect(cards[1].type).toBe(2);
-      expect(cards[1].queue).toBe(2);
-      expect(cards[1].ivl).toBe(6);
-      expect(cards[1].reps).toBe(2);
-      expect(cards[1].due).toBe(17);
+      const fields = unicodeNote!.flds.split('\u001f');
+      // Three fields, so the separator inside the question was neutralised rather than splitting it.
+      expect(fields).toHaveLength(3);
+      expect(fields[0]).toContain('café');
+      expect(fields[0]).toContain('“μM”');
+      expect(fields[0]).toContain('①');
+      expect(fields[0]).not.toContain('\u001f');
+      // The line break survives: Anki renders newlines inside a field.
+      expect(fields[1]).toContain('First line.\nSecond line');
+      expect(fields[1]).toContain('“curly quotes”');
+      // A non-ASCII tag keeps its letters.
+      expect(unicodeNote!.tags).toContain('café');
     } finally {
       db.close();
     }
+  });
+
+  it('makes one card per distinct cloze deletion, numbered the way Anki numbers them', () => {
+    const db = openCollection();
+
+    try {
+      const notes = db
+        .query('SELECT id, flds FROM notes ORDER BY id ASC')
+        .all() as Array<{ id: number; flds: string }>;
+      const cards = db
+        .query('SELECT nid, ord FROM cards ORDER BY id ASC')
+        .all() as Array<{ nid: number; ord: number }>;
+
+      expect(cards.length).toBe(EXPECTED.cards);
+
+      const ordsFor = (needle: string) => {
+        const note = notes.find(entry => entry.flds.includes(needle));
+        expect(note).toBeDefined();
+        return cards
+          .filter(card => card.nid === note!.id)
+          .map(card => card.ord)
+          .sort((a, b) => a - b);
+      };
+
+      // One deletion, one card.
+      expect(ordsFor('reaches approximately')).toEqual([0]);
+      // Two deletions in one sentence, two cards.
+      expect(ordsFor('Sodium influx')).toEqual([0, 1]);
+      // `c1` and `c3` are two cards at ordinals 0 and 2 — Anki derives the card count from the
+      // deletions that are present, so a gap is not a missing card.
+      expect(ordsFor('First ')).toEqual([0, 2]);
+      // A basic note has exactly one card, at ordinal 0.
+      expect(ordsFor('resting membrane potential')).toEqual([0]);
+
+      // Every card belongs to a note that exists, and no note is orphaned.
+      expect(cards.every(card => notes.some(note => note.id === card.nid))).toBe(true);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('exports every card as new, with no interval, due date or review history', () => {
+    const db = openCollection();
+
+    try {
+      const notes = db.query('SELECT id FROM notes ORDER BY id ASC').all() as Array<{ id: number }>;
+      const cards = db
+        .query('SELECT nid, ord, type, queue, due, ivl, factor, reps, lapses, left, odue, odid FROM cards ORDER BY id ASC')
+        .all() as Array<{
+        nid: number;
+        ord: number;
+        type: number;
+        queue: number;
+        due: number;
+        ivl: number;
+        factor: number;
+        reps: number;
+        lapses: number;
+        left: number;
+        odue: number;
+        odid: number;
+      }>;
+
+      const positionOfNote = new Map(notes.map((note, index) => [note.id, index]));
+
+      for (const card of cards) {
+        // New, and carrying none of the learner's progress.
+        expect(card.type).toBe(0);
+        expect(card.queue).toBe(0);
+        expect(card.ivl).toBe(0);
+        expect(card.factor).toBe(NEW_CARD_FACTOR);
+        expect(card.reps).toBe(0);
+        expect(card.lapses).toBe(0);
+        expect(card.left).toBe(0);
+        expect(card.odue).toBe(0);
+        expect(card.odid).toBe(0);
+        // `due` orders the new queue and is not a date: it is the note's position in the export.
+        expect(card.due).toBe(positionOfNote.get(card.nid));
+        expect(card.due).toBeLessThan(EXPECTED.notes);
+      }
+
+      // No review history at all — an import cannot resurrect an interval from here.
+      expect((db.query('SELECT COUNT(*) AS n FROM revlog').get() as { n: number }).n).toBe(0);
+      expect((db.query('SELECT COUNT(*) AS n FROM graves').get() as { n: number }).n).toBe(0);
+
+      // And the deck's own configuration is a fresh-start one: new cards in the order added.
+      const conf = JSON.parse((db.query('SELECT conf FROM col').get() as { conf: string }).conf) as {
+        curDeck: number;
+      };
+      const dconf = JSON.parse(
+        (db.query('SELECT dconf FROM col').get() as { dconf: string }).dconf
+      ) as Record<string, { new: { order: number; perDay: number } }>;
+      const deckConf = Object.values(dconf)[0];
+
+      expect(deckConf.new.order).toBe(1);
+      expect(deckConf.new.perDay).toBeGreaterThan(0);
+      expect(conf.curDeck).toBeGreaterThan(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('is deterministic: the same cards produce identical bytes, so note identity is stable', () => {
+    const first = buildApkg({ deck: { id: 'deck-1', title: 'Neurophysiology' }, cards: CARDS, now: NOW });
+    const second = buildApkg({ deck: { id: 'deck-1', title: 'Neurophysiology' }, cards: CARDS, now: NOW });
+
+    expect([...first.bytes]).toEqual([...second.bytes]);
+  });
+
+  it('counts the cloze indices it accepts, ignoring anything that is not one', () => {
+    expect(clozeIndices('a {{c1::x}} b {{c2::y}}')).toEqual([1, 2]);
+    expect(clozeIndices('a {{c3::x}} b {{c1::y}}')).toEqual([1, 3]);
+    expect(clozeIndices('a {{c1::x}} b {{c1::y}}')).toEqual([1]);
+    expect(clozeIndices('no deletions here')).toEqual([]);
   });
 
   it('exports a deck with no cards without inventing any', () => {

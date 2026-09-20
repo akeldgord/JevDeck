@@ -1,5 +1,6 @@
 import * as pdfjsLib from 'pdfjs-dist';
 import { DocumentPage, DocumentSection } from '@jevdeck/contracts';
+import type { PageKind, Pagination, SourceFormat } from './parsedDocument';
 
 // Configure the worker for client-side processing
 if (typeof window !== 'undefined') {
@@ -9,21 +10,31 @@ if (typeof window !== 'undefined') {
   ).toString();
 }
 
+/** A page plus what the reader concluded about it. */
+export interface ParsedPdfPage extends DocumentPage {
+  kind: PageKind;
+}
+
 export interface ParsedPdfResult {
   fileName: string;
+  format: SourceFormat;
+  pagination: Pagination;
   pageCount: number;
   totalWords: number;
   sections: DocumentSection[];
   /**
-   * Pages that yielded no extractable text.
+   * Pages that yielded no extractable text, split by *why*.
    *
-   * Reported rather than passed over: a page that produced nothing may be a blank divider or a
-   * scanned plate containing material the application cannot see, and coverage claims have to be
-   * honest about which of the two it is looking at.
+   * Reported rather than passed over: a page that produced nothing is either a blank divider — a
+   * confirmed result — or a page whose content is a picture, which is material this build cannot
+   * read. Lumping the two together as "empty" is what let coverage claims overstate themselves.
    */
-  emptyPages: number[];
+  blankPages: number[];
+  unextractedPages: number[];
+  /** What this reader did not do, in plain language, for the coverage report. */
+  limitations: string[];
   /** Extracted text of every page, retained so generation and the page viewer use the real document. */
-  pages: DocumentPage[];
+  pages: ParsedPdfPage[];
   /**
    * An intact copy of the uploaded bytes. `pdf.js` detaches the buffer it is
    * given, so the original cannot be reused for rendering later.
@@ -148,9 +159,10 @@ export async function parsePdfDocument(
 
   // Extract text for every page and retain it
   onProgress?.(55, 'Extracting page text...');
-  const pages: DocumentPage[] = [];
+  const pages: ParsedPdfPage[] = [];
   const pageWordCounts: number[] = [];
-  const emptyPages: number[] = [];
+  const blankPages: number[] = [];
+  const unextractedPages: number[] = [];
   let totalWords = 0;
 
   for (let pageNum = 1; pageNum <= pageCount; pageNum++) {
@@ -160,10 +172,17 @@ export async function parsePdfDocument(
     // normalized copy, so the two columns are genuinely different representations.
     const text = textFromItems(textContent.items as any[]);
 
-    const label = pageLabels?.[pageNum - 1] ?? null;
-    pages.push({ pageNumber: pageNum, pageLabel: label ?? undefined, text });
+    // A page with no text is classified by what is on it, not assumed to be blank. A scanned
+    // plate and a blank divider both extract to nothing; only one of them is a coverage gap.
+    let kind: PageKind = 'text';
+    if (text.trim().length === 0) {
+      kind = (await pageDrawsAnImage(page)) ? 'image-only' : 'blank';
+      if (kind === 'blank') blankPages.push(pageNum);
+      else unextractedPages.push(pageNum);
+    }
 
-    if (text.trim().length === 0) emptyPages.push(pageNum);
+    const label = pageLabels?.[pageNum - 1] ?? null;
+    pages.push({ pageNumber: pageNum, pageLabel: label ?? undefined, text, kind });
 
     const words = text.length === 0 ? 0 : text.split(/\s+/).filter(w => w.length > 0).length;
     pageWordCounts.push(words);
@@ -277,16 +296,79 @@ export async function parsePdfDocument(
 
   onProgress?.(100, 'Parsing complete!');
 
+  // What this reader did not do, stated rather than left to be inferred from a count of pages.
+  const limitations: string[] = [
+    'Text and printed page labels are read from the PDF text layer. Images inside pages are not extracted or stored, and no OCR is applied, so a page whose content is a picture contributes no text.',
+  ];
+  if (unextractedPages.length > 0) {
+    limitations.push(
+      `${unextractedPages.length} page(s) contain no extractable text but do draw an image, so their content was not read.`
+    );
+  }
+  if (blankPages.length > 0) {
+    limitations.push(
+      `${blankPages.length} page(s) contain neither text nor an image and are recorded as blank.`
+    );
+  }
+  if (flatOutline.length === 0) {
+    limitations.push(
+      'The PDF states no outline, so the sections shown are page ranges this import divided, not the document’s own chapters.'
+    );
+  }
+
   return {
     fileName: file.name,
+    format: 'pdf',
+    pagination: 'explicit',
     pageCount,
     totalWords,
     sections,
-    emptyPages,
+    blankPages,
+    unextractedPages,
+    limitations,
     pages,
     bytes: retainedBytes,
     hasToc: flatOutline.length > 0,
   };
+}
+
+/**
+ * The drawing operators that paint a picture.
+ *
+ * Read from pdf.js rather than hard-coded, so a version that renumbers them cannot make every
+ * page look blank. `undefined` entries are filtered out for the same reason.
+ */
+const IMAGE_OPERATOR_NAMES = [
+  'paintImageXObject',
+  'paintJpegXObject',
+  'paintInlineImageXObject',
+  'paintImageMaskXObject',
+  'paintImageXObjectRepeat',
+  'paintImageMaskXObjectRepeat',
+] as const;
+
+const OPS_BY_NAME = pdfjsLib.OPS as unknown as Record<string, number>;
+
+const IMAGE_OPERATORS = IMAGE_OPERATOR_NAMES.map(name => OPS_BY_NAME[name]).filter(
+  (value): value is number => typeof value === 'number'
+);
+
+/**
+ * Whether a page paints any image at all.
+ *
+ * Used only for pages that produced no text, and only to tell a scan from a blank divider. The
+ * operator list is read for those pages alone: it is the expensive call, and a page with text
+ * needs no classification.
+ */
+async function pageDrawsAnImage(page: any): Promise<boolean> {
+  try {
+    const operators = await page.getOperatorList();
+    return (operators.fnArray as number[]).some(fn => IMAGE_OPERATORS.includes(fn));
+  } catch {
+    // A page whose operator list cannot be read is not evidence that it is blank, so it is
+    // reported as unread content rather than as an empty page.
+    return true;
+  }
 }
 
 /**

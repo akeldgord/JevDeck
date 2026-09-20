@@ -69,7 +69,10 @@ describe('SM-2 Spaced Repetition Engine', () => {
     expect(reviewed.intervalDays).toBe(14);
     expect(reviewed.easeFactor).toBe(2.6);
     expect(reviewed.dueDate).toBe('2026-10-01T12:00:00Z');
-    expect(reviewed.lastStudiedAt).toBeDefined();
+
+    // And `lastStudiedAt` is left alone, because it means "the schedule has seen this card".
+    // Setting it here would make a card the learner never scheduled look studied.
+    expect(reviewed.lastStudiedAt).toBe(originalCard.lastStudiedAt);
   });
 
   it('updates SR schedule when cram session has modifyScheduleInCram = true', () => {

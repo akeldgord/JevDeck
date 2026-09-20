@@ -363,7 +363,12 @@ function seedCompletedJob(path: string, options: { fabricatedCitation?: boolean 
 
   db.prepare(
     `INSERT INTO source_blocks (id, document_version_id, page_index, page_label, ordinal, kind, raw_text, normalized_text)
-     VALUES ('sb_2', 'dv_1', 2, NULL, 0, 'empty', '', '')`
+     VALUES ('sb_2', 'dv_1', 2, NULL, 0, 'image-only', '', '')`
+  ).run();
+
+  db.prepare(
+    `INSERT INTO source_blocks (id, document_version_id, page_index, page_label, ordinal, kind, raw_text, normalized_text)
+     VALUES ('sb_blank', 'dv_1', 3, NULL, 0, 'blank', '', '')`
   ).run();
 
   db.prepare(
@@ -428,8 +433,10 @@ describe('Reading a run and reporting on it', () => {
       expect(run.cards).toHaveLength(1);
       expect(run.cards[0]!.claim).toContain('An electrically excitable cell.');
       expect(run.pageTextByIndex.get(1)).toContain('electrically excitable');
-      // The empty page is recorded as empty, not as missing.
-      expect(run.pages.find(page => page.pageIndex === 2)!.kind).toBe('empty');
+      // A page whose content could not be read is recorded as such, not as missing and not as
+      // blank: the two say opposite things about the document.
+      expect(run.pages.find(page => page.pageIndex === 2)!.kind).toBe('image-only');
+      expect(run.pages.find(page => page.pageIndex === 3)!.kind).toBe('blank');
     } finally {
       db.close();
     }
@@ -462,7 +469,10 @@ describe('Reading a run and reporting on it', () => {
       expect(report.summary.measured).toBe(false);
       expect(report.deterministic.grounding.allLocated).toBe(true);
       expect(report.deterministic.note).toContain('not the §5 gates');
-      expect(report.material.pagesWithNoText).toBe(1);
+      // Two pages yielded no text, for two different reasons, and the report keeps them apart.
+      expect(report.material.pagesWithNoText).toBe(2);
+      expect(report.material.pagesUnextracted).toBe(1);
+      expect(report.material.pagesBlank).toBe(1);
       expect(report.output.withheld[0]).toContain('unsupported_claim');
     } finally {
       db.close();
@@ -516,18 +526,19 @@ describe('Reading a run and reporting on it', () => {
 
     try {
       // A second block on page 1 — a two-column page, or a header block. The document still has
-      // two pages, and reporting three would overstate the material the run was measured on.
+      // three pages, and reporting four blocks as four pages would overstate the material the run
+      // was measured on.
       db.prepare(
         `INSERT INTO source_blocks (id, document_version_id, page_index, page_label, ordinal, kind, raw_text, normalized_text)
-         VALUES ('sb_3', 'dv_1', 1, '1', 1, 'text', 'Second block', 'Second block')`
+         VALUES ('sb_columns', 'dv_1', 1, '1', 1, 'text', 'Second block', 'Second block')`
       ).run();
 
       const run = readRun(db, 'job_1');
       const report = buildReport({ run, verdicts: [], review: null });
 
-      expect(run.pages).toHaveLength(3);
-      expect(report.material.pages).toBe(2);
-      expect(report.material.pagesWithNoText).toBe(1);
+      expect(run.pages).toHaveLength(4);
+      expect(report.material.pages).toBe(3);
+      expect(report.material.pagesWithNoText).toBe(2);
       // The concatenated page text is what a citation is checked against.
       expect(run.pageTextByIndex.get(1)).toContain('Second block');
     } finally {

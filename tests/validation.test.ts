@@ -1,163 +1,292 @@
 import { describe, expect, it } from 'bun:test';
-import { combineSupportFindings, validateClaimSupport } from '../packages/validation/src';
+import {
+  CLAIM_SUPPORT_VALIDATOR_VERSION,
+  combineSupportFindings,
+  resolveCitation,
+  validateClaimSupport,
+} from '../packages/validation/src';
 
 /**
- * The deterministic support layer.
+ * The deterministic support layer, version 2: evidence-scoped.
  *
- * This runs before any model is asked and its **errors** are not overridable (see
- * `docs/decisions/0002-provider-backed-generation.md` §5), so both directions of a mistake matter:
- * a claim it should have rejected but did not, and — the failure the audit of R9–R11 found — a claim
- * it rejected although the source supports it, which silently withholds a correct card and lowers
- * the measurable coverage.
+ * Two properties matter, and they pull in opposite directions. A rule that is too eager withholds
+ * correct cards, and a withheld card is indistinguishable from a concept the generator never
+ * covered — it shows up as a *coverage* gap. A rule that is too shy publishes a card the source
+ * does not support, which is the one thing this product must never do.
  *
- * The cases below are the contract. `severity` is part of it: `warning` findings are recorded on the
- * card and do not withhold it, `error` findings do.
+ * The previous version failed both ways at once, which is why this suite is written around scope.
+ * It compared a claim against the **whole page**: a verbatim true sentence was withheld because an
+ * unrelated sentence on the same page said "may", and a claim that negated the very sentence it
+ * cited passed untouched because the page-wide negation check returned early.
+ *
+ * So the contract asserted here is:
+ *
+ *   - everything is measured against the citation resolved in the source, never the page at large;
+ *   - the deterministic layer may conclude `contradicted` only for a mechanically provable defect;
+ *   - everything else is `inconclusive`, and `inconclusive` means a semantic judge is required;
+ *   - a deterministic contradiction is final, and a judge cannot rescue it;
+ *   - a judge that never answered leaves the card withheld rather than published.
  */
+
+const SQUARE = 'All squares have four sides.';
+const HEDGED_NEIGHBOUR = 'Rectangles may be blue.';
+const SQUARES_PAGE = `${SQUARE} ${HEDGED_NEIGHBOUR}`;
 
 const NEURON =
   'A neuron is defined as an electrically excitable cell that communicates with other cells.';
+const UNRELATED_NEGATION = 'No other cell type was examined in this study.';
+const NEURON_PAGE = `${NEURON} ${UNRELATED_NEGATION}`;
 
 const MEMBRANE =
   'The resting membrane potential of a typical mammalian neuron is about -70 mV at physiological temperature.';
 
-const check = (claim: string, page: string) =>
-  validateClaimSupport({ claim, sourceExcerpt: page, pageText: page });
+type Assessment = ReturnType<typeof validateClaimSupport>;
 
-describe('Quantities are read as written', () => {
-  it('rejects a claim whose figure differs from the stored page', () => {
-    const result = check(
-      'The resting membrane potential of a typical mammalian neuron is about -60 mV at physiological temperature.',
-      MEMBRANE
-    );
+/** The stored page defaults to the excerpt when a case does not need them to differ. */
+function assess(claim: string, excerpt: string, page?: string): Assessment {
+  return validateClaimSupport({ claim, sourceExcerpt: excerpt, pageText: page ?? excerpt });
+}
 
-    expect(result.ok).toBe(false);
-    expect(result.issues.map(issue => issue.code)).toContain('quantity_mismatch');
+const codes = (assessment: Assessment) => assessment.issues.map(issue => issue.code);
+
+/** The complete path: the deterministic verdict, then the judge's answer. */
+const published = (
+  assessment: Assessment,
+  judge: { supported: boolean; issues: string[] } | null = { supported: true, issues: [] }
+): boolean => combineSupportFindings(assessment, judge).supported;
+
+const SUPPORTS = { supported: true, issues: [] };
+const WITHHOLDS = (code: string) => ({ supported: false, issues: [code] });
+
+describe('The citation is resolved in the source before anything is judged', () => {
+  it('locates the cited excerpt and keeps the sentences around it as context', () => {
+    const citation = resolveCitation(SQUARE, SQUARES_PAGE);
+
+    expect(citation).not.toBeNull();
+    expect(citation!.spanStart).toBe(0);
+    expect(citation!.spanEnd).toBe(SQUARE.length);
+    expect(citation!.citedSentences).toEqual([SQUARE]);
+    // The hedge is a *neighbour*, not part of the evidence — it is handed to the judge as context.
+    expect(citation!.context).toContain(HEDGED_NEIGHBOUR);
+  });
+
+  it('treats a citation the page does not contain as a final, provable defect', () => {
+    const assessment = assess('Triangles have three sides.', 'Triangles have three sides.', SQUARES_PAGE);
+
+    expect(assessment.verdict).toBe('contradicted');
+    expect(codes(assessment)).toContain('citation_not_in_source');
+    expect(assessment.evidence.resolved).toBe(false);
+    // Nothing is left open, so no judge is asked — and no judge could change this answer.
+    expect(assessment.requiresSemanticValidation).toBe(false);
+    expect(published(assessment, SUPPORTS)).toBe(false);
+  });
+
+  it('has nothing to resolve an empty citation against', () => {
+    expect(resolveCitation('   ', SQUARES_PAGE)).toBeNull();
+    expect(assess(SQUARE, '', SQUARES_PAGE).verdict).toBe('contradicted');
+  });
+
+  it('rejects a claim that asserts nothing', () => {
+    const assessment = assess('   ', NEURON);
+
+    expect(assessment.verdict).toBe('contradicted');
+    expect(codes(assessment)).toContain('claim_empty');
+  });
+});
+
+describe('The two reproduced baseline cases are regression fixtures', () => {
+  it('accepts a verbatim supported claim despite unrelated hedging elsewhere on the page', () => {
+    // Baseline defect: this was rejected with `modality_overstated`, because `may` appeared
+    // somewhere on the page. The hedge belongs to a different sentence and says nothing about squares.
+    const assessment = assess(SQUARE, SQUARE, SQUARES_PAGE);
+
+    expect(codes(assessment)).not.toContain('modality_overstated');
+    expect(assessment.issues.filter(issue => issue.severity === 'error')).toEqual([]);
+    expect(assessment.verdict).toBe('inconclusive');
+    expect(assessment.requiresSemanticValidation).toBe(true);
+    expect(published(assessment, SUPPORTS)).toBe(true);
+  });
+
+  it('rejects a claim that negates the very sentence it cites, with unrelated negation on the page', () => {
+    // Baseline defect: the page-wide negation comparison returned early, so the scoped comparison
+    // never ran and this came back `ok: true` with no issues.
+    const claim = 'A neuron is not defined as an electrically excitable cell that communicates with other cells.';
+    const assessment = assess(claim, NEURON, NEURON_PAGE);
+
+    expect(assessment.verdict).toBe('contradicted');
+    expect(codes(assessment)).toContain('negation_mismatch');
+    expect(assessment.requiresSemanticValidation).toBe(false);
+    expect(published(assessment, SUPPORTS)).toBe(false);
+  });
+
+  it('gives the same verdict without the unrelated sentence, so the page does not decide', () => {
+    const claim = 'A neuron is not defined as an electrically excitable cell that communicates with other cells.';
+    const withNoise = assess(claim, NEURON, NEURON_PAGE);
+    const withoutNoise = assess(claim, NEURON);
+
+    expect(withoutNoise.verdict).toBe(withNoise.verdict);
+    expect(codes(withoutNoise)).toEqual(codes(withNoise));
+
+    const verbatimWithNoise = assess(SQUARE, SQUARE, SQUARES_PAGE);
+    const verbatimWithoutNoise = assess(SQUARE, SQUARE, SQUARE);
+    expect(codes(verbatimWithoutNoise)).toEqual(codes(verbatimWithNoise));
+  });
+
+  it('does not let an unrelated sentence elsewhere on the page be the evidence', () => {
+    // `Rectangles may be blue.` is on the page, but it is not this card's evidence, and the
+    // deterministic layer must not treat the page as the claim's support.
+    const assessment = assess(SQUARE, SQUARE, SQUARES_PAGE);
+
+    expect(assessment.evidence.context).toContain(HEDGED_NEIGHBOUR);
+    expect(assessment.inconclusiveReason).not.toBeNull();
+  });
+});
+
+describe('Quantities are compared against the cited evidence', () => {
+  it('rejects a claim whose figure the source does not state', () => {
+    const claim =
+      'The resting membrane potential of a typical mammalian neuron is about -60 mV at physiological temperature.';
+    const assessment = assess(claim, MEMBRANE);
+
+    expect(assessment.verdict).toBe('contradicted');
+    expect(codes(assessment)).toContain('quantity_mismatch');
+    expect(published(assessment, SUPPORTS)).toBe(false);
   });
 
   it('accepts a paraphrase that keeps the number and the unit', () => {
-    const result = check(
-      'In a typical mammalian neuron, the resting membrane potential is about -70 mV at physiological temperature.',
-      MEMBRANE
-    );
+    const claim =
+      'In a typical mammalian neuron, the resting membrane potential is about -70 mV at physiological temperature.';
+    const assessment = assess(claim, MEMBRANE);
 
-    expect(result.ok).toBe(true);
+    expect(assessment.verdict).toBe('inconclusive');
+    expect(codes(assessment)).not.toContain('quantity_mismatch');
+  });
+
+  it('records a figure that lives outside the citation instead of withholding the card', () => {
+    const page = `${MEMBRANE} The peak of the action potential reaches 40 mV.`;
+    const claim =
+      'The resting membrane potential of a typical mammalian neuron is about -70 mV at physiological temperature, and the peak reaches 40 mV.';
+    const assessment = assess(claim, MEMBRANE, page);
+
+    // The figure is in the source, just not in the cited span: that is a citation-scope problem, so
+    // it is recorded and left to judgement rather than treated as an invented number.
+    expect(assessment.verdict).toBe('inconclusive');
+    expect(codes(assessment)).toContain('quantity_outside_citation');
+    expect(assessment.issues.every(issue => issue.severity === 'warning')).toBe(true);
   });
 });
 
-describe('Negation is scoped to the sentence the claim restates', () => {
-  it('rejects a claim that negates the sentence it restates', () => {
-    const result = check(
-      'A neuron is not an electrically excitable cell that communicates with other cells.',
-      NEURON
-    );
+describe('What needs judgement is routed, not decided', () => {
+  it('routes a faithful low-overlap paraphrase instead of rejecting it on lexical overlap', () => {
+    const assessment = assess('Nerve cells carry electrical signals to other cells.', NEURON);
 
-    expect(result.ok).toBe(false);
-    expect(result.issues.map(issue => issue.code)).toContain('negation_mismatch');
+    expect(assessment.verdict).toBe('inconclusive');
+    expect(assessment.inconclusiveReason).toContain('paraphrase');
+    expect(assessment.issues.filter(issue => issue.severity === 'error')).toEqual([]);
+    expect(published(assessment, SUPPORTS)).toBe(true);
+    expect(published(assessment, WITHHOLDS('term_not_in_source'))).toBe(false);
   });
 
-  it('accepts a claim and a source that are both negated', () => {
-    const line = 'A neuron is not an electrically excitable cell.';
-    expect(check(line, line).ok).toBe(true);
+  it('routes a reversed direction to the judge rather than guessing from the words', () => {
+    // Lexically this is a near-perfect restatement; only meaning tells it apart, so no mechanical
+    // rule may decide it — in either direction.
+    const page = 'Compound A inhibits enzyme B.';
+    const assessment = assess('Enzyme B inhibits compound A.', page);
+
+    expect(assessment.verdict).toBe('inconclusive');
+    expect(published(assessment, WITHHOLDS('direction_reversed'))).toBe(false);
   });
 
-  it('accepts a faithful restatement on a page whose negation is about something else', () => {
-    // The regression this suite exists for. A dense page almost always contains a negation
-    // somewhere; comparing the claim against the whole page withheld correct cards systematically.
-    const page = `${NEURON} No other cell type was examined in this study.`;
-    const result = check(NEURON, page);
+  it('routes a changed population to the judge', () => {
+    const page = 'In adult rats the reflex is absent.';
+    const assessment = assess('In human infants the reflex is absent.', page);
 
-    expect(result.ok).toBe(true);
-    expect(result.issues).toEqual([]);
+    expect(assessment.verdict).toBe('inconclusive');
+    expect(published(assessment, WITHHOLDS('population_changed'))).toBe(false);
   });
 
-  it('accepts a claim restating a negative sentence on a page that also denies something else', () => {
-    const page = 'The channel does not open. No other ion was tested.';
-    expect(check('The channel does not open.', page).ok).toBe(true);
-  });
-
-  it('still applies the coarse check when no sentence clearly restates the claim', () => {
-    // A claim that cannot be tied to a source sentence is treated strictly: the page denies
-    // something and the claim asserts it, so it is withheld rather than waved through.
-    const result = check(
-      'Potassium channels open more slowly than sodium channels.',
-      'The channel does not open.'
-    );
-
-    expect(result.ok).toBe(false);
-    expect(result.issues.map(issue => issue.code)).toContain('negation_mismatch');
-  });
-});
-
-describe('Severity decides whether a card is withheld', () => {
-  it('rejects an empty claim', () => {
-    const result = check('   ', NEURON);
-
-    expect(result.ok).toBe(false);
-    expect(result.issues.map(issue => issue.code)).toContain('claim_empty');
-  });
-
-  it('rejects an overstated modality when the stored page hedges', () => {
-    const page = 'Sodium influx may depolarise the cell.';
-    const result = check('Sodium influx always depolarises the cell.', page);
-
-    expect(result.ok).toBe(false);
-    expect(result.issues.map(issue => issue.code)).toContain('modality_overstated');
-  });
-
-  it('does not reject an unhedged claim when the page does not hedge either', () => {
-    // The check is "the page hedges this and the claim does not", not "the claim sounds confident".
-    expect(check('Sodium influx depolarises the cell.', 'Sodium influx depolarises the cell.').ok).toBe(true);
-  });
-
-  it('records a dropped qualifier as a warning without withholding the card', () => {
-    const result = check(
+  it('records a dropped condition as a warning and leaves the card to the judge', () => {
+    const assessment = assess(
       'The resting membrane potential of a typical mammalian neuron is about -70 mV.',
       MEMBRANE
     );
 
-    expect(result.ok).toBe(true);
-    expect(result.issues.map(issue => issue.code)).toContain('condition_dropped');
-    expect(result.issues.every(issue => issue.severity === 'warning')).toBe(true);
+    expect(codes(assessment)).toContain('condition_dropped');
+    expect(assessment.verdict).toBe('inconclusive');
+    expect(assessment.issues.every(issue => issue.severity === 'warning')).toBe(true);
+  });
+
+  it('shows an exception stated next to the citation to the judge', () => {
+    const page = 'Compound X inhibits the enzyme. This does not hold at pH 4.';
+    const assessment = assess('Compound X inhibits the enzyme at pH 4.', 'Compound X inhibits the enzyme.', page);
+
+    // The exception is one sentence away, so it is part of the evidence window the judge reads.
+    expect(assessment.evidence.context).toContain('does not hold at pH 4');
+    expect(assessment.verdict).toBe('inconclusive');
+    expect(published(assessment, WITHHOLDS('condition_dropped'))).toBe(false);
+  });
+
+  it('does not read a doubly negated sentence as a single negation', () => {
+    const page = 'The channel does not open. It also does not inactivate.';
+    const restatement = assess('The channel does not open.', 'The channel does not open.', page);
+
+    expect(restatement.verdict).toBe('inconclusive');
+    expect(codes(restatement)).not.toContain('negation_mismatch');
+  });
+
+  it('rejects a plain restatement that drops the negation', () => {
+    const page = 'The channel does not open.';
+    const assessment = assess('The channel is open.', page);
+
+    expect(assessment.verdict).toBe('contradicted');
+    expect(codes(assessment)).toContain('negation_mismatch');
+  });
+
+  it('does not reject a claim and evidence that are both negated', () => {
+    const line = 'A neuron is not an electrically excitable cell.';
+    const assessment = assess(line, line);
+
+    expect(assessment.verdict).toBe('inconclusive');
+    expect(codes(assessment)).not.toContain('negation_mismatch');
+    expect(published(assessment, SUPPORTS)).toBe(true);
   });
 });
 
-describe('What the deterministic layer does not attempt', () => {
-  /**
-   * Recorded scope boundaries, asserted so that a change in behaviour is noticed.
-   *
-   * These are not desirable properties — the model call is what covers them, and it can withhold a
-   * card but never rescue one. If a future change makes the deterministic layer catch one of these,
-   * these expectations should be updated to match, and the update is an improvement.
-   */
+describe('The judge is required, and cannot rescue a contradiction', () => {
+  it('withholds a claim no judge assessed', () => {
+    const assessment = assess(SQUARE, SQUARE, SQUARES_PAGE);
+    const combined = combineSupportFindings(assessment, null);
 
-  it('does not flag a single unfamiliar entity (the vocabulary check is a threshold)', () => {
-    const page = 'Voltage-gated sodium channels open because of an influx of sodium ions.';
-    const result = check(
-      'Voltage-gated sodium channels open because of an influx of calcium ions.',
-      page
-    );
-
-    expect(result.ok).toBe(true);
-    expect(result.issues.map(issue => issue.code)).not.toContain('term_not_in_source');
+    // `unknown` is not `supported`: an unchecked card must not be stored.
+    expect(combined.supported).toBe(false);
+    expect(combined.codes).toContain('semantic_validation_missing');
   });
 
-  it('does not attempt a reversed direction', () => {
-    const page = 'Voltage-gated sodium channels open when the membrane depolarises.';
-    const result = check(
-      'Voltage-gated sodium channels opening hyperpolarises the membrane.',
-      page
-    );
+  it('keeps the judge’s own codes when it withholds a card', () => {
+    const assessment = assess(SQUARE, SQUARE, SQUARES_PAGE);
+    const combined = combineSupportFindings(assessment, WITHHOLDS('conflation'));
 
-    expect(result.ok).toBe(true);
+    expect(combined.supported).toBe(false);
+    expect(combined.codes).toContain('conflation');
   });
 
-  it('never lets a deterministic failure be rescued by the model', () => {
-    const deterministic = check('A neuron is not an electrically excitable cell.', NEURON);
-    expect(deterministic.ok).toBe(false);
+  it('never lets a deterministic contradiction be rescued by the judge', () => {
+    const assessment = assess(
+      'A neuron is not an electrically excitable cell that communicates with other cells.',
+      NEURON,
+      NEURON_PAGE
+    );
 
-    const combined = combineSupportFindings(deterministic, { supported: true, issues: [] });
+    expect(assessment.verdict).toBe('contradicted');
+
+    const combined = combineSupportFindings(assessment, SUPPORTS);
 
     expect(combined.supported).toBe(false);
     expect(combined.codes).toContain('negation_mismatch');
+  });
+
+  it('records which rules judged the card', () => {
+    expect(assess(SQUARE, SQUARE, SQUARE).validatorVersion).toBe(CLAIM_SUPPORT_VALIDATOR_VERSION);
+    expect(CLAIM_SUPPORT_VALIDATOR_VERSION).toMatch(/^claim-support\/v\d+$/);
   });
 });

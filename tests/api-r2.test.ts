@@ -108,18 +108,23 @@ afterAll(() => {
 });
 
 describe('Pages that yield no text are gaps, not failed uploads', () => {
-  it('stores a document whose page has no extractable text, and records that page as empty', async () => {
+  it('stores a document whose pages have no extractable text, and records why each one is empty', async () => {
     const created = await admin.call('/api/documents', {
       method: 'POST',
       body: {
         name: 'scanned-plate.pdf',
-        pageCount: 3,
+        pageCount: 4,
         contentHash: 'hash-scanned-plate',
+        sourceFormat: 'pdf',
+        pagination: 'explicit',
         pages: [
           { pageIndex: 1, pageLabel: '1', text: 'A neuron is defined as an electrically excitable cell.' },
-          // A scanned plate, an image-only page or a blank divider: extraction yields nothing.
-          { pageIndex: 2, pageLabel: '2', text: '' },
-          { pageIndex: 3, pageLabel: '3', text: 'The resting potential is about -70 mV in a typical neuron.' },
+          // A scan: the reader saw an image and no text, so its content is a coverage gap.
+          { pageIndex: 2, pageLabel: '2', text: '', kind: 'image-only' },
+          // A blank divider: nothing on the page at all. A result, not a gap.
+          { pageIndex: 3, pageLabel: '3', text: '', kind: 'blank' },
+          // No kind stated: recorded as blank, which is the weaker of the two claims.
+          { pageIndex: 4, pageLabel: '4', text: '' },
         ],
       },
     });
@@ -137,19 +142,47 @@ describe('Pages that yield no text are gaps, not failed uploads', () => {
       raw_text: string;
     }>;
 
-    expect(blocks).toHaveLength(3);
-    expect(blocks.map(block => block.page_index)).toEqual([1, 2, 3]);
+    expect(blocks).toHaveLength(4);
+    expect(blocks.map(block => block.page_index)).toEqual([1, 2, 3, 4]);
 
-    const unreadable = blocks[1];
-    expect(unreadable.kind).toBe('empty');
-    expect(unreadable.raw_text).toBe('');
+    // Three different facts, kept apart: read, unread content, and blank.
+    expect(blocks.map(block => block.kind)).toEqual(['text', 'image-only', 'blank', 'blank']);
+    expect(blocks[1].raw_text).toBe('');
+    expect(blocks[2].raw_text).toBe('');
 
     // The readable pages are unchanged: nothing was invented to fill the gap.
     expect(blocks[0].raw_text).toContain('electrically excitable cell');
-    expect(blocks[2].raw_text).toContain('-70 mV');
 
     // Physical page index and printed label are stored separately.
-    expect(blocks.map(block => block.page_label)).toEqual(['1', '2', '3']);
+    expect(blocks.map(block => block.page_label)).toEqual(['1', '2', '3', '4']);
+
+    // The list reports the same distinction, so a caller counting coverage does not have to read
+    // every block to find out what was skipped.
+    const list = await admin.call('/api/documents');
+    const summary = (list.body.documents as Array<Record<string, unknown>>).find(
+      entry => entry.id === created.body.document.id
+    )!;
+
+    expect(summary.sourceFormat).toBe('pdf');
+    expect(summary.textPages).toBe(1);
+    expect(summary.blankPages).toBe(2);
+    expect(summary.unextractedPages).toBe(1);
+    expect(summary.pageCount).toBe(4);
+  });
+
+  it('refuses a page kind it does not recognise rather than guessing one', async () => {
+    const rejected = await admin.call('/api/documents', {
+      method: 'POST',
+      body: {
+        name: 'odd-kind.pdf',
+        pageCount: 1,
+        contentHash: 'hash-odd-kind',
+        pages: [{ pageIndex: 1, text: '', kind: 'illegible' }],
+      },
+    });
+
+    expect(rejected.status).toBe(400);
+    expect(rejected.body.error.code).toBe('invalid_page_kind');
   });
 
   it('still refuses a page whose text field is missing entirely', async () => {

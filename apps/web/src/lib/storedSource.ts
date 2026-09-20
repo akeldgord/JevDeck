@@ -152,10 +152,14 @@ export interface StoredCardSchedule {
   ease_factor: number;
   due_at: string | null;
   suspended: number;
-  /** When this schedule row last changed, which is when the card was last reviewed. */
+  /** When this schedule row last changed. Moves for every review, including an isolated cram. */
   updated_at: string;
-  /** How many reviews this user has given the card, including ones since undone. */
+  /** How many reviews this user has given the card, of any kind, including ones since undone. */
   review_count?: number;
+  /** How many of those changed the schedule; 0 means the card was never scheduled. */
+  schedule_review_count?: number;
+  /** When the schedule last changed. Null until a review is allowed to affect it. */
+  last_scheduled_at?: string | null;
 }
 
 export function cardsFromStoredDeck(
@@ -211,11 +215,11 @@ export function cardsFromStoredDeck(
       intervalDays: schedule?.interval_days ?? 0,
       easeFactor: schedule?.ease_factor ?? 2.5,
       dueDate: schedule?.due_at ?? '',
-      // Only a card with at least one recorded review counts as studied: a row with a zero count is
-      // the residue of an undone review, and that card is new again.
-      ...(schedule && (schedule.review_count ?? 1) > 0
-        ? { lastStudiedAt: schedule.updated_at }
-        : {}),
+      // A card counts as studied when a review *changed its schedule*. An isolated cram review is
+      // recorded and visible in the history, but it never put the card into the schedule, so the
+      // card is still new — marking it studied is what removed it from the new queue without ever
+      // adding it to anything, and a row whose only review was undone is in the same position.
+      ...(schedule?.last_scheduled_at ? { lastStudiedAt: schedule.last_scheduled_at } : {}),
     };
   });
 }

@@ -55,6 +55,15 @@ function providerAgainstStub(overrides: Partial<ProviderConfig> = {}) {
   return createGenerationProvider(configFor(overrides));
 }
 
+/**
+ * A support request with no open question. These cases exercise the transport, not the judgement:
+ * the evidence window and the open questions the pipeline supplies are covered where they are
+ * produced, in the validation and R3 suites.
+ */
+function supportRequest(claim = 'a', excerpt = 'a', pageText = 'a') {
+  return { claim, sourceExcerpt: excerpt, evidenceContext: excerpt, pageText, openQuestions: [] };
+}
+
 describe('OpenAI-compatible transport', () => {
   it('sends the documented envelope with the key in the authorization header', async () => {
     const transport = createOpenAiCompatibleTransport({
@@ -93,11 +102,7 @@ describe('OpenAI-compatible transport', () => {
 
   it('omits the JSON switch when it is turned off, for compatible servers that reject it', async () => {
     const provider = createGenerationProvider(configFor({ jsonMode: false }));
-    const result = await provider.assessClaimSupport({
-      claim: 'x',
-      sourceExcerpt: 'x',
-      pageText: 'x',
-    });
+    const result = await provider.assessClaimSupport(supportRequest('x'));
 
     expect(result.supported).toBe(true);
     // The request still succeeded, and the field that breaks compatible servers was not sent.
@@ -109,7 +114,7 @@ describe('OpenAI-compatible transport', () => {
     stub.setBehaviour({ httpStatus: 401 });
 
     const provider = providerAgainstStub();
-    const promise = provider.assessClaimSupport({ claim: 'a', sourceExcerpt: 'a', pageText: 'a' });
+    const promise = provider.assessClaimSupport(supportRequest());
 
     await expect(promise).rejects.toThrow(ProviderError);
     try {
@@ -167,7 +172,7 @@ describe('OpenAI-compatible transport', () => {
     const provider = providerAgainstStub({ timeoutMs: 80 });
 
     try {
-      await provider.assessClaimSupport({ claim: 'a', sourceExcerpt: 'a', pageText: 'a' });
+      await provider.assessClaimSupport(supportRequest());
       throw new Error('expected a ProviderError');
     } catch (error) {
       expect((error as ProviderError).code).toBe('timeout');
@@ -181,7 +186,7 @@ describe('OpenAI-compatible transport', () => {
     stub.setBehaviour({ httpStatus: 401 });
 
     try {
-      await providerAgainstStub().assessClaimSupport({ claim: 'a', sourceExcerpt: 'a', pageText: 'a' });
+      await providerAgainstStub().assessClaimSupport(supportRequest());
     } catch (error) {
       const text = `${(error as Error).message} ${JSON.stringify((error as ProviderError).details ?? {})}`;
       expect(text).not.toContain('test-key-not-a-secret');
@@ -389,7 +394,7 @@ describe('Output shape validation', () => {
     const provider = providerReturning(JSON.stringify({ supported: 'yes', issues: [] }));
 
     try {
-      await provider.assessClaimSupport({ claim: 'a', sourceExcerpt: 'a', pageText: 'a' });
+      await provider.assessClaimSupport(supportRequest());
       throw new Error('expected a ProviderError');
     } catch (error) {
       expect((error as ProviderError).code).toBe('malformed_output');
