@@ -8,7 +8,7 @@ import {
   requireCsrf,
   resolveAppOrigin,
 } from '../http/context';
-import { badRequest } from '../http/errors';
+import { badRequest, conflict, notFound } from '../http/errors';
 import { Router } from '../http/router';
 import {
   disableUser,
@@ -27,7 +27,10 @@ import {
 import {
   installationLimitMinor,
   periodKeyFor,
+  readAccountingIncidents,
+  readUncertainCharges,
   readUsageTotals,
+  reconcileReservation,
   resolvePricing,
   setInstallationLimit,
 } from '@jevdeck/worker';
@@ -66,6 +69,33 @@ function budgetReport(db: Parameters<typeof readUsageTotals>[0], providerModel: 
     )
     .get() as { activeUsers: number; cards: number; documents: number };
 
+  // Unresolved charges are listed for every period, not only this one. A hold nobody resolved is
+  // still money that may have been spent, and hiding it because the month rolled over is how a
+  // ledger stops matching an invoice.
+  const uncertain = readUncertainCharges(db);
+
+  // Incidents for the current period, which are the ones that stop further paid work.
+  const incidents = readAccountingIncidents(db, periodKey);
+
+  // Each account's position for the period, read from the same reservations the caps check, so
+  // the roster can show what an account actually spent instead of a placeholder.
+  const perUser = db
+    .query(
+      `SELECT user_id,
+              COALESCE(SUM(CASE WHEN state = 'charged' THEN amount_minor ELSE 0 END), 0) AS charged,
+              COALESCE(SUM(CASE WHEN state = 'reserved' THEN amount_minor ELSE 0 END), 0) AS reserved,
+              COALESCE(SUM(CASE WHEN state = 'reconciling' THEN amount_minor ELSE 0 END), 0) AS reconciling
+         FROM budget_reservations
+        WHERE period_key = ?
+        GROUP BY user_id`
+    )
+    .all(periodKey) as Array<{
+    user_id: string;
+    charged: number;
+    reserved: number;
+    reconciling: number;
+  }>;
+
   return {
     periodKey,
     currency: pricing.currency,
@@ -82,6 +112,26 @@ function budgetReport(db: Parameters<typeof readUsageTotals>[0], providerModel: 
       totalTokens: tokens.inputTokens + tokens.outputTokens,
     },
     counts,
+    incidents: incidents.map(incident => ({
+      id: incident.id,
+      userId: incident.userId,
+      jobId: incident.jobId,
+      model: incident.model,
+      reservedMinor: incident.reservedMinor,
+      chargedMinor: incident.chargedMinor,
+      overMinor: incident.overMinor,
+      currency: incident.currency,
+      detail: incident.detail,
+      createdAt: incident.createdAt,
+    })),
+    uncertain,
+    perUser: perUser.map(row => ({
+      userId: row.user_id,
+      chargedMinor: row.charged,
+      reservedMinor: row.reserved,
+      reconcilingMinor: row.reconciling,
+      committedMinor: row.charged + row.reserved + row.reconciling,
+    })),
   };
 }
 
@@ -156,6 +206,64 @@ export function registerAdminRoutes(router: Router): void {
     setInstallationLimit(ctx.db, { limitMinor, actorId: session.user.id });
 
     return json({ budget: budgetReport(ctx.db, ctx.config.provider?.model ?? null) });
+  });
+
+  /**
+   * Resolves one uncertain charge.
+   *
+   * `reconciling` means the provider may have billed a call and we cannot tell, so the money stays
+   * counted until a person establishes what the invoice says. This is that person's route: it
+   * requires the figure for `charged` rather than inferring one, and it records who decided.
+   */
+  router.post('/api/admin/budget/uncertain/:id/reconcile', async ctx => {
+    assertOriginAllowed(ctx);
+    const session = requireAdmin(ctx);
+    requireCsrf(ctx, session);
+    const body = await readJson<Record<string, unknown>>(ctx);
+
+    const outcome = asString(body.outcome, 'outcome', { maxLength: 20 });
+    if (outcome !== 'charged' && outcome !== 'released') {
+      throw badRequest('`outcome` must be "charged" or "released".', 'field_invalid', {
+        field: 'outcome',
+      });
+    }
+
+    // A release states that nothing was billed, so a figure would be meaningless; a charge is an
+    // invoice line and must be given rather than guessed at.
+    const amountMinor =
+      outcome === 'charged'
+        ? asInteger(body.amountMinor, 'amountMinor', { min: 0, max: MAX_SPEND_LIMIT_MINOR })
+        : 0;
+
+    const pricing = resolvePricing(process.env, ctx.config.provider?.model ?? 'unconfigured');
+    const result = reconcileReservation(ctx.db, {
+      reservationId: ctx.params.id,
+      outcome,
+      amountMinor,
+      actorId: session.user.id,
+      currency: pricing.currency,
+      priceVersion: pricing.priceVersion,
+      note: typeof body.note === 'string' ? body.note.slice(0, 500) : undefined,
+    });
+
+    if (!result.ok) {
+      if (result.reason === 'reservation_not_found') {
+        throw notFound('No such charge.', 'reservation_not_found');
+      }
+      throw conflict(
+        'That charge has already been settled, so there is nothing to reconcile.',
+        'not_reconciling'
+      );
+    }
+
+    return json({
+      reconciled: {
+        reservationId: ctx.params.id,
+        outcome: result.outcome,
+        amountMinor: result.amountMinor,
+      },
+      budget: budgetReport(ctx.db, ctx.config.provider?.model ?? null),
+    });
   });
 
   router.get('/api/admin/invitations', ctx => {

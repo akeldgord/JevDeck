@@ -1,5 +1,6 @@
 import {
   CardFormat,
+  ConceptKind,
   CoverageMode,
   DocumentPage,
   DocumentSection,
@@ -100,17 +101,19 @@ export function classifySentence(sentence: string): ConceptType {
 }
 
 /**
- * Factual definitions and measured values delete cleanly as cloze cards;
- * causal and mechanistic statements are better served by a question.
+ * The concept kind a sentence resembles, for the demo simulator.
  *
- * Delegates to the shared decision so the simulator and the provider pipeline cannot drift
- * apart: there is one place in the codebase that chooses a format, and it records a reason.
+ * The simulator reads sentences rather than concepts, so it has to translate its own classification
+ * into the vocabulary the one format decision speaks. This is deliberately the *only* place that
+ * mapping lives, and it does not decide anything: the decision itself is `decideCardFormat`, the
+ * same function the provider pipeline calls, so production has exactly one format path (F-Q).
  */
-export function selectCardFormat(sentence: string): CardFormat {
+function sentenceKind(sentence: string): ConceptKind {
   const type = classifySentence(sentence);
-  const kind =
-    type === 'definition' ? 'definition' : type === 'causal' ? 'causal' : type === 'mechanism' ? 'mechanism' : 'relational';
-  return decideCardFormat({ kind, sourceExcerpt: sentence }).format;
+  if (type === 'definition') return 'definition';
+  if (type === 'causal') return 'causal';
+  if (type === 'mechanism') return 'mechanism';
+  return 'relational';
 }
 
 /** Splits page text into candidate sentences without a lookbehind assertion. */
@@ -357,7 +360,10 @@ function buildCard(
   now: string,
   exportTags: (sentence: string) => string[]
 ): Flashcard | null {
-  const format = selectCardFormat(sentence.text);
+  const format = decideCardFormat({
+    kind: sentenceKind(sentence.text),
+    sourceExcerpt: sentence.text,
+  }).format;
   const base = {
     id,
     deckId: req.deckId,

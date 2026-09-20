@@ -702,6 +702,36 @@ function settleReservationInline(db: Database, input: SettleInput): void {
         WHERE id = ? AND state IN ('reserved', 'reconciling')`
     ).run(input.outcome, amountMinor, now, input.reservationId);
 
+    /** One row in the append-only ledger. */
+    const writeUsageRow = (amount: number, source: string): void => {
+      db.prepare(
+        `INSERT INTO usage_records
+           (id, user_id, job_id, provider_attempt_id, period_key, amount_minor, currency, source,
+            price_version, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        `usg_${crypto.randomUUID()}`,
+        reservation.user_id,
+        reservation.job_id,
+        input.providerAttemptId ?? null,
+        reservation.period_key,
+        amount,
+        input.currency,
+        source,
+        input.priceVersion,
+        now
+      );
+    };
+
+    // An uncertain hold recorded the figure nobody could verify. Resolving it has to stop that
+    // estimate counting as money, and the ledger is append-only — so the estimate is reversed by a
+    // row of its own rather than written over, and the figure that was established is recorded
+    // beside it (or, for a release, not recorded at all). Afterwards the ledger's own total is
+    // what was finally decided, which is what makes it a record of spend rather than of intentions.
+    if (reservation.state === 'reconciling' && reservation.amount_minor !== 0) {
+      writeUsageRow(-reservation.amount_minor, input.source);
+    }
+
     if (input.outcome === 'released') return;
 
     // The hold was a bound; the provider's own figure is the fact. When the fact is larger, the
@@ -733,23 +763,7 @@ function settleReservationInline(db: Database, input: SettleInput): void {
       );
     }
 
-    db.prepare(
-      `INSERT INTO usage_records
-         (id, user_id, job_id, provider_attempt_id, period_key, amount_minor, currency, source,
-          price_version, recorded_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(
-      `usg_${crypto.randomUUID()}`,
-      reservation.user_id,
-      reservation.job_id,
-      input.providerAttemptId ?? null,
-      reservation.period_key,
-      amountMinor,
-      input.currency,
-      input.source,
-      input.priceVersion,
-      now
-    );
+    writeUsageRow(amountMinor, input.source);
   }
 }
 
@@ -801,13 +815,132 @@ export function readAccountingIncidents(
 }
 
 /**
+ * A charge nobody has resolved yet, with enough context to resolve it.
+ *
+ * `reconciling` is the state a call is left in when the provider may have billed it and we cannot
+ * tell: a timeout, an interrupted dispatch, an answer whose usage never arrived. The money is
+ * counted, the cap respects it, and the only thing that can release it is a person who has
+ * established what the invoice says. The figures are joined from the reservation, the attempt row
+ * and the job so that decision can be made from this list rather than by opening the database.
+ */
+export interface UncertainCharge {
+  reservationId: string;
+  userId: string;
+  userEmail: string | null;
+  jobId: string | null;
+  jobState: string | null;
+  deckId: string | null;
+  /** Stable id shared by the reservation and its attempt row. */
+  attemptId: string | null;
+  /** The attempt row, when one was written; `null` for a hold taken outside a job. */
+  providerAttemptId: string | null;
+  phase: string | null;
+  attemptModel: string | null;
+  attemptStatus: string | null;
+  attemptErrorCode: string | null;
+  /** The model the hold was priced for. */
+  model: string | null;
+  amountMinor: number;
+  periodKey: string;
+  createdAt: string;
+}
+
+/**
+ * Every unresolved charge, newest first.
+ *
+ * Deliberately not restricted to the current period by default: an uncertain charge from last
+ * month still needs a decision, and hiding it because the period rolled over is how a ledger
+ * stops matching an invoice. Filtering by period or user is available for a caller that wants it.
+ */
+export function readUncertainCharges(
+  db: Database,
+  filter: { periodKey?: string; userId?: string } = {}
+): UncertainCharge[] {
+  const where: string[] = ["r.state = 'reconciling'"];
+  const params: string[] = [];
+
+  if (filter.periodKey) {
+    where.push('r.period_key = ?');
+    params.push(filter.periodKey);
+  }
+  if (filter.userId) {
+    where.push('r.user_id = ?');
+    params.push(filter.userId);
+  }
+
+  const rows = db
+    .query(
+      `SELECT r.id AS reservation_id, r.user_id, u.email AS user_email, r.job_id,
+              r.attempt_id, r.period_key, r.amount_minor, r.created_at, r.model AS reserved_model,
+              j.state AS job_state, j.deck_id,
+              a.id AS provider_attempt_id, a.phase, a.model AS attempt_model,
+              a.status AS attempt_status, a.error_code AS attempt_error_code
+         FROM budget_reservations r
+         LEFT JOIN users u ON u.id = r.user_id
+         LEFT JOIN provider_attempts a ON a.attempt_id = r.attempt_id
+         LEFT JOIN generation_jobs j ON j.id = r.job_id
+        WHERE ${where.join(' AND ')}
+        ORDER BY r.created_at DESC`
+    )
+    .all(...params) as Array<{
+    reservation_id: string;
+    user_id: string;
+    user_email: string | null;
+    job_id: string | null;
+    attempt_id: string | null;
+    period_key: string;
+    amount_minor: number;
+    created_at: string;
+    reserved_model: string | null;
+    job_state: string | null;
+    deck_id: string | null;
+    provider_attempt_id: string | null;
+    phase: string | null;
+    attempt_model: string | null;
+    attempt_status: string | null;
+    attempt_error_code: string | null;
+  }>;
+
+  return rows.map(row => ({
+    reservationId: row.reservation_id,
+    userId: row.user_id,
+    userEmail: row.user_email,
+    jobId: row.job_id,
+    jobState: row.job_state,
+    deckId: row.deck_id,
+    attemptId: row.attempt_id,
+    providerAttemptId: row.provider_attempt_id,
+    phase: row.phase,
+    attemptModel: row.attempt_model,
+    attemptStatus: row.attempt_status,
+    attemptErrorCode: row.attempt_error_code,
+    model: row.reserved_model ?? row.attempt_model,
+    amountMinor: row.amount_minor,
+    periodKey: row.period_key,
+    createdAt: row.created_at,
+  }));
+}
+
+/**
  * Corrects an uncertain charge once a person has established what the provider actually billed.
  *
  * The hold was taken because the outcome was genuinely unknown. Resolving it is an explicit act:
  * `charged` with the figure the invoice shows, or `released` when the provider confirms nothing was
  * billed. There is no automatic refund, because a timeout that silently disappears is exactly how
  * a ledger stops matching an invoice.
+ *
+ * `actorId` is required and recorded (`reconciled_by`): money moving because somebody decided it
+ * should is a different fact from money moving because a call succeeded, and the ledger has to be
+ * able to tell them apart afterwards.
  */
+export interface ReconcileResult {
+  ok: boolean;
+  reason?: 'reservation_not_found' | 'not_reconciling';
+  /** What the charge was resolved to, so the caller can report the decision it just made. */
+  outcome?: 'charged' | 'released';
+  amountMinor?: number;
+}
+
 export function reconcileReservation(
   db: Database,
   input: {
@@ -819,8 +952,8 @@ export function reconcileReservation(
     priceVersion: string;
     note?: string;
   }
-): { ok: boolean; reason?: string } {
-  return db.transaction(() => {
+): ReconcileResult {
+  return db.transaction((): ReconcileResult => {
     const reservation = db
       .query('SELECT id, state, amount_minor, user_id, period_key FROM budget_reservations WHERE id = ?')
       .get(input.reservationId) as
@@ -831,18 +964,50 @@ export function reconcileReservation(
     // Only an uncertain charge is reconcilable: settling something twice would misstate the ledger.
     if (reservation.state !== 'reconciling') return { ok: false, reason: 'not_reconciling' };
 
+    const amountMinor = input.outcome === 'released' ? 0 : Math.max(0, input.amountMinor);
+
     settleReservationInline(db, {
       reservationId: input.reservationId,
       outcome: input.outcome,
-      amountMinor: input.outcome === 'released' ? 0 : input.amountMinor,
+      amountMinor,
       source: 'provider_reported',
       priceVersion: input.priceVersion,
       currency: input.currency,
       model: null,
     });
 
-    return { ok: true };
+    // The decision, not the amount: the amount is a `usage_records` row, and the reservation holds
+    // the state it settled into. This is who to ask about it later.
+    db.prepare(
+      `UPDATE budget_reservations
+          SET reconciled_by = ?, reconciled_at = ?, reconcile_note = ?
+        WHERE id = ?`
+    ).run(input.actorId, new Date().toISOString(), input.note ?? null, input.reservationId);
+
+    return { ok: true, outcome: input.outcome, amountMinor };
   })();
+}
+
+/** Who resolved a charge and why, or `null` when it is still open. Read from the reservation. */
+export function readReconciliationAudit(
+  db: Database,
+  reservationId: string
+): { reconciledBy: string | null; reconciledAt: string | null; note: string | null } | null {
+  const row = db
+    .query(
+      'SELECT reconciled_by, reconciled_at, reconcile_note FROM budget_reservations WHERE id = ?'
+    )
+    .get(reservationId) as
+    | { reconciled_by: string | null; reconciled_at: string | null; reconcile_note: string | null }
+    | null;
+
+  if (!row) return null;
+
+  return {
+    reconciledBy: row.reconciled_by,
+    reconciledAt: row.reconciled_at,
+    note: row.reconcile_note,
+  };
 }
 
 /**

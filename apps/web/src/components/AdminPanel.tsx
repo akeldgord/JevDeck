@@ -3,6 +3,7 @@ import { SystemUsageStats } from '@jevdeck/contracts';
 import { Capability } from '../config/capabilities';
 import { UnavailablePanel } from './UnavailablePanel';
 import { SimulatedBadge } from './DemoBanner';
+import { BudgetReport, UncertainCharge } from '../lib/api';
 import {
   Shield,
   Users,
@@ -14,6 +15,8 @@ import {
   Send,
   Loader2,
   AlertCircle,
+  AlertTriangle,
+  Receipt,
   UserMinus,
   UserCheck,
 } from 'lucide-react';
@@ -26,6 +29,13 @@ export interface AdminUserRow {
   role: 'admin' | 'member';
   status: 'active' | 'disabled';
   monthlySpendLimitUsd: number;
+  /**
+   * What this account has spent or holds this period, from the reservations themselves.
+   *
+   * `null` means no accounting figure was read at all — it is not a claim that the account spent
+   * nothing, and the column says so rather than printing a zero.
+   */
+  committedMinor: number | null;
 }
 
 export interface AdminInvitationRow {
@@ -47,6 +57,16 @@ interface Props {
    * shown comes from a stored row, and an absent one is reported as absent.
    */
   stats: SystemUsageStats | null;
+  /** The stored accounting position, or `null` when it could not be read. */
+  budget: BudgetReport | null;
+  /**
+   * Resolves one uncertain charge. `charged` carries the figure the invoice shows; `released`
+   * states that nothing was billed. The server refuses to guess either way.
+   */
+  onReconcileCharge: (
+    reservationId: string,
+    body: { outcome: 'charged' | 'released'; amountMinor?: number }
+  ) => Promise<void>;
   onInviteUser: (email: string, monthlySpendLimitUsd: number) => Promise<void>;
   onRevokeInvitation: (id: string) => Promise<void>;
   onUpdateInstanceCap: (newCapUsd: number) => void;
@@ -65,6 +85,8 @@ export const AdminPanel: React.FC<Props> = ({
   users,
   invitations,
   stats,
+  budget,
+  onReconcileCharge,
   onInviteUser,
   onRevokeInvitation,
   onUpdateInstanceCap,
@@ -204,10 +226,86 @@ export const AdminPanel: React.FC<Props> = ({
             <h2 className="text-sm font-bold text-slate-300">Instance spending</h2>
           </div>
           <p className="text-xs text-slate-400 leading-relaxed">
-            No usage ledger exists yet, so there are no spend or token figures to show and none
-            are invented. Provider calls, reservations and reconciliation arrive with the
-            usage-accounting workstream.
+            The accounting endpoint returned no figures, so none are shown and none are invented.
+            Every number on this screen comes from a stored reservation, ledger row or attempt row;
+            the message above says why the read failed.
           </p>
+        </div>
+      )}
+
+      {/*
+        Unresolved charges — the one part of the accounting a person has to act on.
+
+        Shown only when the accounting was actually read: an empty list here would otherwise claim
+        "nothing is owed" when the truth is "we could not find out".
+      */}
+      {budget && (
+        <div className="bg-slate-900/60 border border-slate-800 rounded-3xl p-6 sm:p-8 backdrop-blur-md shadow-xl space-y-5">
+          <div className="flex items-center gap-2">
+            <Receipt className="w-4 h-4 text-amber-400" />
+            <h3 className="text-base font-bold text-slate-100">
+              Unresolved charges ({budget.uncertain.length})
+            </h3>
+          </div>
+
+          <p className="text-xs text-slate-400 leading-relaxed">
+            A call that timed out or was cut off after it was sent may still have been billed, so its
+            hold stays counted against the caps — {money(budget.reconcilingMinor, budget.currency)} of
+            this period’s total — until somebody establishes what the invoice says. Nothing is
+            released automatically: an uncertain charge that quietly disappeared is exactly how a
+            ledger stops matching an invoice.
+          </p>
+
+          {budget.uncertain.length === 0 ? (
+            <div className="text-xs text-slate-500 rounded-2xl border border-slate-800 bg-slate-950/40 p-4">
+              No charge is waiting on a decision.
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {budget.uncertain.map(charge => (
+                <UncertainChargeRow
+                  key={charge.reservationId}
+                  charge={charge}
+                  currency={budget.currency}
+                  busy={busy}
+                  onReconcile={onReconcileCharge}
+                />
+              ))}
+            </div>
+          )}
+
+          {budget.incidents.length > 0 && (
+            <div className="space-y-2 border-t border-slate-800/80 pt-4">
+              <div className="flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 text-amber-400" />
+                <h4 className="text-sm font-bold text-slate-200">
+                  Overspend incidents ({budget.incidents.length}) this period
+                </h4>
+              </div>
+              <p className="text-[11px] text-slate-500 leading-relaxed">
+                Charges that came in above the hold taken for them. Each is counted in full — the cap
+                already reflects it — so this is an estimation defect to correct, not a bill to
+                dispute.
+              </p>
+              <ul className="space-y-2">
+                {budget.incidents.map(incident => (
+                  <li
+                    key={incident.id}
+                    className="rounded-2xl border border-amber-900/40 bg-amber-950/10 p-3 text-[11px] text-amber-100/90 leading-relaxed"
+                  >
+                    <div className="flex flex-wrap gap-x-3 gap-y-1 font-mono text-amber-200/90">
+                      <span>over {money(incident.overMinor, incident.currency)}</span>
+                      <span>held {money(incident.reservedMinor, incident.currency)}</span>
+                      <span>charged {money(incident.chargedMinor, incident.currency)}</span>
+                      {incident.model && <span>{incident.model}</span>}
+                      <span>{incident.createdAt}</span>
+                    </div>
+                    <p className="mt-1 text-amber-100/80">{incident.detail}</p>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </div>
       )}
 
@@ -250,7 +348,8 @@ export const AdminPanel: React.FC<Props> = ({
                 className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono text-emerald-400 focus:outline-none focus:border-emerald-500"
               />
               <p className="text-[10px] text-slate-500 mt-1">
-                Recorded on the account. Spending is not enforced yet — no ledger exists.
+                Recorded on the account and enforced server-side: a call that would cross this
+                account’s cap is refused before it is made.
               </p>
             </div>
 
@@ -383,8 +482,17 @@ export const AdminPanel: React.FC<Props> = ({
                   <td className="py-3.5 text-slate-300">
                     ${user.monthlySpendLimitUsd.toFixed(2)}
                   </td>
-                  <td className="py-3.5 text-slate-500" title="No usage ledger exists yet">
-                    not tracked
+                  <td className="py-3.5 text-slate-300">
+                    {user.committedMinor === null ? (
+                      <span
+                        className="text-slate-500"
+                        title="No accounting figure was read, so this account's spend is unknown rather than zero."
+                      >
+                        not read
+                      </span>
+                    ) : (
+                      `$${(user.committedMinor / 100).toFixed(2)}`
+                    )}
                   </td>
                   <td className="py-3.5 font-sans">
                     <span
@@ -437,6 +545,116 @@ export const AdminPanel: React.FC<Props> = ({
     </div>
   );
 };
+
+/**
+ * One uncertain charge, with the two decisions a person can take about it.
+ *
+ * The input starts at the figure that was held, because that is the only number on hand — but it
+ * is editable and it is what gets recorded, so a hold that turns out to be wrong is corrected here
+ * rather than rounded to whatever we assumed.
+ */
+const UncertainChargeRow: React.FC<{
+  charge: UncertainCharge;
+  currency: string;
+  busy: boolean;
+  onReconcile: Props['onReconcileCharge'];
+}> = ({ charge, currency, busy, onReconcile }) => {
+  const [amount, setAmount] = useState((charge.amountMinor / 100).toFixed(2));
+  const [resolving, setResolving] = useState(false);
+
+  const resolve = async (outcome: 'charged' | 'released') => {
+    const parsed = Number(amount);
+    if (outcome === 'charged' && (!Number.isFinite(parsed) || parsed < 0)) return;
+
+    setResolving(true);
+    try {
+      await onReconcile(charge.reservationId, {
+        outcome,
+        ...(outcome === 'charged' ? { amountMinor: Math.round(parsed * 100) } : {}),
+      });
+    } finally {
+      setResolving(false);
+    }
+  };
+
+  return (
+    <div className="rounded-2xl border border-slate-800 bg-slate-950/40 p-4 space-y-3">
+      <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-3">
+        <div className="space-y-1 min-w-0">
+          <div className="text-sm font-semibold text-slate-200">
+            {money(charge.amountMinor, currency)} held
+            {charge.phase && (
+              <span className="text-slate-500 font-normal"> · {charge.phase} call</span>
+            )}
+          </div>
+          <div className="text-[11px] font-mono text-slate-500 break-all">
+            {charge.userEmail ?? charge.userId}
+            {charge.attemptModel && ` · ${charge.attemptModel}`}
+            {charge.attemptStatus && ` · ${charge.attemptStatus}`}
+            {charge.attemptErrorCode && ` · ${charge.attemptErrorCode}`}
+          </div>
+          <div className="text-[11px] text-slate-500">
+            {charge.periodKey}
+            {charge.jobId
+              ? ` · job ${charge.jobId}${charge.jobState ? ` (${charge.jobState})` : ''}`
+              : ' · outside a job'}
+            {' · '}
+            {describeAge(charge.createdAt)}
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 flex-shrink-0">
+          <input
+            type="number"
+            min={0}
+            step="0.01"
+            value={amount}
+            onChange={event => setAmount(event.target.value)}
+            aria-label="Amount the provider billed"
+            className="w-24 px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-700 text-xs font-mono text-emerald-400"
+          />
+          <button
+            onClick={() => void resolve('charged')}
+            disabled={resolving || busy}
+            className="px-2.5 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:bg-slate-800 disabled:text-slate-500 text-slate-950 text-xs font-bold transition-colors"
+          >
+            Count as charged
+          </button>
+          <button
+            onClick={() => void resolve('released')}
+            disabled={resolving || busy}
+            className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 text-xs font-medium transition-colors"
+          >
+            Nothing was billed
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+/** `$12.34`, or the code in front of the figure for a currency that does not use `$`. */
+function money(minor: number, currency: string): string {
+  const amount = (minor / 100).toFixed(2);
+  return currency.toUpperCase() === 'USD' ? `$${amount}` : `${currency} ${amount}`;
+}
+
+/** How long a charge has been waiting, from its own timestamp. */
+function describeAge(createdAt: string): string {
+  const elapsedMs = Date.now() - Date.parse(createdAt);
+  if (!Number.isFinite(elapsedMs)) return 'age unknown';
+  if (elapsedMs < 0) return 'held just now';
+
+  const minutes = Math.floor(elapsedMs / 60_000);
+  if (minutes < 1) return 'held for under a minute';
+  if (minutes < 60) return `held for ${minutes} minute${minutes === 1 ? '' : 's'}`;
+
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `held for ${hours} hour${hours === 1 ? '' : 's'}`;
+
+  const days = Math.round(hours / 24);
+  return `held for ${days} day${days === 1 ? '' : 's'}`;
+}
 
 function describeExpiry(expiresAt: string): string {
   const remainingMs = Date.parse(expiresAt) - Date.now();

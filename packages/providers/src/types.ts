@@ -158,6 +158,14 @@ export interface PreparedCall<T> {
   /** Whether the request asks for a JSON object. */
   jsonMode: boolean;
   /**
+   * How long the transport will wait for this call before aborting it.
+   *
+   * Part of the prepared call rather than of the send step, because it decides what a failure
+   * *means*: a call that was aborted after it reached the provider may still have been billed, so
+   * the attempt row has to record the timeout it was dispatched under (remediation F-N).
+   */
+  timeoutMs: number;
+  /**
    * Input tokens as counted by the provider's own tokenizer, when one is available.
    *
    * `null` means no counter is configured, and the caller must fall back to a conservative

@@ -16,6 +16,7 @@ import { buildDeckList } from './lib/deckList';
 import { documentUploadPayload, retainsOriginal } from './lib/documentPayload';
 import { saveBytes } from './lib/download';
 import {
+  BudgetReport,
   DailyAllowance,
   GenerationJob,
   JobConcept,
@@ -101,7 +102,16 @@ export default function App() {
   // Usage figures. In demo mode these are simulated and labelled; otherwise they are read from
   // the ledger the enforcement used, and an absent limit is reported as an absent limit.
   const [stats, setStats] = useState<SystemUsageStats | null>(demo?.stats ?? null);
+  /** The caller's own spending position. */
   const [budget, setBudget] = useState<SpendReport | null>(null);
+  /**
+   * The installation-wide accounting the administrator screen acts on.
+   *
+   * Kept apart from `budget` above, which is the signed-in account's own report and carries no
+   * other account's figures. `null` means the accounting could not be read — the screen says so
+   * rather than showing an empty ledger.
+   */
+  const [adminBudget, setAdminBudget] = useState<BudgetReport | null>(null);
   const [demoInvitations, setDemoInvitations] = useState<Invitation[]>(demo?.invitations ?? []);
 
   // The caller's own scheduling state, as stored. What makes a session survive a reload: the
@@ -252,6 +262,8 @@ export default function App() {
       // Real figures only: every number here comes from the ledger, the attempt rows or a count
       // of stored rows. The token cap stays 0 because no token cap is enforced — the panel says
       // so rather than implying a limit of zero tokens.
+      setAdminBudget(budget.budget);
+
       setStats({
         instanceTotalSpendUsd: budget.budget.committedMinor / 100,
         instanceMonthlyCapUsd: (budget.budget.limitMinor ?? 0) / 100,
@@ -262,6 +274,13 @@ export default function App() {
         totalDocumentsProcessed: budget.budget.counts.documents,
       });
 
+      // Each account's spend comes from the same reservations the caps check, so the roster and
+      // the limits cannot disagree. An account with no reservations this period has no row, which
+      // is zero spent rather than an unknown figure.
+      const spendByUser = new Map(
+        budget.budget.perUser.map(entry => [entry.userId, entry.committedMinor])
+      );
+
       setAdminUsers(
         users.users.map(user => ({
           id: user.id,
@@ -270,6 +289,7 @@ export default function App() {
           role: user.role,
           status: user.status,
           monthlySpendLimitUsd: user.monthlySpendLimitMinor / 100,
+          committedMinor: spendByUser.get(user.id) ?? 0,
         }))
       );
       setAdminInvitations(
@@ -297,6 +317,8 @@ export default function App() {
           role: user.role,
           status: user.status,
           monthlySpendLimitUsd: user.monthlySpendLimitUsd,
+          // The demo roster is synthetic, so there is no stored spend behind it to show.
+          committedMinor: null,
         }))
       );
       setAdminInvitations(
@@ -1235,6 +1257,35 @@ export default function App() {
     }
   };
 
+  /**
+   * Records what an administrator established about one uncertain charge.
+   *
+   * The decision is theirs, not the app's: `charged` sends the figure they entered, `released`
+   * states that nothing was billed. Both go through the server, so the ledger — and the cap it
+   * enforces — reflect the decision rather than a guess made here.
+   */
+  const handleReconcileCharge = async (
+    reservationId: string,
+    input: { outcome: 'charged' | 'released'; amountMinor?: number }
+  ) => {
+    if (isDemoMode) return;
+
+    setAdminBusy(true);
+    setAdminError(null);
+
+    try {
+      await api.reconcileCharge(reservationId, input);
+      await loadAdministration();
+      await loadUsage();
+    } catch (cause) {
+      setAdminError(
+        cause instanceof Error ? cause.message : 'That charge could not be reconciled.'
+      );
+    } finally {
+      setAdminBusy(false);
+    }
+  };
+
   const clearInvitationFromUrl = () => {
     setInviteToken(null);
     if (typeof window !== 'undefined') {
@@ -1470,6 +1521,8 @@ export default function App() {
                     : adminInvitations
                 }
                 stats={stats}
+                budget={adminBudget}
+                onReconcileCharge={handleReconcileCharge}
                 onInviteUser={handleInviteUser}
                 onRevokeInvitation={handleRevokeInvitation}
                 onUpdateInstanceCap={handleUpdateInstanceCap}

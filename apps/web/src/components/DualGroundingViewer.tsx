@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
 import { DocumentPage, Flashcard } from '@jevdeck/contracts';
+import { locateExcerptRects, type HighlightRect } from '../lib/excerptGeometry';
 import {
   X,
   BookOpen,
@@ -36,17 +37,7 @@ interface Props {
   isDemo?: boolean;
 }
 
-interface HighlightBox {
-  left: number;
-  top: number;
-  width: number;
-  height: number;
-}
 
-/** Collapses whitespace and punctuation so text-layer items can be matched against an excerpt. */
-function normalizeForMatch(text: string): string {
-  return text.toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
-}
 
 export const DualGroundingViewer: React.FC<Props> = ({
   card,
@@ -59,7 +50,8 @@ export const DualGroundingViewer: React.FC<Props> = ({
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const pdfDocRef = useRef<any>(null);
-  const [highlight, setHighlight] = useState<HighlightBox | null>(null);
+  // One rectangle per line of the cited passage; empty means it could not be located.
+  const [highlight, setHighlight] = useState<HighlightRect[]>([]);
   const [isRendering, setIsRendering] = useState(false);
   const [renderError, setRenderError] = useState<string | null>(null);
 
@@ -74,7 +66,7 @@ export const DualGroundingViewer: React.FC<Props> = ({
   useEffect(() => {
     if (!card || !pdfBytes || pageNumber === null) {
       setIsRendering(false);
-      setHighlight(null);
+      setHighlight([]);
       setRenderError(null);
       return;
     }
@@ -82,7 +74,7 @@ export const DualGroundingViewer: React.FC<Props> = ({
     let cancelled = false;
     setIsRendering(true);
     setRenderError(null);
-    setHighlight(null);
+    setHighlight([]);
 
     (async () => {
       try {
@@ -106,7 +98,10 @@ export const DualGroundingViewer: React.FC<Props> = ({
         await page.render({ canvas, viewport }).promise;
         if (cancelled) return;
 
-        setHighlight(await findExcerptBox(page, viewport, excerpt));
+        const textContent = await page.getTextContent();
+        if (cancelled) return;
+
+        setHighlight(locateExcerptRects(textContent.items ?? [], excerpt, viewport));
       } catch (err: any) {
         if (!cancelled) {
           setRenderError(err?.message || 'Could not render the original page.');
@@ -226,13 +221,18 @@ export const DualGroundingViewer: React.FC<Props> = ({
               </span>
               <div className="flex items-center gap-3">
                 {usesPdf && <span className="text-[11px] bg-slate-800 px-2 py-0.5 rounded text-slate-300">Fit width</span>}
-                {usesPdf && highlight && (
+                {usesPdf && highlight.length > 0 && (
                   <span className="text-emerald-400 flex items-center gap-1 font-semibold">
                     <CheckCircle2 className="w-3.5 h-3.5" /> Excerpt located on page
+                    {highlight.length > 1 && (
+                      <span className="text-emerald-400/70 font-normal">
+                        ({highlight.length} lines)
+                      </span>
+                    )}
                   </span>
                 )}
                 {/* R4: when the excerpt cannot be located, say so instead of drawing nothing. */}
-                {usesPdf && !highlight && !isRendering && !renderError && (
+                {usesPdf && highlight.length === 0 && !isRendering && !renderError && (
                   <span
                     className="text-amber-400/90 font-mono text-[11px]"
                     title="The cited text was not found in this page's text layer, so no rectangle is drawn."
@@ -250,18 +250,19 @@ export const DualGroundingViewer: React.FC<Props> = ({
                     ref={canvasRef}
                     className="rounded-xl border border-slate-800 shadow-2xl bg-white max-w-full h-auto"
                   />
-                  {highlight && (
+                  {highlight.map((rect, index) => (
                     <div
+                      key={`${rect.left}-${rect.top}-${index}`}
                       className="absolute rounded-md bg-emerald-400/30 ring-2 ring-emerald-400/70 pointer-events-none"
                       style={{
-                        left: highlight.left,
-                        top: highlight.top,
-                        width: highlight.width,
-                        height: highlight.height,
+                        left: rect.left,
+                        top: rect.top,
+                        width: rect.width,
+                        height: rect.height,
                       }}
                       title="Cited excerpt"
                     />
-                  )}
+                  ))}
                   {isRendering && (
                     <div className="absolute inset-0 flex items-center justify-center text-slate-300 gap-2 bg-slate-950/60 rounded-xl text-sm">
                       <Loader2 className="w-4 h-4 animate-spin" /> Rendering original page...
@@ -328,59 +329,8 @@ function highlightExcerpt(pageText: string, excerpt: string): React.ReactNode {
   );
 }
 
-/**
- * Locates the cited excerpt in the page text layer and returns its bounding box
- * in viewport pixels, so the viewer can highlight the passage on the real page.
+/*
+ * The measurement itself lives in `lib/excerptGeometry.ts`, so it can be exercised without a
+ * browser: it returns one rectangle per line of the passage, transformed through whatever
+ * viewport is in use, and is covered by `tests/excerptGeometry.test.ts`.
  */
-async function findExcerptBox(page: any, viewport: any, excerpt: string): Promise<HighlightBox | null> {
-  const target = normalizeForMatch(excerpt);
-  if (!target) return null;
-
-  const content = await page.getTextContent();
-  const spans: Array<{ start: number; end: number; item: any }> = [];
-  let buffer = '';
-
-  for (const item of content.items as Array<any>) {
-    if (typeof item.str !== 'string') continue;
-    const piece = normalizeForMatch(item.str);
-    if (!piece) continue;
-    const start = buffer.length;
-    buffer += piece + ' ';
-    spans.push({ start, end: buffer.length, item });
-  }
-
-  const index = buffer.indexOf(target);
-  if (index === -1) return null;
-
-  const end = index + target.length;
-  const hits = spans.filter(span => span.end > index && span.start < end);
-  if (hits.length === 0) return null;
-
-  let minX = Infinity;
-  let minY = Infinity;
-  let maxX = -Infinity;
-  let maxY = -Infinity;
-
-  for (const hit of hits) {
-    const transform = hit.item.transform as number[];
-    const x = transform[4];
-    const y = transform[5];
-    const width = typeof hit.item.width === 'number' ? hit.item.width : 0;
-    const height = typeof hit.item.height === 'number' ? hit.item.height : Math.abs(transform[3]);
-
-    minX = Math.min(minX, x);
-    maxX = Math.max(maxX, x + width);
-    minY = Math.min(minY, y);
-    maxY = Math.max(maxY, y + height);
-  }
-
-  const [x1, y1] = viewport.convertToViewportPoint(minX, minY);
-  const [x2, y2] = viewport.convertToViewportPoint(maxX, maxY);
-
-  return {
-    left: Math.min(x1, x2),
-    top: Math.min(y1, y2),
-    width: Math.abs(x2 - x1),
-    height: Math.abs(y2 - y1),
-  };
-}

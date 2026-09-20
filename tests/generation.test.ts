@@ -4,8 +4,8 @@ import {
   CARDS_PER_WORDS,
   cardsForSection,
   classifySentence,
+  decideCardFormat,
   generateFlashcardsFromSections,
-  selectCardFormat,
 } from '../packages/generation/src';
 import { validateGrounding, detectDuplicates } from '../packages/validation/src';
 import { COVERAGE_MODES, CoverageMode, DocumentSection } from '../packages/contracts/src';
@@ -53,6 +53,14 @@ describe('Coverage and the removed workload estimate', () => {
     // R0 removed the pre-generation estimate rather than making it accurate. This guards
     // against reintroducing a projection the application cannot guarantee.
     expect('estimateWorkload' in generation).toBe(false);
+  });
+
+  it('has exactly one format decision, not a second name for it', () => {
+    // R3/F-Q: `selectCardFormat` was a second exported entry point that resolved the same
+    // question. The simulator now maps its sentence classification onto a concept kind and calls
+    // the shared decision, so this guards against the duplicate name coming back.
+    expect('selectCardFormat' in generation).toBe(false);
+    expect(typeof generation.decideCardFormat).toBe('function');
   });
 
   it('scales output with coverage', () => {
@@ -151,9 +159,31 @@ describe('Format selection is automatic and content-driven', () => {
     expect(classifySentence('Myelination increases conduction velocity by restricting ion exchange.')).toBe('mechanism');
   });
 
-  it('routes definitions to cloze and causal statements to Q&A', () => {
-    expect(selectCardFormat('The threshold potential is defined as the voltage at which currents balance.')).toBe('cloze');
-    expect(selectCardFormat('The membrane depolarizes because sodium channels open rapidly.')).toBe('qa');
+  it('routes definitions to cloze and causal statements to Q&A through the single decision', () => {
+    expect(
+      decideCardFormat({
+        kind: 'definition',
+        sourceExcerpt: 'The threshold potential is defined as the voltage at which currents balance.',
+      }).format
+    ).toBe('cloze');
+
+    expect(
+      decideCardFormat({
+        kind: 'causal',
+        sourceExcerpt: 'The membrane depolarizes because sodium channels open rapidly.',
+      }).format
+    ).toBe('qa');
+  });
+
+  it('lets the wording outrank the concept kind, so one passage has one format', () => {
+    // The content is the evidence; the kind only breaks ties. Two concepts described by the same
+    // sentence cannot therefore receive different formats.
+    const excerpt = 'The membrane depolarizes because sodium channels open rapidly.';
+    const asCausal = decideCardFormat({ kind: 'causal', sourceExcerpt: excerpt });
+    const asDefinition = decideCardFormat({ kind: 'definition', sourceExcerpt: excerpt });
+
+    expect(asCausal.format).toBe(asDefinition.format);
+    expect(asCausal.reason).toBe('content_cues_causal');
   });
 
   it('does not decide format from the section heading', () => {

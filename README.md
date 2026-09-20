@@ -36,11 +36,11 @@ is in the later records beside it.
 | Sessions and authorization | HttpOnly session cookies with server-side expiry and revocation, a CSRF token required on every state-changing request, login throttling, and owner-scoped resources. Disabling an account ends its access on the next request. |
 | Spaced repetition | SM-2 scheduling per user, with a per-session cram choice: each session decides whether cramming updates your long-term schedule. The study screen writes every rating to the server, undo replays the schedule, and suspension is per user, so progress survives a reload and a restart. |
 | Study queue | One eligibility function produces both the header's due count and the session queue, so they cannot disagree. New, due, suspended and later are distinguished, and daily limits are applied and explained rather than silently truncating a session. |
-| Original-page viewer | Renders the real uploaded page and locates the cited passage on it. A passage that cannot be located is labelled "exact highlight unavailable" instead of drawing an approximate rectangle. |
+| Original-page viewer | Renders the real uploaded page and locates the cited passage on it — one rectangle per line for a passage that wraps, measured from the page's own text layer through the current zoom and page rotation. A passage that cannot be located is labelled "exact highlight unavailable" instead of drawing an approximate rectangle. |
 | Text exports | Tab-separated Anki import file and a JSON bundle. |
 | Anki `.apkg` export | A real Anki collection in a ZIP, built server-side from the stored cards and their citations. Every card arrives **new**: the export is a fresh schedule, so review history, intervals and due dates are deliberately not transferred, and nothing syncs back. Multiple cloze deletions in one note become multiple Anki cards. |
 | Deck sharing | Owner-scoped grant and revoke, addressed by email, study scope only: a shared deck's cards can be studied while the owner's document stays unreadable. |
-| Budget accounting | An append-only usage ledger with per-user and installation-wide monthly caps, reserved before each provider call and settled after it, so concurrent jobs cannot exceed the available reservation. |
+| Budget accounting | An append-only usage ledger with per-user and installation-wide monthly caps, reserved before each provider call and settled after it, so concurrent jobs cannot exceed the available reservation. A charge whose cost could not be established is listed for an administrator to resolve, and a charge above its hold is reported as an incident. |
 | Input formats | PDF, Word (`.docx`), PowerPoint (`.pptx`), Markdown, plain text and pasted notes, each read by its own reader into one storage shape. A page that yields no text is recorded as **blank** (a confirmed result) or as **unread content** (a picture this build could not read), and the two are reported separately. Formats this build cannot read are refused with the step that would fix it. OCR is not implemented, so a scanned page is reported unread rather than read. |
 | Stored media | Images a `.docx` or `.pptx` actually carries are stored beside their version, listed with the page they sit on (or recorded as unanchored when the format did not place them), and served one at a time to the account that owns the document. PDF images are **not** extracted, and the `.apkg` bundles no media. |
 | Deck browsing | A **Decks** tab lists the caller's decks and the decks shared with them, with open, study, export and delete offered only where the server allows it, and the reason stated where it does not. Deleting a deck deletes its cards and keeps its document. |
@@ -186,6 +186,19 @@ discover a ceiling by hitting it.
 | Repair attempts per card | 1 | `MAX_REPAIR_ATTEMPTS` |
 | Provider call timeout | 90 s (`JEVDECK_PROVIDER_TIMEOUT_MS`) | the transport aborts the request |
 | Job attempts | 3 | `DEFAULT_MAX_ATTEMPTS`, behind a 5 s backoff |
+
+### Resolving an uncertain charge
+
+A provider call that times out, or whose dispatch is interrupted after it was sent, may still have
+been billed. Such a call is left in `reconciling`: its hold stays counted against both caps, and the
+ledger records it labelled as an estimate. Nothing releases that money automatically, because an
+uncertain charge that quietly disappears is how a ledger stops matching an invoice.
+
+An administrator resolves it from the Admin tab, or with
+`POST /api/admin/budget/uncertain/:id/reconcile` and a body of `{"outcome":"charged","amountMinor":137}`
+or `{"outcome":"released"}`. The figure is required for a charge rather than inferred, the decision
+is recorded with the administrator who made it (`reconciled_by`), and a charge above its hold is
+reported as an overspend incident on the same screen and in `GET /api/admin/budget`.
 
 **What is not established.** There is no measured page-count or worker-memory ceiling, so this
 project does not claim one: “unlimited textbook support” is not a support claim it can back. Large

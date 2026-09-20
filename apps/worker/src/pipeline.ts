@@ -287,6 +287,7 @@ async function attempt<T>(
       temperature: call.temperature,
       maxOutputTokens: call.maxOutputTokens,
       jsonMode: call.jsonMode,
+      timeoutMs: call.timeoutMs,
       countedInputTokens: call.countedInputTokens,
       priceVersion: pricing.priceVersion,
       billingOutlook: billing,

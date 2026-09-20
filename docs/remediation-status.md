@@ -60,6 +60,24 @@ The findings with evidence are in the sections below it.
 > a checkpoint written for a different pipeline refused with the work redone rather than reused.
 > The remaining V2-5 gaps are unchanged and named in the row: PDF image extraction, OCR, and media
 > in the `.apkg`.
+>
+> **Update, same date, after closing R5's last gap.** The R5 rows in §1, §5 and §7 all named the same
+> missing piece: an uncertain charge stayed counted for ever because nothing let a person resolve it,
+> and a charge above its hold was recorded but never shown. `GET /api/admin/budget` now returns the
+> unresolved holds themselves, the period's overspend incidents and each account's committed figure;
+> `POST /api/admin/budget/uncertain/:id/reconcile` records the decision — the invoice figure or
+> “nothing was billed” — together with the administrator who made it (`reconciled_by`, migration
+> `0008`), and the administrator screen presents both. `tests/api-budget-admin.test.ts` drives all of
+> it through the real server. Two defects that suite found are fixed with it: a release left the
+> ledger still claiming the estimate it had superseded (F-AB), and `reconcileReservation` accepted an
+> `actorId` and a note that it then discarded, so the act was unattributable (F-AC). **F-N and F-Q are
+> closed in this pass too**: the per-call timeout is stored on the attempt row (migration `0007`), and
+> the duplicate `selectCardFormat` name is gone rather than documented as surviving. The pass also
+> closed R4's two remaining mechanics: the viewer now highlights **one rectangle per line** of a
+> wrapped passage instead of one box around the whole block, and the measurement moved into
+> `apps/web/src/lib/excerptGeometry.ts`, which `tests/excerptGeometry.test.ts` exercises at two zoom
+> levels and on a rotated page by supplying the viewport transform itself. What R4 still lacks is a
+> browser check, which no test here can stand in for.
 
 ## 1. Requirement-to-evidence matrix
 
@@ -69,8 +87,8 @@ The findings with evidence are in the sections below it.
 | R1 | P0 | **Implemented and verified** | `apps/api/migrations/*`; `apps/api/src/auth/*`; 41 tests in `tests/api-r1.test.ts` (bootstrap once, invitation single-use/expiry/revocation, cross-user 404s, disable revokes access, restart retention) | Authentication is first-party: Bun's argon2id for hashing plus an owned session/CSRF/throttling layer, not a third-party auth library |
 | R2 | P0 | **Implemented and verified** | `0001_init.sql` (source_blocks with raw+normalized text, page_index vs page_label; sections with parent_id/depth; evidence with spans); the parser emits nested outline entries with parent keys, `pdfDoc.getPageLabels()`, and line-preserving text with the server deriving its own normalized copy; extraction gaps are served; 8 tests in `tests/api-r2.test.ts` plus the round-trip assertions in `tests/backup-restore.test.ts` | The three-level-outline and identical-heading cases are covered as parser-level units rather than by a browser-driven upload fixture |
 | R3 | P0 | **Implemented and verified** (mechanisms) | `packages/providers`; `apps/worker/src/{queue,pipeline,worker,run}.ts`; 21 tests in `tests/api-r3.test.ts`; 21 in `tests/providers.test.ts`; 14 in `tests/validation.test.ts` covering the deterministic layer's contract and its recorded scope boundaries | Real-provider smoke run, independent source review and the §5 quality gates are **blocked** — no provider credential in this environment. The deterministic layer cannot see direction, conflation, population or condition changes; the vocabulary check is a threshold, so a single invented entity passes it. The model call is the gate for those, and `tests/validation.test.ts` records them rather than implying coverage |
-| R4 | P0 | **Implemented** (fixtures still thin) | `DualGroundingViewer` renders the stored original and measures the highlight from the PDF text layer through the pdf.js viewport; an unlocatable passage is labelled "Exact highlight unavailable" rather than approximated; the "100% Grounding Score" badge is gone and the recorded validation codes are shown instead; a real upload whose bytes were not retained is no longer labelled a sample document | No zoom/rotation/multiline fixture, so those cases are unproven. Media extraction is not implemented (R8) |
-| R5 | P0 | **Implemented and verified** | `apps/worker/src/budget.ts`; `apps/worker/src/pipeline.ts` (reserve-then-settle around every provider call); `apps/api/src/routes/{resources,admin}.ts` (402 at dispatch, installation cap); 25 tests in `tests/api-r5.test.ts`, including two workers on two connections sharing one pool of headroom | Uncertain charges (`reconciling`, e.g. a timed-out call) stay counted, but there is no route or screen that lets a person resolve one; the excess of a charge over its hold is counted and stops the next call, and is not reported as a separate event |
+| R4 | P0 | **Implemented and verified** (geometry) | `DualGroundingViewer` renders the stored original and measures the highlight from the PDF text layer through the pdf.js viewport; an unlocatable passage is labelled "Exact highlight unavailable" rather than approximated; the "100% Grounding Score" badge is gone and the recorded validation codes are shown instead; a real upload whose bytes were not retained is no longer labelled a sample document | The geometry is verified by `tests/excerptGeometry.test.ts` (10 tests) rather than by eye: a three-line passage yields one rectangle per line with the gaps left unhighlighted, a baseline jitter within a line stays one rectangle, a passage spanning a line break gets two, two zoom levels scale every rectangle exactly, and a 90° page transposes each rectangle while keeping it axis-aligned and inside the page. What remains unverified is the rendered result: no browser was driven. Media extraction is not implemented (R8) |
+| R5 | P0 | **Implemented and verified** | `apps/worker/src/budget.ts`; `apps/worker/src/pipeline.ts` (reserve-then-settle around every provider call); `apps/api/src/routes/{resources,admin}.ts` (402 at dispatch, installation cap); 25 tests in `tests/api-r5.test.ts`, including two workers on two connections sharing one pool of headroom | Uncertain charges stay counted until a person resolves them, and all three ways to do so now exist: the Admin tab lists them, `POST /api/admin/budget/uncertain/:id/reconcile` records the decision with the administrator who made it, and a charge above its hold is reported as an incident on the same screen. The remaining prerequisite is human (who watches it, and what the invoice says), not a missing route |
 | R6 | P1 | **Implemented and verified** | Study writes every rating to `POST /api/cards/:id/reviews` and renders the schedule the server returned; undo replays it; `GET /api/decks/:id/schedule` supplies due/new counts and suspensions; one `selectStudyQueue` produces both the header count and the session queue; Space/1–4/Z/S shortcuts implemented; sharing has a write path; deck↔document isolation asserted. `tests/api-r6.test.ts`, `tests/study.test.ts`, `tests/workflow.test.ts`, `tests/api-share-export.test.ts` | Deck browsing was absent in this pass and is implemented under §7's V2-5. Multiple decks per document remain absent by requirement, not by omission: one document backs one deck (see §2) |
 | R7 | P1 | **Implemented** (export contract corrected by V2-4 — see §7) | `packages/anki_export/src/apkg.ts` writes a real Anki collection (`collection.anki2`, ZIP-store) from stored rows; `GET /api/decks/:id/export.apkg` serves it; `tests/anki-apkg.test.ts` opens the produced archive and asserts the schema, notes, cards and media map | Superseded by §7: the export is a **fresh schedule** and a cloze note yields one card per deletion. Not imported into a real Anki client in this environment; the package bundles no media, and after V2-5 that is a stated scope decision rather than a missing capability — stored images stay in JevDeck and each card cites its page |
 | R8 | P1 | **Implemented for the text formats; OCR absent** | PDF, `.docx`, `.pptx`, Markdown, text and pasted notes are read into one storage shape by `packages/ingestion` and the browser PDF reader; format, pagination rule and the reader's limitations are stored with the document and served back; a page with no text is stored as `blank` or `image-only` and the two are reported separately; `.docx`/`.pptx` images are stored and served owner-only; unrecognised formats are refused with the step that fixes them (`tests/ingestion.test.ts`, `tests/api-v2-5.test.ts`) | **OCR is absent**, so a scan or an image input is reported as unread content rather than read; **PDF images are not extracted**; a long run can be paused, resumed or cancelled rather than left to restart its plan (`tests/api-cancel.test.ts`, `tests/api-resume.test.ts`), but the final deck write is one transaction rather than a resumable step; large documents are bounded by the per-call source limit; published operational limits are in `README.md` |
@@ -100,9 +118,9 @@ Severity is about product truthfulness and correctness, not effort.
 | F-K | Medium | "100% Grounding Score" is a value no measurement produced | **Fixed** (badge removed) |
 | F-L | Medium | No honest "exact highlight unavailable" state | **Fixed** |
 | F-M | Low | A real uploaded document is labelled "Sample document" when its bytes were not retained | **Fixed** |
-| F-N | Low | Provider call settings are not persisted | Open |
+| F-N | Low | Provider call settings are not persisted | **Fixed** for this update |
 | F-O | Low | The downloaded webfont does not apply; animation classes are inert | **Fixed** |
-| F-Q | Low | `selectCardFormat` remains as a second name for the format decision | Open |
+| F-Q | Low | `selectCardFormat` remained as a second name for the format decision | **Fixed** for this update (removed) |
 | F-R | Low | `.env.example` cannot be created in this workspace | Blocked by tooling |
 | F-S | Critical | The production web bundle **did not build**: the export package re-exported the `.apkg` writer, which imports `bun:sqlite`, from the same module the browser imports | **Fixed** for this update |
 | F-T | Medium | `tsc -b` reported an error in `createBackup` (`VACUUM INTO ?` bound as a scalar where Bun's types require an array) | **Fixed** for this update |
@@ -242,6 +260,39 @@ freebuff-env command.` The specification anticipates this case and asks for the 
 which this is; the variables themselves are documented in the README table and
 `docs/self-hosting.md`.
 
+### F-AB — a released charge was reversed on the reservation and left standing in the ledger
+
+`settleReservation` writes a ledger row when an uncertain hold is taken, at the estimated amount and
+labelled `estimated` — which is right, because the money may have been spent. When a person then
+reconciled that hold, only the reservation changed: `released` set the reservation to zero and
+`return`ed before the ledger, and a `charged` reconciliation added the invoice row beside the
+estimate it had superseded. Either way `usage_records` went on claiming money that had been decided
+against, so any report of what a period cost — the ledger is meant to *be* that record — overstated
+it by the difference. Nothing enforced the caps wrongly (they read the reservations), which is why
+the unit test that covered `reconcileReservation` passed.
+
+**Reproducer.** Settle a hold of 250 as `reconciling`, then reconcile it as `released`: the
+reservation totals fall to 0 while `SUM(usage_records.amount_minor)` stays at 250.
+
+**Fix.** A reconciliation appends the reversal of the estimate (`-estimate`) and, for `charged`, the
+decided figure beside it, so the ledger's own total lands on what was finally decided and the
+original estimate is still visible in history. `tests/api-budget-admin.test.ts` asserts both halves:
+released leaves a total of 0, charged leaves the invoice figure.
+
+### F-AC — the reconciliation accepted an actor and a note it discarded
+
+`reconcileReservation` took an `actorId` and an optional `note` and used neither: the reservation's
+state changed, the ledger gained a row, and nothing recorded who decided that money should move or
+why. An operator reading the ledger afterwards could see the correction but not who authorised it.
+The route added in this pass passes both, so the gap was between two callers rather than invisible —
+but the parameter that promises attribution and does nothing with it is the failure mode this
+repository exists to remove.
+
+**Fix.** Migration `0008` adds `reconciled_by`, `reconciled_at` and `reconcile_note` to
+`budget_reservations`, the settle path writes them in the same transaction that settles the charge,
+and `readReconciliationAudit` reads them back. The route requires an authenticated administrator for
+the actor; `tests/api-budget-admin.test.ts` asserts the recorded id and note.
+
 ## 3. What was fixed in earlier passes
 
 F-A, F-B and F-P below were fixed while this audit was being written.
@@ -376,6 +427,9 @@ contract case per rule exposed this.
 | Ingestion readers against real containers | `tests/ingestion.test.ts` (32 tests) builds deflated and stored ZIP containers in the test and reads them: `.docx` paragraphs, heading-style nesting, stated page breaks, an image anchored to the paragraph that holds it, and a stated blank page kept as a page so later numbering does not shift; `.pptx` one page per slide with title, body and notes, slide images anchored and theme artwork not; Markdown headings as sections, ignoring headings inside code fences; virtual pagination for text that states no pages; every refused format carrying the step that fixes it |
 | Multi-format round trip and media authorization | `tests/api-v2-5.test.ts` (11 tests): format, pagination and limitations survive storage and reload; the list reports readable, unread and blank separately; the original is served under the format's own media type; an unknown format is refused; media is listed without bytes and served byte-for-byte to its owner; a shared reader studies the cards and gets 404 for the document, its source and its figures; decks list by access; export and delete are owner-only (403 for a shared deck, 404 for a stranger); deleting a deck keeps its document |
 | Browser-facing rules as pure functions | `tests/deckList.test.ts` (9) and `tests/readReport.test.ts` (6): what each row may offer matches what the endpoints allow, a deck whose document was deleted says why it cannot be reopened, the two coverage labels are the only ones, and the report built from a parse and the report built from stored rows agree on every count they both know |
+| Resolving an uncertain charge through the real server | `tests/api-budget-admin.test.ts` (7 tests) writes the holds with `reserveBudget`/`settleReservation` and then drives the administrator route: the report lists each unresolved hold with its account, model, attempt and period and its figures equal `readUsageTotals`; an overspend of 5 → 9 is reported as an incident naming the model and how far the estimate was out, with the attempt row carrying the `timeout_ms` it was dispatched under; reconciling as `charged` records the invoice figure, leaves the ledger's own total at that figure and attributes the decision to the administrator; `released` reverses the estimate so the ledger totals 0; a second decision returns 409 `not_reconciling` and an unknown charge 404 `reservation_not_found`; a charge with no figure and an unknown outcome are refused with the hold left open; and an anonymous caller gets 401 while a member gets 403 on both the list and the reconcile route |
+| Viewer geometry, at two zooms and rotated | `tests/excerptGeometry.test.ts` (10 tests) drives the pure measurement the viewer uses: the same three-line passage yields three rectangles whose gaps are not highlighted; two items on one line stay one rectangle; a passage crossing a line break gets two, the second starting at the line's left edge while the first stops where the citation stops; a malformed transform does not throw and a blank text item is skipped; an absent passage yields none rather than an approximation; at scale 2 every rectangle doubles exactly; and on a 90° page each rectangle is the transpose of the upright one and stays inside the rotated page |
+| The dispatched timeout is on the attempt | `tests/api-r5.test.ts` sends one call under a 120 ms ceiling and reads the attempt rows back: `timeout_ms` includes 120, so a timeout is explained by the run's own record rather than by the environment at the time it is read (F-N) |
 
 ## 5. Blockers and outstanding prerequisites
 
@@ -385,11 +439,11 @@ contract case per rule exposed this.
    unmet, not passed. The harness that would measure them is implemented and runs without a
    credential (it reports the review-dependent gates as unmet), so the remaining work is a person
    with access, not code.
-2. **Spending caps are a decision, not a mechanism.** The enforcement exists and is tested; what
-   remains before paid production use is choosing an installation cap (or relying on per-account
-   limits) and deciding who reconciles `reconciling` charges, for which there is still no screen.
-   A charge that exceeded its hold is counted and stops the next call, but is not reported as its
-   own event.
+2. **Spending caps are a decision, not a mechanism.** The enforcement, the reconciliation screen and
+   the incident report all exist and are tested; what remains before paid production use is a
+   decision rather than code — choose an installation cap (or rely on per-account limits), and say
+   who watches the Admin tab's unresolved charges. The screen names the charge, its account, model,
+   attempt and period; the decision it cannot make for you is what your provider actually billed.
 3. **`.env.example`** still cannot be created through the available file tooling in this workspace;
    the exact refusal is `Sensitive files cannot be changed with write_file. For Cloud env variables
    use the write-only freebuff-env command.` This is a tooling limit, not a missing decision: the
@@ -412,15 +466,19 @@ contract case per rule exposed this.
    and `tests/api-resume.test.ts` counts provider calls to prove the earlier stages are not paid for
    twice. See the blockquote at the top of this document, `docs/decisions/0009-resuming-an-interrupted-run.md`
    and the V2-5 row in §7.
-6. **One low finding remains open, and another is narrower than recorded.** F-N is **mostly
-   corrected already**: `provider_attempts` stores the temperature, the exact `max_tokens`
-   dispatched, JSON mode, the price version and the counted input tokens (migration `0003`, written
-   by `attempt()`), so a run is reproducible from its own records except for the per-call timeout,
-   which is still not stored. F-Q stays open: `selectCardFormat` survives as a second name for the
-   format decision, although it delegates to `decideCardFormat`, so production has one active path
-   and the wrapper is only the demo simulator's sentence→kind adapter.
-7. **The zoom/rotation/multiline highlight fixtures** are still missing, so those viewer cases are
-   unproven. The rectangle that *is* drawn remains measured rather than guessed.
+6. **Both low findings named here are now closed, and one of them was closed by deleting rather than
+   explaining.** F-N: `provider_attempts` stores the temperature, the exact `max_tokens` dispatched,
+   JSON mode, the price version, the counted input tokens (migration `0003`) *and* the per-call
+   timeout (migration `0007`, from the prepared call rather than from the current environment), so a
+   run is reproducible from its own rows. F-Q: `selectCardFormat` is gone; the demo simulator maps
+   its sentence classification onto a concept kind (a private function that decides nothing) and
+   calls `decideCardFormat`, the same function the pipeline calls, and
+   `tests/generation.test.ts` asserts the package exposes one format decision rather than two.
+7. **The zoom/rotation/multiline highlight cases are now covered, and only the browser check is
+   missing.** `tests/excerptGeometry.test.ts` supplies the viewport itself, so a multi-line passage,
+   two zoom levels and a rotated page are asserted on the geometry the viewer uses. What no test
+   here establishes is the rendered result: the rectangle is measured rather than guessed, but
+   nobody has looked at it in a browser.
 8. **JEV.** No adapter, no access, no comparison. Nothing in this repository claims one.
 
 ## 6. Workstream close-out
@@ -458,7 +516,7 @@ matrix; where it disagrees with §1, §1 is the historical record.
 
 | ID | Priority | Status | Changed paths | Evidence | Remaining limitation |
 | --- | --- | --- | --- | --- | --- |
-| V2-1 | P0 | **Implemented and verified** | `packages/providers/src/{types,transport,provider,errors,config,index}.ts`, `apps/worker/src/{budget,queue,pipeline,index}.ts`, `apps/api/migrations/0003_budget_correctness.sql`, `tests/api-r5.test.ts`, `tests/budget-v2.test.ts` | 12 tests in `tests/budget-v2.test.ts` (each acceptance bullet) plus the 27 in `tests/api-r5.test.ts`: 8,000-token request → 8,000 reserved; a short claim against a long page prices the whole serialized request; a dearer decision model reserves and settles at its own rate; two workers cannot over-reserve the last headroom; a malformed response after a 200 keeps its charge; timeout, interrupted dispatch, confirmed-nonbillable, repeated settlement and retry are separate cases; the dispatched ceiling is asserted from the request the stub received | The estimate above the provider's counted tokens remains an estimate (`PRICE`/chars-per-token), recorded as such on the reservation. Overspend incidents are recorded and surfaced in the budget snapshot, not in the UI. |
+| V2-1 | P0 | **Implemented and verified** | `packages/providers/src/{types,transport,provider,errors,config,index}.ts`, `apps/worker/src/{budget,queue,pipeline,index}.ts`, `apps/api/migrations/0003_budget_correctness.sql`, `tests/api-r5.test.ts`, `tests/budget-v2.test.ts` | 12 tests in `tests/budget-v2.test.ts` (each acceptance bullet) plus the 27 in `tests/api-r5.test.ts`: 8,000-token request → 8,000 reserved; a short claim against a long page prices the whole serialized request; a dearer decision model reserves and settles at its own rate; two workers cannot over-reserve the last headroom; a malformed response after a 200 keeps its charge; timeout, interrupted dispatch, confirmed-nonbillable, repeated settlement and retry are separate cases; the dispatched ceiling is asserted from the request the stub received | The estimate above the provider's counted tokens remains an estimate (`PRICE`/chars-per-token), recorded as such on the reservation. An unresolved charge is now resolvable and visible (the Admin tab lists it with the decision that resolves it, and `POST /api/admin/budget/uncertain/:id/reconcile` records it with the administrator who made it), and an overspend is reported as an incident on the same screen; what remains is a person deciding, not a missing mechanism. |
 | V2-2 | P0 | **Implemented and verified** | `packages/validation/src/index.ts`, `packages/providers/src/{types,provider}.ts`, `prompts/validation/support.v1.md`, `apps/worker/src/pipeline.ts`, `tests/validation.test.ts`, `tests/api-r3.test.ts`, `tests/helpers/stubProvider.ts`, `docs/decisions/0004-evidence-scoped-validation.md` | Both reproduced probes are regression fixtures in `tests/validation.test.ts` (23 tests): the verbatim square claim is no longer flagged for an unrelated hedge and is published; the negated neuron claim is `contradicted` with the unrelated negation on the page. Measured at the pipeline level in `tests/api-r3.test.ts` (24 tests): the judge receives the server's slice of the page, not the card's excerpt; a provably wrong figure never reaches the judge and is withheld as `quantity_mismatch`; an unusable judge answer publishes nothing and fails the job; every stored card carries `validation_result` with `validator`, `verdict`, span and judge model | Live-provider card quality is still a separate, unmet gate (§9 below). Direction, conflation and population changes are only caught when the judge looks; the fixtures assert that routing rather than a detection. |
 | V2-3 | P1 | **Implemented and verified** | `packages/scheduling/src/{daily,study,index}.ts`, `apps/api/src/study/accounting.ts`, `apps/api/src/routes/resources.ts`, `apps/web/src/{App.tsx,lib/api.ts,lib/storedSource.ts,components/StudyInterface.tsx}`, `tests/api-daily-limits.test.ts`, `tests/study.test.ts`, `docs/decisions/0005-daily-study-accounting.md` | 13 tests in `tests/api-daily-limits.test.ts` through the HTTP endpoints, plus 3 in `tests/study.test.ts`. Each acceptance bullet has its own case: three reviews of one new card count **one** (and the previous query, run verbatim against the same rows, returns **3** — the defect as a measured contrast); two cards count two; a card first reviewed yesterday is not introduced today; an isolated cram review changes no counter, no schedule and no state, and leaves the card in the new queue; a scheduling cram review introduces the card once across two reviews; undo restores the new-card status and recounts from what is left; an event on the boundary counts and one at the next midnight does not; a second signed-in session sees the first session's reviews; and the queue the study screen builds admits nothing once the allowance is spent | The day boundary is UTC, not the learner's local midnight, and the limits are per deck per user — both documented rather than changed. No browser was driven, so the rendered allowance line is unverified; the queue is asserted from the rows the server serves and the formatter is unit-tested |
 | V2-4 | P1 | **Implemented and verified** (application import unperformed) | `packages/anki_export/src/apkg.ts`, `apps/api/src/routes/resources.ts`, `apps/web/src/components/ExportView.tsx`, `README.md`, `tests/anki-apkg.test.ts`, `tests/api-share-export.test.ts`, `tests/workflow.test.ts`, `docs/decisions/0006-fresh-schedule-anki-export.md` | 10 tests in `tests/anki-apkg.test.ts` open the produced archive and assert the rows Anki's importer reads: every card `type 0`, `queue 0`, `ivl 0`, `factor 2500`, `reps 0`, `lapses 0`, `due` = the note's position in the new queue, `revlog` and `graves` empty, and the deck configured for new cards in the order added; one card per distinct cloze deletion with `ord = index - 1` (`{{c1}}{{c2}}` → ords 0,1; `{{c1}}{{c3}}` → ords 0,2; cardCount 7 from 5 notes); Unicode, multiline, quotes and a raw field separator survive; identical input produces identical bytes. `tests/api-share-export.test.ts` studies a card through the API, confirms the server now holds an interval and due date for it, and then asserts the package is still new with no `revlog`. `tests/workflow.test.ts` step 8 does the same inside the full invite→upload→generate→study→export walk, asserting the schema reports two studied cards first | Anki is **not installed** here (`anki`, `anki-console` and the Python `anki` module are all absent), so the application-level import into a clean profile is **unperformed** — the evidence is the collection's rows, not Anki's own renderer. Offline images cannot be verified because media extraction does not exist, so the package ships an empty media map and neither the screen nor the README claims otherwise |

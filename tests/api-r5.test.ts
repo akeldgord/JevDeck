@@ -933,6 +933,15 @@ describe('The pipeline accounts for every call it makes', () => {
     expect(retried.state).toBe('completed');
     expect(retried.attempts).toBe(2);
 
+    // Each attempt records the timeout it was dispatched under (F-N). The first call was sent with
+    // a 120 ms ceiling, so the run explains its own timeout from its own rows rather than from
+    // whatever the environment says today.
+    const dispatchedTimeouts = db
+      .query('SELECT DISTINCT timeout_ms FROM provider_attempts WHERE job_id = ?')
+      .all(jobId) as Array<{ timeout_ms: number | null }>;
+    expect(dispatchedTimeouts.map(row => row.timeout_ms)).toContain(120);
+    for (const row of dispatchedTimeouts) expect(row.timeout_ms).toBeGreaterThan(0);
+
     const reservations = db
       .query(
         `SELECT r.state, r.amount_minor, a.status AS attempt_status

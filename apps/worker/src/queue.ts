@@ -638,6 +638,8 @@ export interface ProviderAttemptInput {
   /** The exact `max_tokens` dispatched. */
   maxOutputTokens?: number;
   jsonMode?: boolean;
+  /** The per-call timeout the transport waited under, so a timeout is explainable afterwards. */
+  timeoutMs?: number;
   /** Input tokens from the provider's counter, when one was available. */
   countedInputTokens?: number | null;
   priceVersion?: string;
@@ -661,9 +663,9 @@ export function recordProviderAttempt(db: Database, attempt: ProviderAttemptInpu
        (id, job_id, owner_id, attempt_id, provider, model, decision_model, prompt_version,
         prompt_id, prompt_hash, phase, attempt_number, status, input_tokens, output_tokens,
         latency_ms, request_chars, response_chars, error_code, error_message, created_at,
-        temperature, max_output_tokens, json_mode, counted_input_tokens, price_version,
+        temperature, max_output_tokens, json_mode, timeout_ms, counted_input_tokens, price_version,
         billing_outlook)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     id,
     attempt.jobId,
@@ -689,6 +691,7 @@ export function recordProviderAttempt(db: Database, attempt: ProviderAttemptInpu
     attempt.temperature ?? null,
     attempt.maxOutputTokens ?? null,
     attempt.jsonMode === undefined ? null : attempt.jsonMode ? 1 : 0,
+    attempt.timeoutMs ?? null,
     attempt.countedInputTokens ?? null,
     attempt.priceVersion ?? null,
     attempt.billingOutlook ?? null

@@ -60,6 +60,12 @@ export interface CreateProviderOptions {
   transport: ChatTransport;
   prompts: PromptLibrary;
   temperature?: number;
+  /**
+   * The transport's own per-call timeout, so every prepared call states the wait it was sent
+   * under. Defaulted to the same 90 s the configuration defaults to, and always supplied in
+   * production (`createGenerationProvider` passes the configured value).
+   */
+  timeoutMs?: number;
   /** Optional provider-compatible tokenizer. Without one, pricing uses a character bound. */
   countTokens?: TokenCounter;
 }
@@ -77,6 +83,7 @@ export function createProvider(options: CreateProviderOptions): GenerationProvid
 } {
   const { info, transport, prompts } = options;
   const temperature = options.temperature ?? 0.2;
+  const timeoutMs = options.timeoutMs ?? 90_000;
   const countTokens = options.countTokens;
 
   const conceptPrompt = prompts.require('concepts/extract.v1');
@@ -116,6 +123,7 @@ export function createProvider(options: CreateProviderOptions): GenerationProvid
       maxOutputTokens: request.maxOutputTokens,
       temperature,
       jsonMode,
+      timeoutMs,
       countedInputTokens: countTokens ? countTokens(request.system, request.user) : null,
       send: () => transport(request),
       parse: response => {

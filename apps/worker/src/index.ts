@@ -70,6 +70,8 @@ export {
   readAccountingIncidents,
   readBudgetSnapshot,
   readLimits,
+  readReconciliationAudit,
+  readUncertainCharges,
   readUsageTotals,
   reconcileReservation,
   reserveBudget,
@@ -82,6 +84,8 @@ export {
   type BudgetRefusal,
   type BudgetSnapshot,
   type Pricing,
+  type ReconcileResult,
+  type UncertainCharge,
   type ReserveOutcome,
 } from './budget';
 

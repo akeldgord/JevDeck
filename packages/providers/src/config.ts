@@ -162,6 +162,7 @@ export function createGenerationProvider(
     transport,
     prompts,
     temperature: config.temperature,
+    timeoutMs: config.timeoutMs,
     countTokens: options.countTokens,
   });
 }

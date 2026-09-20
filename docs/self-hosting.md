@@ -231,10 +231,13 @@ made, and the reason is stored on the job. An allowance resets with the period k
 Two things to know before enabling a paid provider:
 
 - A call whose cost could not be established (a timeout, for example) stays counted as
-  `reconciling` rather than being forgotten. There is no screen that resolves one yet, so a small
-  amount can remain held.
-- If a charge exceeds the reservation made for it, the excess is counted and stops the next call,
-  but it is not reported as its own event.
+  `reconciling` rather than being forgotten, and **nothing releases it automatically**. It is
+  listed in the Admin tab's unresolved charges, where an administrator records what the provider
+  billed — or that nothing was billed — and that decision is stored with their account. Left
+  unattended, a small amount can remain held indefinitely, which is the honest outcome rather
+  than a silent write-off.
+- If a charge exceeds the reservation made for it, the excess is counted, stops the next call, and
+  is reported as an overspend incident on the same screen, with how far the estimate was out.
 
 Set a cap before turning generation on. Demo mode's usage figures are simulated and labelled; they
 are not the ledger.

@@ -9,19 +9,21 @@ Requirements of record: [`../SPEC.md`](../SPEC.md). Requirement changes and thei
 
 ## Current implementation status
 
-The web application is a prototype. It performs document ingestion, section selection,
-scheduling and export honestly; the server-side components it will need are not built.
+The application is a working self-hosted product for the formats it supports: the web interface,
+the API, the worker and the packages below are all implemented, and what is still absent is named
+explicitly in this file rather than implied away. The remediation record that produced this state
+is [`remediation-status.md`](remediation-status.md).
 
 | Layer | Status |
 | --- | --- |
 | `apps/web` | Implemented: multi-format ingestion (PDF, `.docx`, `.pptx`, Markdown, text, pasted notes), a "what was read" report with the reader's own limitations, section selection, coverage choice, SM-2 study, cram mode, page viewer, stored media, deck browsing, text exports, invitation/sign-in flow, stored-document list. `lib/documentParser.ts` only decides which reader to run; the shape every reader converges on, and the mapping into the upload payload, are in `lib/parsedDocument.ts` and `lib/documentPayload.ts`, so the non-PDF path does not need the browser's PDF engine |
 | `packages/ingestion` | Implemented: OOXML (`.docx`, `.pptx`), Markdown, text and pasted-note readers, a ZIP reader, image collection, and the coverage summary. Format detection and refusals name the formats that do work |
-| `packages/generation` | **Local demo simulator only.** Heuristic sentence selection and key-phrase deletion over extracted text. Not a provider-backed pipeline, and unreachable unless demo mode is enabled. |
+| `packages/generation` | Implemented: the concept inventory, the two coverage modes and the single format decision the real pipeline uses. Its demo simulator is separate and heuristic, and is unreachable unless demo mode is enabled. |
 | `packages/contracts`, `packages/scheduling`, `packages/validation`, `packages/anki_export` | Implemented |
 | `apps/api` | Implemented: HTTP server, versioned migrations, accounts, sessions, invitations, owner-scoped documents/decks/cards/evidence/reviews/jobs, static hosting of the built web app |
 | `apps/worker` | Implemented: the durable queue and the generation pipeline, run in-process by the API or standalone |
 | `packages/providers` | Implemented: OpenAI-compatible and Anthropic transports, versioned prompt loading with hashes, strict output parsing, typed errors |
-| Usage ledger and enforced budgets | Schema only — no enforcement, no figures shown |
+| Usage ledger and enforced budgets | Implemented: an append-only ledger, reserve-then-settle around every provider call, per-account and installation-wide caps, overspend incidents, and an administrator screen that lists what is unresolved and records the decision that resolves it |
 
 ## Decisions of record
 
@@ -57,8 +59,10 @@ scheduling and export honestly; the server-side components it will need are not 
    original file or job answers 404 rather than 403 so ids cannot be probed. Writes additionally
    require a CSRF token issued to that session, and repeated failed sign-ins are throttled.
    Provider credentials are held server-side. Per-user and installation spending limits are
-   **not** enforced yet: the ledger tables exist, and the administration screen says plainly
-   that spending is not tracked rather than showing figures nothing produced.
+   enforced server-side from an append-only ledger, reserved before each call and settled after
+   it, with a refusal naming the cap that stopped it. A charge whose cost could not be
+   established stays counted until an administrator records what the provider billed, and that
+   decision is attributed to them.
 
 7. **Demo and simulation isolation.** Fabricated content — fixture documents, sample cards,
    sample identities, simulated usage — lives in `apps/web/src/demo` and is loaded only when

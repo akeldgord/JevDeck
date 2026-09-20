@@ -387,6 +387,64 @@ export interface BudgetReport {
   tokens: { inputTokens: number; outputTokens: number; totalTokens: number };
   /** Stored row counts, so the administration screen shows measured numbers. */
   counts: { activeUsers: number; cards: number; documents: number };
+  /** Charges that cost more than their hold. Append-only, newest first. */
+  incidents: ReconciliationIncident[];
+  /**
+   * Holds that may have been billed and nobody has resolved yet, across every period.
+   *
+   * Counted against the cap until an administrator says otherwise, which is why they are
+   * actionable rather than merely displayed.
+   */
+  uncertain: UncertainCharge[];
+  /** Each account's position for the period, from the same reservations the caps check. */
+  perUser: PerUserSpend[];
+}
+
+/** A charge that came in above its reservation, recorded so the estimation bug is visible. */
+export interface ReconciliationIncident {
+  id: string;
+  userId: string;
+  jobId: string | null;
+  model: string | null;
+  reservedMinor: number;
+  chargedMinor: number;
+  overMinor: number;
+  currency: string;
+  detail: string;
+  createdAt: string;
+}
+
+/** A hold left in `reconciling`, with the context needed to decide it. */
+export interface UncertainCharge {
+  reservationId: string;
+  userId: string;
+  userEmail: string | null;
+  jobId: string | null;
+  jobState: string | null;
+  deckId: string | null;
+  attemptId: string | null;
+  providerAttemptId: string | null;
+  phase: string | null;
+  attemptModel: string | null;
+  attemptStatus: string | null;
+  attemptErrorCode: string | null;
+  model: string | null;
+  amountMinor: number;
+  periodKey: string;
+  createdAt: string;
+}
+
+export interface PerUserSpend {
+  userId: string;
+  chargedMinor: number;
+  reservedMinor: number;
+  reconcilingMinor: number;
+  committedMinor: number;
+}
+
+export interface ReconcileChargeResult {
+  reconciled: { reservationId: string; outcome: 'charged' | 'released'; amountMinor: number };
+  budget: BudgetReport;
 }
 
 export interface StoredEvidence {
@@ -769,4 +827,20 @@ export const api = {
       method: 'PUT',
       body: { limitMinor },
     }),
+
+  /**
+   * Resolves one uncertain charge.
+   *
+   * `charged` carries the figure the invoice shows; `released` states that nothing was billed.
+   * The server refuses to guess either way, and there is no automatic release — a timeout that
+   * quietly disappeared would leave the ledger disagreeing with the invoice.
+   */
+  reconcileCharge: (
+    reservationId: string,
+    body: { outcome: 'charged' | 'released'; amountMinor?: number; note?: string }
+  ) =>
+    request<ReconcileChargeResult>(
+      `/api/admin/budget/uncertain/${encodeURIComponent(reservationId)}/reconcile`,
+      { method: 'POST', body }
+    ),
 };
