@@ -27,6 +27,51 @@ describe('The shipped image is built on the toolchain that was tested', () => {
   });
 });
 
+describe('The web build works from a clean checkout, the way the image builds it', () => {
+  it('typechecks its project references rather than reusing outputs the image never has', () => {
+    // `.dockerignore` excludes `**/dist` and `**/*.tsbuildinfo`, so the image's build stage begins
+    // with no declarations at all. `apps/web` is a `noEmit` project whose imports resolve through
+    // project references into `packages/*/dist`, and plain `tsc` does not build references: every
+    // cross-package import reported TS6305 and then collapsed into a cascade of implicit-anys and
+    // type mismatches, so `docker build` failed while a local `bun run build` passed on declarations
+    // an earlier `tsc -b` had left behind. Build mode is what makes the two agree.
+    const web = JSON.parse(read('../apps/web/package.json')) as {
+      scripts: Record<string, string>;
+    };
+
+    const build = web.scripts.build;
+    expect(build).toContain('tsc -b');
+    expect(build).not.toMatch(/\btsc\s+&&/);
+  });
+
+  it('does not leave a workspace build script depending on another workspace\'s output', () => {
+    // The same defect in any other workspace would be just as invisible locally, so the rule is
+    // stated once for the whole tree rather than only for the workspace that happened to break.
+    const workspaces = [
+      '../apps/web/package.json',
+      '../apps/api/package.json',
+      '../apps/worker/package.json',
+      ...['contracts', 'generation', 'ingestion', 'scheduling', 'validation', 'anki_export'].map(
+        name => `../packages/${name}/package.json`
+      ),
+    ];
+
+    const builds = workspaces
+      .map(workspace => {
+        const parsed = JSON.parse(read(workspace)) as { scripts?: Record<string, string> };
+        return { workspace, build: parsed.scripts?.build };
+      })
+      .filter((entry): entry is { workspace: string; build: string } => Boolean(entry.build));
+
+    // Without this the rule could pass by applying to nothing at all.
+    expect(builds.length).toBeGreaterThan(0);
+
+    for (const { workspace, build } of builds) {
+      expect(`${workspace}: ${build}`).not.toMatch(/(^|[^\w-])tsc\s+&&/);
+    }
+  });
+});
+
 describe('Runtime environment resolution', () => {
   it('is off unless the demo flag is exactly "true"', () => {
     for (const flag of [undefined, '', 'false', '0', '1', 'yes', 'TRUE', 'True', 'demo']) {
