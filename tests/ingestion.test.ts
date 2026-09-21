@@ -2,19 +2,31 @@ import { describe, expect, it } from 'bun:test';
 import {
   DEFAULT_MEDIA_BUDGET,
   detectFormat,
+  encodePng,
   explainUnsupported,
   fileExtension,
+  imageTypeOf,
   ingestDocument,
+  readImageSource,
   readPptx,
   readTextSource,
   SUPPORTED_FORMATS,
   summariseExtraction,
+  UnreadableImageError,
   UnsupportedFormatError,
   UNSUPPORTED_FORMATS,
   readZipDirectory,
+  type IngestedPage,
   type IngestedSource,
 } from '../packages/ingestion/src';
 import { buildDocx, makeZip, PNG } from './helpers/ooxmlFixture';
+
+/** A real PNG, encoded rather than faked, so the signature check is checked against real bytes. */
+function pngBytes(width = 4, height = 3): Uint8Array {
+  const pixels = new Uint8Array(width * height * 3);
+  for (let index = 0; index < pixels.length; index++) pixels[index] = (index * 7) % 256;
+  return encodePng({ width, height, pixels, channels: 3 });
+}
 
 // ---------------------------------------------------------------------------
 // DOCX
@@ -73,6 +85,48 @@ describe('DOCX reader', () => {
       contentType: 'image/png',
     });
     expect(Array.from(source.media[0].bytes)).toEqual(Array.from(PNG));
+  });
+
+  it('stores the paragraph a Word drawing is captioned by, and the text around it', async () => {
+    // The page states what the drawing is: the caption under it, and the sentences either side.
+    // Keeping them is what lets a card citing that page carry the figure honestly — association is
+    // decided by the caption and the surrounding text, not by the picture's position alone.
+    const bytes = await buildDocx(
+      [
+        { kind: 'heading', level: 1, text: 'Photosynthesis' },
+        { kind: 'paragraph', text: 'Light is absorbed by chlorophyll in the thylakoid membrane.' },
+        { kind: 'image' },
+        { kind: 'paragraph', text: 'Figure 1: the thylakoid membrane.' },
+        { kind: 'paragraph', text: 'The membrane stacks into grana.' },
+      ],
+      { imageBytes: PNG }
+    );
+
+    const source = await readDocxBytes(bytes);
+    const figure = source.media[0]!;
+
+    expect(figure.caption).toBe('Figure 1: the thylakoid membrane.');
+    expect(figure.context).toContain('Light is absorbed by chlorophyll');
+    expect(figure.context).toContain('The membrane stacks into grana.');
+  });
+
+  it('keeps the neighbouring text when nothing near the drawing is a caption', async () => {
+    const bytes = await buildDocx(
+      [
+        { kind: 'paragraph', text: 'Light is absorbed by chlorophyll in the thylakoid membrane.' },
+        { kind: 'image' },
+        { kind: 'paragraph', text: 'The membrane stacks into grana.' },
+      ],
+      { imageBytes: PNG }
+    );
+
+    const source = await readDocxBytes(bytes);
+    const figure = source.media[0]!;
+
+    // A nearby sentence is context, never a caption: labelling one as the other would print text
+    // under a figure that the document never gave it.
+    expect(figure.caption).toBeUndefined();
+    expect(figure.context).toContain('grana');
   });
 
   it('reads a stored (uncompressed) container as well as a deflated one', async () => {
@@ -216,6 +270,10 @@ describe('PPTX reader', () => {
     ]);
     expect(unanchored.map(item => item.name)).toEqual(['theme.png']);
     expect(source.limitations.join(' ')).toContain('no slide references them');
+
+    // A slide states so little that its own text is the figure's context, which is what lets a card
+    // citing the slide carry the picture rather than a diagram attached to nothing.
+    expect(anchored[0]!.context).toContain('Mitochondria produce ATP.');
   });
 
   it('labels an image-only slide as unread content rather than blank', async () => {
@@ -327,6 +385,140 @@ describe('plain text, Markdown and pasted notes', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Pictures and scans (step F2)
+// ---------------------------------------------------------------------------
+
+describe('a picture upload is stored whole and reported as unread', () => {
+  it('keeps the bytes, names the format from the signature, and records one page nobody has read', () => {
+    const bytes = pngBytes(4, 3);
+    const source = readImageSource({ fileName: 'plate.png', bytes });
+
+    expect(source.format).toBe('image');
+    expect(source.pageCount).toBe(1);
+    expect(source.pages[0].kind).toBe('image-only');
+    expect(source.pages[0].textSource).toBe('none');
+    expect(source.unextractedPages).toEqual([1]);
+    expect(source.blankPages).toEqual([]);
+
+    // The one section that covers the page, so the picture can be generated from at all: a run is
+    // scoped to a section, and a document with none has nothing for a run to be pointed at.
+    expect(source.sections.map(section => section.title)).toEqual(['Page 1']);
+    expect(source.sections[0]!.pageStart).toBe(1);
+    expect(source.sections[0]!.pageEnd).toBe(1);
+    expect(source.sections[0]!.selected).toBe(true);
+
+    // The picture itself, so the source viewer and the reading pass both have the real bytes.
+    expect(source.media).toHaveLength(1);
+    expect(source.media[0].kind).toBe('scan');
+    expect(source.media[0].contentType).toBe('image/png');
+    expect(source.media[0].pageNumber).toBe(1);
+    expect(Array.from(source.media[0].bytes)).toEqual(Array.from(bytes));
+  });
+
+  it('says in the reader’s own words what it did not do, rather than implying it read the picture', () => {
+    const source = readImageSource({ fileName: 'plate.png', bytes: pngBytes() });
+    const stated = source.limitations.join(' ');
+
+    expect(stated).toContain('unread content, not as an empty page');
+    expect(stated).toContain('OCR');
+  });
+
+  it('identifies the picture formats it can store from their own bytes', () => {
+    expect(imageTypeOf(pngBytes())?.contentType).toBe('image/png');
+    expect(imageTypeOf(new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00]))?.contentType).toBe('image/jpeg');
+    expect(imageTypeOf(new TextEncoder().encode('GIF89a'))?.contentType).toBe('image/gif');
+    expect(
+      imageTypeOf(new Uint8Array([...new TextEncoder().encode('RIFF'), 0, 0, 0, 0, ...new TextEncoder().encode('WEBP')]))
+        ?.contentType
+    ).toBe('image/webp');
+    expect(imageTypeOf(new TextEncoder().encode('BM000000000000'))?.contentType).toBe('image/bmp');
+    expect(imageTypeOf(new TextEncoder().encode('just words'))).toBeNull();
+  });
+
+  it('reads an image through ingestDocument, so the upload path has one reader', async () => {
+    const source = await ingestDocument({ fileName: 'plate.png', bytes: pngBytes() });
+
+    expect(source.format).toBe('image');
+    expect(source.pages[0].kind).toBe('image-only');
+  });
+});
+
+describe('the extraction summary keeps OCR text separate from the document’s own', () => {
+  const base: IngestedSource = {
+    format: 'pdf',
+    fileName: 'mixed.pdf',
+    pageCount: 4,
+    totalWords: 60,
+    pages: [],
+    sections: [],
+    media: [],
+    hasToc: false,
+    pagination: 'explicit',
+    blankPages: [4],
+    unextractedPages: [3],
+    limitations: [],
+    bytes: new Uint8Array(),
+  };
+
+  const page = (over: Partial<IngestedPage> & { pageNumber: number }): IngestedPage => ({
+    text: '',
+    kind: 'text',
+    ...over,
+  });
+
+  it('counts a page read by OCR as readable, and says how many readable pages came from OCR', () => {
+    const summary = summariseExtraction({
+      ...base,
+      pages: [
+        page({ pageNumber: 1, text: 'Native text.', kind: 'text' }),
+        page({
+          pageNumber: 2,
+          text: 'Text read off a scan.',
+          kind: 'ocr-text',
+          textSource: 'ocr',
+          ocr: { status: 'succeeded', engine: 'openai-compatible', model: 'vision-1', confidence: 0.8 },
+        }),
+        page({ pageNumber: 3, kind: 'image-only', textSource: 'none' }),
+        page({ pageNumber: 4, kind: 'blank', textSource: 'none' }),
+      ],
+    });
+
+    expect(summary.textPages).toBe(1);
+    expect(summary.ocrPages).toBe(1);
+    expect(summary.readable).toBe(2);
+    expect(summary.unextractedPages).toBe(1);
+    expect(summary.sentence).toContain('2 of 4 page(s) readable');
+    expect(summary.sentence).toContain('1 of them read by OCR');
+    expect(summary.sentence).toContain('1 with unread content');
+  });
+
+  it('does not count a page whose reading found no words as readable', () => {
+    const summary = summariseExtraction({
+      ...base,
+      pageCount: 1,
+      pages: [
+        page({
+          pageNumber: 1,
+          kind: 'image-only',
+          textSource: 'none',
+          // Read successfully, and there were no words on it: a photograph of a diagram.
+          ocr: {
+            status: 'succeeded',
+            engine: 'openai-compatible',
+            model: 'vision-1',
+            confidence: 0.4,
+          },
+        }),
+      ],
+    });
+
+    expect(summary.readable).toBe(0);
+    expect(summary.ocrPages).toBe(0);
+    expect(summary.unextractedPages).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Dispatch and honest refusal
 // ---------------------------------------------------------------------------
 
@@ -339,13 +531,17 @@ describe('format detection and refusal', () => {
     expect(detectFormat('data.csv')).toBe('text');
     expect(detectFormat('scan', 'application/pdf')).toBe('pdf');
     expect(detectFormat('scan', 'text/plain')).toBe('text');
-    expect(detectFormat('photo.png')).toBeNull();
+    // A picture is a supported input: it is stored whole, and its text is whatever the OCR pass
+    // reads off it. It is not ".txt-like", so it is detected by extension *and* by MIME type.
+    expect(detectFormat('photo.png')).toBe('image');
+    expect(detectFormat('plate', 'image/jpeg')).toBe('image');
+    expect(detectFormat('plate.tiff')).toBeNull();
     expect(detectFormat('archive.zip')).toBeNull();
   });
 
   it('explains why each refused format is refused, with the step that would fix it', () => {
     expect(explainUnsupported('old.doc')).toContain('Re-save the file as .docx');
-    expect(explainUnsupported('photo.jpeg')).toContain('OCR');
+    expect(explainUnsupported('plate.tiff')).toContain('Convert the file to PNG or JPEG');
     expect(explainUnsupported('book.epub')).toContain('PDF or text');
     expect(explainUnsupported('mystery.xyz')).toContain('Supported inputs are');
   });
@@ -359,8 +555,17 @@ describe('format detection and refusal', () => {
 
   it('throws a typed error for an unsupported file', async () => {
     await expect(
-      ingestDocument({ fileName: 'scan.png', bytes: new Uint8Array([1, 2, 3]) })
+      ingestDocument({ fileName: 'scan.tiff', bytes: new Uint8Array([1, 2, 3]) })
     ).rejects.toBeInstanceOf(UnsupportedFormatError);
+  });
+
+  it('refuses a picture whose bytes are not a picture, however it is named', async () => {
+    // The extension is a claim by the uploader; the signature is a fact about the bytes. Storing a
+    // file that is not an image under `image` would put a row in the source viewer that nothing can
+    // render, so the reader checks and refuses.
+    await expect(
+      ingestDocument({ fileName: 'plate.png', bytes: new TextEncoder().encode('not a picture') })
+    ).rejects.toBeInstanceOf(UnreadableImageError);
   });
 
   it('reads a text file end to end through ingestDocument', async () => {

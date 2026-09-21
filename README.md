@@ -27,7 +27,7 @@ is in the later records beside it.
 
 | Capability | Notes |
 | --- | --- |
-| Document upload and text extraction | PDF (in your browser via `pdfjs-dist`), Word, PowerPoint, Markdown, plain text and pasted notes, each read by its own reader. Outline/TOC sections are extracted where the format states them, with nested subsections preserved. Pages that yielded no text are reported as blank or as unread content, separately. |
+| Document upload and text extraction | PDF (in your browser via `pdfjs-dist`), Word, PowerPoint, Markdown, plain text, pasted notes and standalone pictures, each read by its own reader. Outline/TOC sections are extracted where the format states them, with nested subsections preserved. Pages that yielded no text are reported as blank or as unread content, separately. |
 | Section selection | Choose which chapters or subsections to cover. |
 | Coverage choice | **Two** modes: **high-yield** and **comprehensive**. |
 | Persistent backend | SQLite with versioned, checksum-verified migrations. Accounts, sessions, invitations, documents and versions, sections, source blocks, decks, cards, evidence, per-user schedules, review events and generation jobs are stored server-side. |
@@ -38,14 +38,15 @@ is in the later records beside it.
 | Study queue | One eligibility function produces both the header's due count and the session queue, so they cannot disagree. New, due, suspended and later are distinguished, and daily limits are applied and explained rather than silently truncating a session. |
 | Original-page viewer | Renders the real uploaded page and locates the cited passage on it — one rectangle per line for a passage that wraps, measured from the page's own text layer through the current zoom and page rotation. A passage that cannot be located is labelled "exact highlight unavailable" instead of drawing an approximate rectangle. |
 | Text exports | Tab-separated Anki import file and a JSON bundle. |
-| Anki `.apkg` export | A real Anki collection in a ZIP, built server-side from the stored cards and their citations. Every card arrives **new**: the export is a fresh schedule, so review history, intervals and due dates are deliberately not transferred, and nothing syncs back. Multiple cloze deletions in one note become multiple Anki cards. |
-| Deck sharing | Owner-scoped grant and revoke, addressed by email, study scope only: a shared deck's cards can be studied while the owner's document stays unreadable. |
+| Anki `.apkg` export | A real Anki collection in a ZIP, built server-side from the stored cards and their citations. Every card arrives **new**: the export is a fresh schedule, so review history, intervals and due dates are deliberately not transferred, and nothing syncs back. Multiple cloze deletions in one note become multiple Anki cards. The figures a card's source states travel with it: their real bytes go into the package's media map under a deterministic, collision-free name and are referenced on the answer side, with no absolute path or credential in a note — so the package renders offline. |
+| Deck sharing | Owner-scoped grant and revoke, addressed by email, at one of two scopes, both stated in words before the address is submitted. **Study only** is the cards and the recipient's own schedule. **Study and source** adds the material the cards were built from — the document's stored pages, the original file and the figures — because a card is a claim with a citation and a reader who cannot open the cited page has to take it on trust. Either scope is reached *through a deck*, so a share is not a key to the owner's library: another document of the same owner answers 404, and a reader is held to the version the shared deck was generated from. Changing, re-generating, deleting, exporting and re-sharing stay with the owner, at both scopes. Revoking ends the next request; it cannot recall what a recipient already downloaded, and the interface says so rather than implying otherwise. |
 | Budget accounting | An append-only usage ledger with per-user and installation-wide monthly caps, reserved before each provider call and settled after it, so concurrent jobs cannot exceed the available reservation. A charge whose cost could not be established is listed for an administrator to resolve, and a charge above its hold is reported as an incident. |
-| Input formats | PDF, Word (`.docx`), PowerPoint (`.pptx`), Markdown, plain text and pasted notes, each read by its own reader into one storage shape. A page that yields no text is recorded as **blank** (a confirmed result) or as **unread content** (a picture this build could not read), and the two are reported separately. Formats this build cannot read are refused with the step that would fix it. OCR is not implemented, so a scanned page is reported unread rather than read. |
-| Stored media | Images a `.docx` or `.pptx` actually carries are stored beside their version, listed with the page they sit on (or recorded as unanchored when the format did not place them), and served one at a time to the account that owns the document. PDF images are **not** extracted, and the `.apkg` bundles no media. |
+| Input formats | PDF, Word (`.docx`), PowerPoint (`.pptx`), Markdown, plain text, pasted notes and standalone pictures, each read by its own reader into one storage shape. A page that yields no text is recorded as **blank** (a confirmed result) or as **unread content** (a picture this build has not read), and the two are reported separately. Formats this build cannot read are refused with the step that would fix it. |
+| Reading unread pages (OCR) | A page whose content is a picture is read by a provider call through the same reservation, attempt and durable-result machinery as extraction and card writing — so it is budgeted, its answer is reused on a resume, and an uncertain dispatch stops for a decision. It runs only on pages with no readable text, so a readable page keeps what the document said, and it is bounded per run (8 pages, 3 MiB a page, 9 MiB a run) with the pages beyond a bound named in the plan and left counted as unread. A reading stores its provenance — engine, model, prompt version, the confidence the engine reported, and the reason when it failed — and the coverage report counts a page as read only when a reading exists. |
+| Stored media and figures | Images a `.docx`, `.pptx` or PDF actually carries are stored beside their version, listed with the page they sit on (or recorded as unanchored when the format did not place them), and served one at a time to the account that may read that document — its owner, or a reader whose share carries source access. A figure belongs to a card when it sits on the page the card cites and its caption or nearest text touches the citation — one shared rule, so the app and the export cannot disagree. |
 | Deck browsing | A **Decks** tab lists the caller's decks and the decks shared with them, with open, study, export and delete offered only where the server allows it, and the reason stated where it does not. Deleting a deck deletes its cards and keeps its document. |
 | Backup and restore | One consistent SQLite artifact covering the database and the retained original files, with a verified round trip. |
-| Containers and CI | A `Dockerfile`, a Compose file with a data volume and health check, and a CI workflow that installs from the lockfile, typechecks, tests and builds. |
+| Containers and CI | A `Dockerfile` pinned to the tested Bun version (`.bun-version`, asserted by `tests/runtime.test.ts`), a Compose file with a data volume and health check, and a CI workflow with two jobs: one that installs from the lockfile, typechecks, tests and builds, and one that builds the image, runs it, drives it over HTTP with the controlled provider, then **backs it up and restores the backup inside the image** and serves the restored database from a second container. |
 | Evaluation harness | Measures the quality gates in §5 from a completed run's stored rows, and reports a gate it cannot measure as unmet rather than passing it. |
 | **Card generation through a real AI provider** | `packages/providers` speaks the OpenAI chat-completions and Anthropic messages envelopes, so OpenAI, Anthropic, vLLM, Ollama or LocalAI all work. Prompts are versioned files; a missing prompt is a hard failure rather than a hidden default. Without a configured credential generation is **unavailable**, the refusal is recorded with its reason, and no placeholder card is produced. |
 | **Durable job dispatch** | A job is a database row, claimed with an atomic conditional update and held under a lease. A crash leaves it reclaimable once the lease expires, and a retry backs off rather than hammering a rate-limited provider. Every attempt is recorded with its prompt hash, tokens and outcome. |
@@ -58,9 +59,6 @@ is in the later records beside it.
 
 | Capability | Blocked on |
 | --- | --- |
-| Reading scanned pages (OCR) | Ingestion work. A scan is stored as a page and reported as unread content; nothing on it can be turned into cards, and the report says so rather than counting it as covered |
-| Image extraction from PDFs | PDF work. A `.docx` or `.pptx` image is stored and served; a figure inside a PDF page is not, and the reader records that limitation with the document |
-| Media in the Anki package | The package cites each card's page and bundles no media files, rather than shipping placeholders |
 | A passing §5 quality gate | No provider credential in the development environment and no independent review of cards from a hosted model. All three gates are **unmet**, not passed. |
 | Zoom/rotation/multiline highlight fixtures | R4 follow-up; the highlight that is drawn is measured, but those cases are untested |
 | A tracked `.env.example` | The file tooling in this workspace refuses any `.env*` path. The variables are documented in the table below and in `docs/self-hosting.md`. |
@@ -132,6 +130,13 @@ bun run backup  [target-path]              # writes a verified, consistent copy
 bun run restore <backup-path> [target]     # refuses to overwrite without --force
 ```
 
+The copy is taken with `VACUUM INTO`, so it is consistent while the server is running rather than
+missing whatever is still in the write-ahead log. The report it prints names what it preserved —
+users, documents with their retained originals, decks, cards, reviews, the usage ledger, **stored
+images**, the **saved call results** a resumed run reuses and the **runs holding progress** — and a
+restore verifies the file it wrote against the file it read before reporting success.
+`tests/deploy-restore.test.ts` walks the whole thing through two real installations.
+
 To measure the quality gates against a completed run:
 
 ```bash
@@ -141,6 +146,51 @@ bun run evaluate --job <job-id> --template evaluations/reports/review.json
 To explore the interface with the bundled fixture document instead of a real backend, create
 `.env.local` containing `VITE_JEVDECK_DEMO_MODE=true` and restart. Every screen is then marked
 as demo content, and the app does not talk to the API at all.
+
+### Tests
+
+```bash
+bun test                     # everything, including the browser workflow
+bun test tests/browser-journey.test.ts   # just the walk through the product in a browser
+```
+
+`tests/browser-journey.test.ts` drives a real Chromium through the real screens: the production
+web bundle, served by the real API on one origin, over a temporary database and the controlled
+loopback provider. It needs Playwright's browser, which the CI workflow installs:
+
+```bash
+bunx playwright install --with-deps chromium   # once, per machine
+```
+
+An environment with no browser reports the suite as **skipped** rather than passing, and
+`JEVDECK_BROWSER_TESTS=0` skips it deliberately.
+
+`tests/deploy-restore.test.ts` needs nothing extra: it boots two real installations in turn, backs a
+running one up, restores it into a second directory and checks what the second one serves.
+`tests/container-deployment.test.ts` is the one that needs a container, so it **skips itself** unless
+you point it at a running one — the CI `container` job does that, in both modes:
+
+```bash
+docker build --build-arg "BUN_VERSION=$(cat .bun-version)" -t jevdeck .
+bun tests/helpers/stubProviderServer.ts 4319 &
+docker run -d --name jevdeck --network host -v jevdeck-data:/data \
+  -e JEVDECK_PROVIDER_BASE_URL=http://127.0.0.1:4319/v1 -e JEVDECK_PROVIDER_API_KEY=any \
+  jevdeck
+JEVDECK_CONTAINER_BASE_URL=http://127.0.0.1:3001 JEVDECK_CONTAINER_MODE=fresh \
+  bun test tests/container-deployment.test.ts
+```
+
+One test in the suite is a live smoke test and skips itself unless a credential is configured,
+so `bun test` never needs a provider secret:
+
+```bash
+JEVDECK_LIVE_PROVIDER=1 JEVDECK_LIVE_PROVIDER_API_KEY=... \
+  JEVDECK_LIVE_PROVIDER_MODEL=gpt-4o-mini bun test tests/live-provider.test.ts
+```
+
+It makes one small real request to check that the provider adapter still speaks the vendor's
+protocol. It is not a quality measurement — that is `evaluations/`, and it is not a substitute
+for the gates being unmet.
 
 ### Environment variables
 
@@ -176,9 +226,11 @@ discover a ceiling by hitting it.
 
 | Limit | Value | Enforced by |
 | --- | --- | --- |
-| Original file kept for the source viewer | 16 MiB per document | `MAX_SOURCE_BYTES` — above it the upload is accepted but the bytes are dropped, the extracted text becomes the record, and the document says so |
+| Original file kept for the source viewer | 16 MiB per document | `MAX_SOURCE_BYTES` — above it the upload is **refused** (`source_too_large`), because a viewer that offers the original must have it |
 | Request body | 24 MiB | `MAX_JSON_BODY_BYTES`, refused by `content-length` before it is read |
 | Stored images per document | 8 MiB total | `MAX_MEDIA_BYTES_PER_DOCUMENT` |
+| Pages read by OCR in one run | 8, and 3 MiB a page / 9 MiB a run | `MAX_OCR_PAGES_PER_RUN`, `MAX_OCR_IMAGE_BYTES`, `MAX_OCR_BYTES_PER_RUN`; the pages beyond a bound are named in the run's plan and stay counted as unread |
+| OCR claim taken over from a dead process | after 15 minutes | `OCR_CLAIM_STALE_MS`; sooner would pay for a live reading twice |
 | Sections selectable in one run | 500 | the generate route truncates the selection list |
 | Source sent in one extraction call | 60,000 characters | `MAX_SOURCE_CHARS_PER_CALL`; a page larger than that is sent whole rather than truncated |
 | Concepts per run | 120 | `MAX_CONCEPTS` |
@@ -212,7 +264,8 @@ measured. Those remain open work rather than unstated limits.
 - [`SPEC.md`](SPEC.md) — requirements of record
 - [`docs/architecture.md`](docs/architecture.md) — architecture and decisions
 - [`docs/self-hosting.md`](docs/self-hosting.md) — self-hosting guide, backup and restore
-- [`docs/remediation-status.md`](docs/remediation-status.md) — audit against the remediation spec: per-workstream status, findings and blockers
+- [`docs/remediation-status.md`](docs/remediation-status.md) — the live status of the remediation checklist: per-step status, evidence and remaining limitations
+- [`docs/remediation-status-history.md`](docs/remediation-status-history.md) — the frozen audit trail the live status was split out of: the original spec's matrices, findings and blockers
 - [`evaluations/README.md`](evaluations/README.md) — the quality-gate harness and how a review is recorded
 - [`docs/decisions/`](docs/decisions/) — decision records
 - [`SECURITY.md`](SECURITY.md) — how to report a vulnerability, and the controls the application enforces
@@ -228,7 +281,8 @@ JevDeck/
     worker/                  # Durable job queue and the real generation pipeline
   packages/
     contracts/               # Shared TypeScript schemas and DTOs
-    ingestion/               # Multi-format readers (.docx, .pptx, Markdown, text), coverage summary
+    ingestion/               # Multi-format readers (.docx, .pptx, Markdown, text, images), PDF
+                             # figure extraction, figure-to-card association, coverage summary
     generation/              # Concept inventory, coverage rules, format decision (pure)
     validation/              # Grounding, ambiguity, duplicate and claim-support checks
     providers/               # Provider adapters, prompt loading, strict output parsing

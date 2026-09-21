@@ -691,11 +691,22 @@ describe('Invite → upload → generate → inspect → study → reload → re
     expect(new Uint8Array(image.bytes)).toEqual(PNG);
     expect((await new Client().download(`/api/media/${mediaId}`)).status).toBe(401);
 
-    // And the Word deck exports the same way, with every card new.
+    // And the Word deck exports the same way, with every card new — plus the figure its source
+    // carries, because a card that cites that page cannot be read without it.
     const exported = await student.download(`/api/decks/${walked.docxDeckId}/export.apkg`);
     expect(exported.status).toBe(200);
     const entries = readZip(exported.bytes);
-    expect([...entries.keys()].sort()).toEqual(['collection.anki2', 'media']);
+    expect([...entries.keys()].sort()).toEqual(['0', 'collection.anki2', 'media']);
+
+    // The media map names the stored file, the bytes are the source's own PNG rather than a
+    // re-encode, and the name is one Anki can place on disk.
+    const mediaMap = JSON.parse(new TextDecoder().decode(entries.get('media')!)) as Record<
+      string,
+      string
+    >;
+    expect(Object.keys(mediaMap)).toEqual(['0']);
+    expect(mediaMap['0'].endsWith('.png')).toBe(true);
+    expect(new Uint8Array(entries.get('0')!)).toEqual(PNG);
 
     await Bun.write(join(scratch, 'word.anki2'), entries.get('collection.anki2')!);
     const archived = new Database(join(scratch, 'word.anki2'), { readonly: true });
@@ -712,6 +723,18 @@ describe('Invite → upload → generate → inspect → study → reload → re
         expect(row.queue).toBe(0);
         expect(row.ivl).toBe(0);
         expect(row.reps).toBe(0);
+      }
+
+      // A note that cites the figure's page points at the exported file name, and at nothing that
+      // needs this server: no absolute path, no credential, no authenticated URL.
+      const notes = archived.query('SELECT flds FROM notes').all() as Array<{ flds: string }>;
+      const referencing = notes.filter(note => note.flds.includes(mediaMap['0']));
+      expect(referencing.length).toBeGreaterThan(0);
+      expect(referencing.every(note => note.flds.includes(`<img src="${mediaMap['0']}"`))).toBe(
+        true
+      );
+      for (const note of notes) {
+        expect(note.flds).not.toContain('http');
       }
     } finally {
       archived.close();

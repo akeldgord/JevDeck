@@ -111,7 +111,8 @@ const DeckCard: React.FC<{
         <p className="text-xs text-slate-400">
           {row.cardCount} card{row.cardCount === 1 ? '' : 's'}
           {row.documentName ? ` · from “${row.documentName}”` : ''}
-          {row.access === 'shared' ? ' · source document not shared' : ''}
+          {row.access === 'shared' && !row.can.readSource ? ' · source document not shared' : ''}
+          {row.access === 'shared' && row.can.readSource ? ' · source document shared' : ''}
         </p>
         {row.description && (
           <p className="text-xs text-slate-500 line-clamp-2">{row.description}</p>
@@ -123,7 +124,10 @@ const DeckCard: React.FC<{
     </div>
 
     <div className="flex flex-wrap items-center gap-2">
-      {row.can.open ? (
+      {/* `readSource`, not `open`: an owner opens the generator around their own document, while a
+          reader opens the source their share carries. Both land on the viewer; only the owner's
+          screen can re-generate. */}
+      {row.can.readSource ? (
         <ActionButton
           icon={<FolderOpen className="w-3.5 h-3.5" />}
           label="Open with source"
@@ -138,7 +142,7 @@ const DeckCard: React.FC<{
           label="Open with source"
           onClick={() => undefined}
           disabled
-          title={row.openBlockedReason ?? 'Not available.'}
+          title={row.sourceBlockedReason ?? row.openBlockedReason ?? 'Not available.'}
         />
       )}
 
@@ -190,6 +194,10 @@ const DeckCard: React.FC<{
 
     {row.openBlockedReason && (
       <p className="text-[11px] text-amber-300/90">{row.openBlockedReason}</p>
+    )}
+
+    {row.sourceBlockedReason && (
+      <p className="text-[11px] text-slate-500">{row.sourceBlockedReason}</p>
     )}
   </div>
 );

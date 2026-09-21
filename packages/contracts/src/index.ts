@@ -86,6 +86,25 @@ export interface CoverageSummary {
   byDecision: Partial<Record<ConceptDecision, number>>;
   /** Why included concepts failed to become cards, keyed by reason code. */
   withheldReasons: Record<string, number>;
+  /**
+   * Pages of the source this run read off a picture, when it read any.
+   *
+   * Reported separately from the card counts because it is a different fact about the run: a deck
+   * can be complete and still rest on text a model read out of a scan, and a reader who is told
+   * only "12 cards" cannot tell whether the cards rest on the document or on a reading of it.
+   */
+  pagesReadByOcr?: number;
+  /**
+   * Pages whose picture was read and holds no words. A result rather than a failure, and one a
+   * coverage report that lumped it in with "unread" would misstate in both directions.
+   */
+  pagesReadWithNoText?: number;
+  /**
+   * Pages of the selected material that are still unread when the run finished, whether because a
+   * reading failed, because the run's limits did not reach them, or because there was no stored
+   * picture to read. Named so a gap is stated rather than left to be inferred from a page count.
+   */
+  pagesStillUnread?: number;
 }
 
 /**
@@ -103,6 +122,45 @@ export interface CoverageChoice {
   value: CoverageMode;
   label: string;
   description: string;
+}
+
+/**
+ * What a share grants.
+ *
+ * `study` is the cards and the reader's own schedule. `study_and_source` adds the material the
+ * cards were built from — the stored source and its figures — because a card that cites a page a
+ * reader cannot open is an assertion they have to take on trust.
+ *
+ * There is no third scope, and neither scope is a licence to change anything: the deck, its cards
+ * and its re-generation stay with the owner.
+ */
+export const SHARE_SCOPES = ['study', 'study_and_source'] as const;
+
+export type ShareScope = (typeof SHARE_SCOPES)[number];
+
+/** The scope that carries source access. Named once, so the check and the copy cannot disagree. */
+export const SOURCE_SHARE_SCOPE: ShareScope = 'study_and_source';
+
+export function shareGrantsSource(scope: ShareScope | null | undefined): boolean {
+  return scope === SOURCE_SHARE_SCOPE;
+}
+
+/**
+ * A share scope as it is offered to the person doing the sharing.
+ *
+ * One list, rendered by the interface and quoted by the server's response, so the sentence an
+ * owner reads before adding someone cannot drift from the permission the server grants.
+ */
+export interface ShareScopeChoice {
+  value: ShareScope;
+  label: string;
+  description: string;
+  /**
+   * What the recipient can reach that the owner should know about before sharing. Stated for every
+   * scope, including the one that grants nothing extra, so "no extra access" is a sentence rather
+   * than an absence.
+   */
+  disclosure: string;
 }
 
 export interface DocumentSection {
@@ -134,12 +192,42 @@ export interface DocumentPage {
   text: string;
 }
 
+/**
+ * A figure stored with the source that a card is allowed to show.
+ *
+ * The server decides which figures belong to a card — the ones on the cited page whose caption or
+ * surrounding text touches the citation — and sends them with the citation, so the answer side and
+ * the Anki export cannot disagree about which picture goes with which claim. `id` fetches the bytes
+ * through the same access check as the rest of the source; a reader whose share carries no source
+ * access receives no figures rather than a list of images they cannot load.
+ */
+export interface GroundingFigure {
+  id: string;
+  /** The page it sits on, which is the cited page by construction. */
+  pageNumber: number;
+  /** `figure`, `table`, or `scan` when the page itself is the picture. */
+  kind: string;
+  name: string;
+  /** The document's own caption, when one was identified. */
+  caption: string | null;
+  contentType: string;
+  /** False when the row exists but its bytes were not stored: nothing can be shown. */
+  hasBytes: boolean;
+}
+
 export interface GroundingCitation {
   excerpt: string;
   pageNumber: number;
   boundingPolygon?: { x: number; y: number; width: number; height: number };
   documentId: string;
   sectionTitle: string;
+  /**
+   * The source figures this card may carry, empty when the source states none beside it.
+   *
+   * Absent on a card written before figures were extracted, which is a different thing from a card
+   * whose page holds no figure — the first is unknown, the second is known to have none.
+   */
+  figures?: GroundingFigure[];
   /**
    * The checks that were actually run on this card, as recorded by the pipeline.
    *

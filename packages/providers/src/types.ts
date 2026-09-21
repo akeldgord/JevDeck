@@ -133,6 +133,40 @@ export interface ClaimSupportResult {
 }
 
 /**
+ * One page picture to read.
+ *
+ * The picture is the page as it is stored: a scan, a photographed page, a page of a PDF that has no
+ * text layer. Nothing about the document is inferred from it — the engine's only job is the words.
+ */
+export interface PageOcrRequest {
+  documentName: string;
+  pageNumber: number;
+  pageLabel?: string | null;
+  image: { mediaType: string; base64: string };
+}
+
+/**
+ * What reading a page's picture produced.
+ *
+ * `text` may be empty, and that is a *result*, not a failure: a photographed diagram with no labels
+ * has no words on it, and inventing some would put text in a document that never said it. `notes`
+ * is where the engine says what it could not read, and `confidence` is whatever it reported —
+ * `null` when it reported none, because an absent number is not a number of 1.
+ */
+export interface PageOcrResult {
+  text: string;
+  confidence: number | null;
+  notes: string;
+  usage: TokenUsage;
+}
+
+/** Reading text off a picture. A bounded transcription, not a judgement about the page. */
+export interface PageOcrProvider {
+  preparePageOcr(request: PageOcrRequest): PreparedCall<PageOcrResult>;
+  readPageImage(request: PageOcrRequest): Promise<PageOcrResult>;
+}
+
+/**
  * A call that has been built but not sent.
  *
  * Preparing and sending are separate steps for one reason: the spending cap has to hold a figure
@@ -199,5 +233,24 @@ export interface CardGenerationProvider {
   generateCards(request: CardGenerationRequest): Promise<CardGenerationResult>;
 }
 
+/**
+ * The prompt library a provider was built with, as that provider used it.
+ *
+ * Part of the interface rather than a convention. The pipeline records these on every attempt and
+ * inside the fingerprint a run's saved progress is keyed to, so a provider that cannot say which
+ * instructions produced its answers makes that fingerprint incomplete — and an incomplete
+ * fingerprint *matches* a run whose prompts changed, which is exactly the thing it exists to
+ * prevent. Stating it here is what makes a wrapper that forgets to carry it a compile error rather
+ * than a run that quietly re-pays for its own answers.
+ */
+export interface ProviderPromptMetadata {
+  readonly promptVersions: Record<string, string>;
+  readonly promptHashes: Record<string, string>;
+}
+
 /** A provider that can do both. */
-export interface GenerationProvider extends ConceptDecisionProvider, CardGenerationProvider {}
+export interface GenerationProvider
+  extends ConceptDecisionProvider,
+    CardGenerationProvider,
+    PageOcrProvider,
+    ProviderPromptMetadata {}

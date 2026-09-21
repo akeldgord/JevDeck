@@ -1,10 +1,12 @@
 import { Database } from 'bun:sqlite';
 import type { GenerationProvider } from '@jevdeck/providers';
 import {
+  claimIdentityOf,
   claimNextJob,
   failJob,
   LEASE_SECONDS,
   toContractJob,
+  type ClaimIdentity,
   type GenerationJobRow,
 } from './queue';
 import { runGenerationJob, type RunOutcome } from './pipeline';
@@ -80,17 +82,20 @@ export class GenerationWorker {
       return null;
     }
 
-    return this.runJob(job);
+    // The claim the queue just handed out, carried through the run: the epoch belongs to the row,
+    // not to this worker, so it cannot be reconstructed later from the worker id alone.
+    return this.runJob(job, claimIdentityOf(job, this.workerId));
   }
 
   /** Runs a specific job that has already been claimed. */
-  async runJob(job: GenerationJobRow): Promise<RunOutcome> {
+  async runJob(job: GenerationJobRow, claim = claimIdentityOf(job, this.workerId)): Promise<RunOutcome> {
     this.emit({ type: 'claimed', jobId: job.id });
 
     try {
       const outcome = await runGenerationJob(this.db, this.provider, job, {
         workerId: this.workerId,
         leaseSeconds: this.options.leaseSeconds ?? LEASE_SECONDS,
+        claim,
       });
 
       if (outcome.state === 'completed') {
@@ -112,15 +117,23 @@ export class GenerationWorker {
 
       return outcome;
     } catch (cause) {
-      // A bug in the pipeline must not leave the job leased forever.
+      // A bug in the pipeline must not leave the job leased forever — but only the claim that still
+      // owns the run may say so. `failJob` refuses when it does not, which is what stops a late
+      // exception from an old worker marking the new worker's job failed.
       const message = cause instanceof Error ? cause.message : String(cause);
-      const state = failJob(this.db, job.id, {
+      const state = failJob(this.db, claim, {
         code: 'pipeline_error',
         message,
         retryable: true,
       });
       const type: WorkerEventType =
-        state === 'pending' ? 'retrying' : state === 'paused' ? 'paused' : 'failed';
+        state === 'claim_lost'
+          ? 'claim_lost'
+          : state === 'pending'
+            ? 'retrying'
+            : state === 'paused'
+              ? 'paused'
+              : 'failed';
       this.emit({ type, jobId: job.id, message });
 
       return { state, conceptCount: 0, cardCount: 0, errorCode: 'pipeline_error', message };

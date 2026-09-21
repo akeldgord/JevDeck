@@ -366,7 +366,7 @@ describe('Stored media', () => {
     expect(detail.status).toBe(404);
   });
 
-  it('keeps media out of reach for a person the deck is shared with', async () => {
+  it('keeps media out of reach for a study-only share, and hands it to a source share', async () => {
     const share = await admin.call(`/api/decks/${created.deckId}/shares`, {
       method: 'POST',
       body: { email: MEMBER_EMAIL, scope: 'study' },
@@ -387,6 +387,21 @@ describe('Stored media', () => {
 
     const detail = await member.call(`/api/documents/${created.documentId}`);
     expect(detail.status).toBe(404);
+
+    // The other scope is what carries them, and it is granted rather than stored as a promise:
+    // the same figure, the same bytes, one scope wider. (The full access matrix, including what a
+    // share must *not* reach, is `tests/share-source-access.test.ts`.)
+    const widened = await admin.call(`/api/decks/${created.deckId}/shares`, {
+      method: 'POST',
+      body: { email: MEMBER_EMAIL, scope: 'study_and_source' },
+    });
+    expect(widened.status).toBe(201);
+    expect(widened.body.share.sourceAccess).toBe(true);
+
+    const sharedImage = await member.bytes(`/api/media/${created.mediaId}`);
+    expect(sharedImage.status).toBe(200);
+    expect(sharedImage.headers.get('content-type')).toBe('image/png');
+    expect(Buffer.from(sharedImage.bytes).toString('base64')).toBe(PNG_BASE64);
   });
 });
 

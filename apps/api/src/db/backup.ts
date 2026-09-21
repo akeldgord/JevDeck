@@ -30,6 +30,26 @@ export interface InstallationSummary {
   migrations: string[];
   /** Whether any retained original file is present. Source bytes live in the database as a BLOB. */
   documentsWithSourceBytes: number;
+  /**
+   * Stored images — the figures, plates and scans that sit beside their version.
+   *
+   * Counted because a deck whose cards cite a figure is only whole when the figure survives with it:
+   * a restore that dropped the media rows would leave every citation pointing at a picture the
+   * installation no longer has, and the report would still have read as a success.
+   */
+  mediaRows: number;
+  /**
+   * Durable per-call results, and the retained provider attempts they were dispatched under.
+   *
+   * These are what makes a resumed or interrupted run stop paying twice, so they are part of the
+   * installation rather than of a process: a restore that lost them would silently re-charge for
+   * work the ledger already records as paid for.
+   */
+  savedCallResults: number;
+  /** The retained attempt records, which hold the accounting evidence for each call. */
+  providerAttempts: number;
+  /** Runs holding recoverable progress (`generation_jobs` with a checkpoint). */
+  runCheckpoints: number;
 }
 
 export interface BackupReport extends InstallationSummary {
@@ -58,6 +78,9 @@ const REQUIRED_TABLES = [
   'review_events',
   'user_card_state',
   'generation_jobs',
+  'media',
+  'provider_attempts',
+  'operation_results',
   'budget_reservations',
   'usage_records',
   'schema_migrations',
@@ -141,6 +164,13 @@ export function summariseInstallation(path: string): InstallationSummary {
       documentsWithSourceBytes: count(
         db,
         'SELECT COUNT(*) AS n FROM document_versions WHERE source_bytes IS NOT NULL'
+      ),
+      mediaRows: count(db, 'SELECT COUNT(*) AS n FROM media'),
+      savedCallResults: count(db, 'SELECT COUNT(*) AS n FROM operation_results'),
+      providerAttempts: count(db, 'SELECT COUNT(*) AS n FROM provider_attempts'),
+      runCheckpoints: count(
+        db,
+        'SELECT COUNT(*) AS n FROM generation_jobs WHERE checkpoint IS NOT NULL'
       ),
       migrations: (
         db.query('SELECT version FROM schema_migrations ORDER BY version ASC').all() as Array<{
@@ -275,6 +305,10 @@ function sameContents(a: InstallationSummary, b: InstallationSummary): boolean {
     a.reviews === b.reviews &&
     a.usageRows === b.usageRows &&
     a.documentsWithSourceBytes === b.documentsWithSourceBytes &&
+    a.mediaRows === b.mediaRows &&
+    a.savedCallResults === b.savedCallResults &&
+    a.providerAttempts === b.providerAttempts &&
+    a.runCheckpoints === b.runCheckpoints &&
     a.migrations.join(',') === b.migrations.join(',')
   );
 }
@@ -291,6 +325,8 @@ export function describeSummary(
     `${report.users} user(s), ${report.documents} document(s) ` +
     `(${report.documentsWithSourceBytes} with retained source), ${report.decks} deck(s), ` +
     `${report.cards} card(s), ${report.reviews} review(s), ${report.usageRows} usage row(s), ` +
+    `${report.mediaRows} image(s), ${report.savedCallResults} saved call result(s) ` +
+    `(${report.providerAttempts} attempt(s)), ${report.runCheckpoints} run(s) with progress, ` +
     `migrations ${report.migrations.join(', ') || 'none'}`
   );
 }

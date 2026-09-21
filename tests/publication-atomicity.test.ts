@@ -9,6 +9,7 @@ import { ServerConfig, loadConfig } from '../apps/api/src/config';
 import { startServer, type RunningServer } from '../apps/api/src/server';
 import { createGenerationProvider } from '../packages/providers/src';
 import {
+  claimIdentityOf,
   claimNextJob,
   finalisePause,
   finaliseWithPublication,
@@ -16,10 +17,12 @@ import {
   requestPause,
   requireJob,
   writeCheckpoint,
+  type ClaimIdentity,
   type CompleteInput,
 } from '../apps/worker/src/queue';
 import { runGenerationJob } from '../apps/worker/src/pipeline';
 import { startStubProvider, type StubProvider } from './helpers/stubProvider';
+import { barrierDirFor, runWorkerProcess } from './helpers/workerProcess';
 
 /**
  * Atomic publication (remediation v3 §2, step A).
@@ -496,12 +499,21 @@ describe('The finalisation gate', () => {
     return { jobId, deckId };
   }
 
+  /** The claim the row currently carries, as the worker holding it would hold it. */
+  function claimFor(jobId: string, workerId: string): ClaimIdentity {
+    return claimIdentityOf(requireJob(workerDb, jobId), workerId);
+  }
+
   function attempt(jobId: string, workerId: string, input: CompleteInput = COMPLETION) {
     let published = false;
 
-    const result = finaliseWithPublication(workerDb, jobId, { ...input, workerId }, () => {
-      published = true;
-    });
+    const result = finaliseWithPublication(
+      workerDb,
+      { ...input, claim: claimFor(jobId, workerId) },
+      () => {
+        published = true;
+      }
+    );
 
     return { result, published: () => published };
   }
@@ -536,7 +548,7 @@ describe('The finalisation gate', () => {
     // The stop is then recorded by the handler every other stop uses — the other half of "one of
     // the two valid outcomes, never a mixture": a paused run, with nothing published and no claim
     // left to expire.
-    finalisePause(workerDb, jobId, 'Paused before the publication committed.');
+    finalisePause(workerDb, claimFor(jobId, 'wrk_gate_paused'), 'Paused before the publication committed.');
 
     const paused = requireJob(workerDb, jobId);
     expect(paused.state).toBe('paused');
@@ -612,10 +624,17 @@ describe('The finalisation gate', () => {
     const { jobId } = await claimed('gate-throws.pdf', 'wrk_gate_throws');
 
     // Progress that would have been paid for, so that the rollback can be shown to keep it.
-    writeCheckpoint(workerDb, jobId, JSON.stringify({ paidFor: 'one batch of concepts' }));
+    writeCheckpoint(
+      workerDb,
+      claimFor(jobId, 'wrk_gate_throws'),
+      JSON.stringify({ paidFor: 'one batch of concepts' })
+    );
 
     expect(() =>
-      finaliseWithPublication(workerDb, jobId, { ...COMPLETION, workerId: 'wrk_gate_throws' }, () => {
+      finaliseWithPublication(
+        workerDb,
+        { ...COMPLETION, claim: claimFor(jobId, 'wrk_gate_throws') },
+        () => {
         workerDb
           .prepare(
             `INSERT INTO generation_concepts
@@ -716,13 +735,12 @@ describe('A worker killed mid-publication', () => {
   }
 
   /**
-   * Runs `tests/helpers/publishWorker.ts` against the shared database and kills it with `SIGKILL`
+   * Runs `tests/helpers/workerChild.ts` against the shared database and kills it with `SIGKILL`
    * at the named point. Nothing is cleaned up in the child: a killed process runs no `finally`,
    * which is exactly the state this test needs to observe.
    */
   async function killWorkerAt(point: 'before-commit' | 'after-commit', jobId: string): Promise<void> {
-    const barrierDir = mkdtempSync(join(scratch, `barrier-${point}-`));
-    const barrierPath = join(barrierDir, point);
+    const barrierDir = barrierDirFor(`publication-${point}`);
 
     if (point === 'before-commit') {
       // The run's completion, made slow. The child reaches it with every card, evidence row and
@@ -743,37 +761,23 @@ describe('A worker killed mid-publication', () => {
       `);
     }
 
-    const child = Bun.spawn(
-      [
-        'bun',
-        'tests/helpers/publishWorker.ts',
-        dbPath,
-        stub.url,
-        jobId,
-        barrierDir,
-        point,
-        `wrk_killed_${point.replace('-', '_')}`,
-      ],
-      { cwd: PROJECT_ROOT, stdout: 'pipe', stderr: 'pipe' }
-    );
-
     try {
-      if (point === 'before-commit') {
-        await waitForPublicationWindow(jobId);
-      } else {
-        const deadline = Date.now() + 30_000;
+      const outcome = await runWorkerProcess({
+        dbPath,
+        providerUrl: stub.url,
+        jobId,
+        workerId: `wrk_killed_${point.replace('-', '_')}`,
+        plan: point,
+        barrierDir,
+        // The two publication points differ in their barrier and in nothing else: before the commit
+        // the process is inside an open transaction, which the write lock reports, and after the
+        // commit it blocks itself on a file.
+        barrier: point === 'before-commit' ? 'write-lock' : 'file',
+        killAtBarrier: true,
+      });
 
-        while (!existsSync(barrierPath)) {
-          if (Date.now() > deadline) {
-            const stderr = await new Response(child.stderr as ReadableStream).text();
-            throw new Error(`the worker never reached its ${point} barrier: ${stderr}`);
-          }
-          await Bun.sleep(10);
-        }
-      }
-
-      child.kill(9);
-      await child.exited;
+      expect(outcome.barrierReached).toBe(true);
+      expect(outcome.signal).toBe('SIGKILL');
     } finally {
       if (point === 'before-commit') workerDb.exec('DROP TRIGGER IF EXISTS test_slow_publication');
     }

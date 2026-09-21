@@ -1,4 +1,5 @@
 import type { DocumentSection } from '@jevdeck/contracts';
+import { looksLikeCaption, MAX_CONTEXT_CHARS } from './figures';
 import { collectMedia, contentTypeFor, decodeXmlText, readRelationships } from './ooxml';
 import { chunkedSections, countWords } from './text';
 import type { IngestedMedia, IngestedPage, IngestedSource } from './types';
@@ -49,7 +50,15 @@ export async function readPptx(input: { fileName: string; bytes: Uint8Array }): 
     const notes = await readNotes(input.bytes, entries, notesPartBySlide.get(slide.entry.name));
 
     const text = [title, body, notes].filter(part => part.length > 0).join('\n\n');
-    const slideImages = await mediaForSlide(input.bytes, entries, slide.entry, collected, usedMedia, pageNumber);
+    const slideImages = await mediaForSlide(
+      input.bytes,
+      entries,
+      slide.entry,
+      collected,
+      usedMedia,
+      pageNumber,
+      text
+    );
 
     media.push(...slideImages);
     titleOfSlide.push(title.trim().length > 0 ? title.trim() : firstLineOf(text));
@@ -234,11 +243,18 @@ async function mediaForSlide(
   slideEntry: ZipEntry,
   collected: { byPath: Map<string, Uint8Array> },
   usedMedia: Set<string>,
-  pageNumber: number
+  pageNumber: number,
+  /** The slide's own text, which is the figure's context: a slide states little else. */
+  slideText: string
 ): Promise<IngestedMedia[]> {
   const relationships = await readRelationships(zip, entries, slideEntry.name);
   const xml = decodeText(await readZipEntry(zip, slideEntry));
   const items: IngestedMedia[] = [];
+  const caption = captionLineOf(slideText);
+  const context =
+    slideText.trim().length > MAX_CONTEXT_CHARS
+      ? `${slideText.trim().slice(0, MAX_CONTEXT_CHARS)}…`
+      : slideText.trim();
 
   for (const match of xml.matchAll(/<a:blip[^>]*r:embed="([^"]+)"/g)) {
     const path = relationships.get(match[1]);
@@ -248,11 +264,35 @@ async function mediaForSlide(
     if (!bytes) continue;
 
     const name = path.slice(path.lastIndexOf('/') + 1);
-    items.push({ pageNumber, kind: 'figure', name, contentType: contentTypeFor(name), bytes });
+    items.push({
+      pageNumber,
+      kind: 'figure',
+      name,
+      contentType: contentTypeFor(name),
+      bytes,
+      ...(caption ? { caption } : {}),
+      ...(context.length > 0 ? { context } : {}),
+    });
     usedMedia.add(path);
   }
 
   return items;
+}
+
+/**
+ * The slide line that reads as the figure's own label, if the slide states one.
+ *
+ * A slide carries so little text that the whole of it is the figure's context, so this is only about
+ * the caption: a line that begins `Figure 2:` is the deck labelling the picture, and a line that
+ * merely mentions the subject is not.
+ */
+function captionLineOf(text: string): string | null {
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed.length > 0 && looksLikeCaption(trimmed)) return trimmed;
+  }
+
+  return null;
 }
 
 function firstLineOf(text: string): string {

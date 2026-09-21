@@ -4,10 +4,13 @@ import {
   summariseExtraction,
   type ExtractionSummary,
   type IngestedSource,
+  type MediaAnchor,
   type MediaKind,
+  type OcrProvenance,
   type PageKind,
   type Pagination,
   type SourceFormat,
+  type TextSource,
 } from '@jevdeck/ingestion';
 
 /**
@@ -20,7 +23,16 @@ import {
  * keeping them here also removes the import cycle that used to run between the two files.
  */
 
-export type { ExtractionSummary, MediaKind, PageKind, Pagination, SourceFormat };
+export type {
+  ExtractionSummary,
+  MediaAnchor,
+  MediaKind,
+  OcrProvenance,
+  PageKind,
+  Pagination,
+  SourceFormat,
+  TextSource,
+};
 
 /** A page and what the reader concluded about it. */
 export interface ParsedPage {
@@ -29,9 +41,12 @@ export interface ParsedPage {
   pageLabel?: string;
   text: string;
   kind: PageKind;
+  /** Where the text came from, and what read the page's picture when it came from OCR. */
+  textSource?: TextSource;
+  ocr?: OcrProvenance;
 }
 
-/** An image the format carried, with its bytes. PDF images are not extracted here. */
+/** An image the format carried, with its bytes and the text that belongs to it. */
 export interface ParsedMedia {
   /** The page it sits on, or `0` when the format does not place it. */
   pageNumber: number;
@@ -39,6 +54,12 @@ export interface ParsedMedia {
   name: string;
   contentType: string;
   bytes: Uint8Array;
+  /** The document's own caption for the figure, when the page states one nearby. */
+  caption?: string;
+  /** The text around the figure, so it can be read without its page. */
+  context?: string;
+  /** Whether the bytes came out of the container or are this reader's crop of a page. */
+  anchor?: MediaAnchor;
 }
 
 export interface ParsedDocument {
@@ -78,6 +99,8 @@ export function fromIngested(source: IngestedSource): ParsedDocument {
       ...(page.pageLabel ? { pageLabel: page.pageLabel } : {}),
       text: page.text,
       kind: page.kind,
+      ...(page.textSource ? { textSource: page.textSource } : {}),
+      ...(page.ocr ? { ocr: page.ocr } : {}),
     })),
     media: source.media.map(item => ({
       pageNumber: item.pageNumber,
@@ -85,6 +108,9 @@ export function fromIngested(source: IngestedSource): ParsedDocument {
       name: item.name,
       contentType: item.contentType,
       bytes: item.bytes,
+      ...(item.caption ? { caption: item.caption } : {}),
+      ...(item.context ? { context: item.context } : {}),
+      ...(item.anchor ? { anchor: item.anchor } : {}),
     })),
     blankPages: [...source.blankPages],
     unextractedPages: [...source.unextractedPages],

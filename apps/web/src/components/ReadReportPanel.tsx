@@ -8,9 +8,12 @@ import type { ReadReport } from '../lib/readReport';
  *
  * A page that yielded no text is one of two different things — a blank divider, which is a result,
  * or a page whose content is a picture, which is a gap — and this panel keeps them apart instead of
- * reporting one number called "empty". The limitations below the counts are the reader's own words,
- * stored with the document, so a reader reopened after a restart says exactly what it said when it
- * was first read.
+ * reporting one number called "empty". Within that gap it keeps a second distinction: a page whose
+ * picture was stored can still be read, and one with nothing stored cannot. Text read *off* a
+ * picture is named separately again, with who read it, because a card resting on a model's
+ * transcription is a different claim from a card resting on the document's own text. The
+ * limitations below the counts are the reader's own words, stored with the document, so a reader
+ * reopened after a restart says exactly what it said when it was first read.
  *
  * The images are listed with their page and served one at a time, to the account that owns the
  * document. Nothing here is a placeholder for media that does not exist.
@@ -58,6 +61,11 @@ export const ReadReportPanel: React.FC<{ report: ReadReport }> = ({ report }) =>
             ? 'No images stored with this document'
             : `${report.mediaCount} image${report.mediaCount === 1 ? '' : 's'} stored`}
         </span>
+        {report.captionedFigures > 0 && (
+          <span className="text-slate-500">
+            {report.captionedFigures} of them with the document’s own caption
+          </span>
+        )}
         {report.mediaCount > 0 && (
           <button
             onClick={() => setShowMedia(previous => !previous)}
@@ -72,6 +80,16 @@ export const ReadReportPanel: React.FC<{ report: ReadReport }> = ({ report }) =>
             : 'There is no page image for this format; the stored text is the record.'}
         </span>
       </div>
+
+      {report.ocrPages > 0 && (
+        <p className="text-[11px] text-slate-400 leading-relaxed">
+          {report.ocrPages} page{report.ocrPages === 1 ? '' : 's'} carry no text of their own and{' '}
+          {report.ocrPages === 1 ? 'was' : 'were'} read off a picture instead
+          {report.ocrReaders.length > 0 ? ` by ${report.ocrReaders.join(', ')}` : ''}. That text is a
+          transcription of an image rather than text the document wrote, and the pages holding it
+          record which one it is.
+        </p>
+      )}
 
       {showMedia && report.media.length > 0 && (
         <div className="space-y-3">
@@ -106,11 +124,25 @@ export const ReadReportPanel: React.FC<{ report: ReadReport }> = ({ report }) =>
       )}
 
       {report.unextractedPages > 0 && (
-        <p className="text-[11px] text-amber-200/90 leading-relaxed">
-          {report.unextractedPages} page{report.unextractedPages === 1 ? '' : 's'} hold content this
-          build cannot read — a scan, or an image of text. Nothing on them can be turned into cards
-          or counted as covered, and they are reported rather than silently skipped.
-        </p>
+        <div className="space-y-1">
+          <p className="text-[11px] text-amber-200/90 leading-relaxed">
+            {report.unextractedPages} page{report.unextractedPages === 1 ? '' : 's'} hold content this
+            build could not read — a scan, or an image of text. Nothing on them can be turned into
+            cards or counted as covered, and they are reported rather than silently skipped.
+          </p>
+          {report.unreadPictures > 0 && (
+            <p className="text-[11px] text-slate-400 leading-relaxed">
+              {report.unreadPictures} of them kept a readable picture, so a run can still read{' '}
+              {report.unreadPictures === 1 ? 'it' : 'them'} — the gap is closable, not permanent.
+            </p>
+          )}
+          {report.unreadWithoutPicture > 0 && (
+            <p className="text-[11px] text-amber-300/80 leading-relaxed">
+              {report.unreadWithoutPicture} of them kept no picture at all: this build stored nothing
+              that could be read, so re-running it cannot close {report.unreadWithoutPicture === 1 ? 'this gap' : 'these gaps'}.
+            </p>
+          )}
+        </div>
       )}
     </div>
   );
@@ -169,6 +201,9 @@ const StoredImage: React.FC<{ item: StoredMediaItem }> = ({ item }) => {
           {item.kind} · {item.pageAnchored ? `page ${item.pageIndex}` : 'page not recorded'} ·{' '}
           {formatBytes(item.byteSize)}
         </div>
+        {item.caption && (
+          <div className="text-[10px] text-slate-400 leading-snug line-clamp-2">{item.caption}</div>
+        )}
       </figcaption>
     </figure>
   );

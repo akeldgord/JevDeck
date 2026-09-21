@@ -233,10 +233,9 @@ describe('Prompt library', () => {
   });
 
   it('records the prompt version and hash the provider was built with', async () => {
-    const provider = createGenerationProvider(configFor()) as unknown as {
-      promptVersions: Record<string, string>;
-      promptHashes: Record<string, string>;
-    };
+    // No cast: the prompt metadata is part of the provider interface, because the pipeline records
+    // it in the fingerprint a run's saved progress is keyed to.
+    const provider = createGenerationProvider(configFor());
 
     expect(provider.promptVersions['cards/generate.v1']).toBe('v1');
     expect(provider.promptHashes['cards/generate.v1']).toMatch(/^[0-9a-f]{64}$/);

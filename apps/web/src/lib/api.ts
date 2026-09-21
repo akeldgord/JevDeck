@@ -6,9 +6,9 @@
  * carry the CSRF token the server issued for the session.
  */
 
-import type { CoverageSummary, GenerationJob } from '@jevdeck/contracts';
+import type { CoverageSummary, GenerationJob, ShareScope, ShareScopeChoice } from '@jevdeck/contracts';
 
-export type { GenerationJob };
+export type { GenerationJob, ShareScope, ShareScopeChoice };
 
 export class ApiClientError extends Error {
   readonly status: number;
@@ -182,6 +182,12 @@ export interface StoredMediaItem {
   byteSize: number;
   /** False when the format did not place the image on a page. */
   pageAnchored: boolean;
+  /** The document's own caption for the figure, when the page stated one nearby. */
+  caption: string | null;
+  /** The text around the figure. */
+  context: string;
+  /** `embedded` when the format carried the bytes, `page-crop` when this build cropped the page. */
+  source: string;
 }
 
 /** Row shapes as stored. Source text is served verbatim, so the wire keeps the raw columns. */
@@ -191,11 +197,20 @@ export interface StoredSourceBlock {
   page_label: string | null;
   ordinal: number;
   /**
-   * `text`, `blank` for a page with nothing on it, or `image-only` for a page whose content is a
-   * picture this build cannot read. Those last two are different facts, not two spellings of empty.
+   * `text`, `blank` for a page with nothing on it, `image-only` for a page whose content is a
+   * picture nobody has read, or `ocr-text` for text read off a picture. Those are four different
+   * facts, not four spellings of empty.
    */
   kind?: string;
   raw_text: string;
+  /** `native` is the document's own text; `ocr` means a picture was read; `none` means nobody did. */
+  text_source?: string | null;
+  /** What happened when the page's picture was read, when an attempt was made. */
+  ocr_status?: string | null;
+  ocr_engine?: string | null;
+  ocr_model?: string | null;
+  ocr_confidence?: number | null;
+  ocr_error?: string | null;
 }
 
 export interface StoredSection {
@@ -234,13 +249,23 @@ export interface StoredDeck {
   createdAt: string;
   updatedAt: string;
   access: 'owner' | 'shared';
+  /** The scope of the share that reaches this deck, or `null` when the caller owns it. */
+  shareScope?: ShareScope | null;
+  /**
+   * Whether the caller may ask the server for this deck's source material.
+   *
+   * Served rather than derived: the scope that grants it is the server's rule, and a client that
+   * recomputed it could offer a viewer the server refuses.
+   */
+  sourceAccess?: boolean;
 }
 
 /**
- * One account's study access to a deck.
+ * One account's access to a deck, and what that access carries.
  *
- * There is no source-sharing scope here on purpose: the document endpoints are owner-only, so a
- * share grants card review and nothing else.
+ * `study` is the cards and the recipient's own schedule. `study_and_source` adds the document the
+ * cards were built from — its stored pages, its figures and the original file. Neither scope
+ * carries anything that changes the deck: that stays with the owner.
  */
 export interface DeckShare {
   id?: string;
@@ -249,7 +274,7 @@ export interface DeckShare {
   shared_with_user_id?: string;
   email: string;
   name?: string;
-  scope: 'study';
+  scope: ShareScope;
   createdAt?: string;
   created_at?: string;
 }
@@ -454,6 +479,22 @@ export interface StoredEvidence {
   span_start: number;
   span_end: number;
   excerpt: string;
+  /**
+   * The source figures the server decided this citation may show.
+   *
+   * Decided by the server rather than by the client, and absent rather than empty on a response
+   * from a build that did not send them — the difference between "the source states no figure
+   * here" and "this card predates figures" is one a screen is entitled to keep.
+   */
+  figures?: Array<{
+    id: string;
+    pageIndex: number;
+    kind: string;
+    name: string;
+    caption: string | null;
+    contentType: string;
+    hasBytes: boolean;
+  }>;
 }
 
 /** One concept in a job's inventory, with the decision taken about it. */
@@ -549,7 +590,7 @@ export const api = {
     contentHash?: string;
     bytesBase64?: string;
     /** Which reader produced these pages. */
-    sourceFormat?: 'pdf' | 'text' | 'markdown' | 'notes' | 'docx' | 'pptx';
+    sourceFormat?: 'pdf' | 'text' | 'markdown' | 'notes' | 'docx' | 'pptx' | 'image';
     /** Whether the page numbers are the document's own or this import's. */
     pagination?: 'explicit' | 'virtual' | 'mixed';
     /** What the reader did not do. Stored with the version, so the report cannot forget it. */
@@ -559,7 +600,18 @@ export const api = {
       pageLabel?: string;
       text: string;
       /** Omitted for a page with text; required to distinguish a blank page from a scan. */
-      kind?: 'text' | 'blank' | 'image-only';
+      kind?: 'text' | 'blank' | 'image-only' | 'ocr-text';
+      /** Where the text came from. Omitted when it is the document's own. */
+      textSource?: 'native' | 'ocr' | 'none';
+      /** What read the page's picture, and how well it went. */
+      ocr?: {
+        status: 'succeeded' | 'failed' | 'unavailable';
+        engine: string;
+        model: string;
+        promptVersion?: string;
+        confidence: number | null;
+        error?: string;
+      };
     }>;
     media?: Array<{
       pageNumber: number;
@@ -567,6 +619,11 @@ export const api = {
       name: string;
       contentType: string;
       bytesBase64: string;
+      /** The document's own caption for the figure, when one was found nearby. */
+      caption?: string;
+      /** The text around the figure. */
+      context?: string;
+      source?: 'embedded' | 'page-crop';
     }>;
     sections?: Array<{
       clientId: string;
@@ -667,17 +724,30 @@ export const api = {
    *
    * Owner only: the server answers 403 for anyone else, because the list names other accounts.
    */
+  /**
+   * The deck's shares, the scopes that may be chosen, and whether this deck has a source to share.
+   *
+   * The choices come from the server so the sentence an owner reads before sharing is the same one
+   * the server states when it grants the share.
+   */
   deckShares: (deckId: string, signal?: AbortSignal) =>
-    request<{ shares: DeckShare[] }>(`/api/decks/${deckId}/shares`, { signal }),
+    request<{ shares: DeckShare[]; scopes: ShareScopeChoice[]; sourceAvailable: boolean }>(
+      `/api/decks/${deckId}/shares`,
+      { signal }
+    ),
 
   /**
-   * Shares a deck for study, by email.
+   * Shares a deck with an account, by email, under one of the two scopes.
    *
-   * Only `study` is accepted: source access stays with the owner, and the server refuses a scope
-   * it cannot actually enforce rather than storing one.
+   * The server grants the scope it was asked for and no other: `study` is the cards, and
+   * `study_and_source` adds the document the deck was built from. Requesting any other value is a
+   * 400 rather than a silently reduced share.
    */
-  shareDeck: (deckId: string, body: { email: string; scope?: 'study' }) =>
-    request<{ share: DeckShare }>(`/api/decks/${deckId}/shares`, { method: 'POST', body }),
+  shareDeck: (deckId: string, body: { email: string; scope?: ShareScope }) =>
+    request<{ share: DeckShare; disclosure?: string }>(`/api/decks/${deckId}/shares`, {
+      method: 'POST',
+      body,
+    }),
 
   revokeShare: (deckId: string, userId: string) =>
     request<{ revoked: boolean }>(`/api/decks/${deckId}/shares/${userId}`, { method: 'DELETE' }),
@@ -738,6 +808,10 @@ export const api = {
    * or starts its plan again; `cancelled` is terminal and starting over is a new run; and
    * `restart_required` carries the `reason` its stored progress cannot be used, so the screen can
    * offer a new run instead of spending again under the label “resume”.
+   *
+   * `repeatedDispatches` is how many calls this resume accepted the risk of repeating. A run that
+   * stopped because a call went out and its outcome was never recorded holds one or more, and the
+   * screen says so: continuing those is a decision about money, not a formality.
    */
   resumeJob: (id: string) =>
     request<{
@@ -745,6 +819,7 @@ export const api = {
       fromCheckpoint: boolean;
       resumed: boolean;
       reason: string | null;
+      repeatedDispatches: number;
       job: GenerationJob;
     }>(`/api/jobs/${id}/resume`, { method: 'POST' }),
 

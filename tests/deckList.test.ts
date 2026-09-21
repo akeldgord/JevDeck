@@ -6,9 +6,11 @@ import type { StoredDeck } from '../apps/web/src/lib/api';
  * The decks screen's rules, tested where they can be tested: as pure functions.
  *
  * What a row *offers* is a claim about what the server will *allow*, and the two must match or the
- * screen shows dead buttons. The rules here mirror the endpoints — export and source access are
- * `requireOwnedDeck`, sharing is owner-only, and only `study` is ever granted to another account —
- * and `tests/api-v2-5.test.ts` checks the endpoints those rules describe.
+ * screen shows dead buttons. The rules here mirror the endpoints — export, sharing and deletion are
+ * `requireOwnedDeck`, and source access follows the share's scope, which the server states on the
+ * row (`sourceAccess`) rather than leaving the screen to infer it — and `tests/api-v2-5.test.ts`,
+ * `tests/api-share-export.test.ts` and `tests/share-source-access.test.ts` check the endpoints
+ * those rules describe.
  */
 
 function deck(overrides: Partial<StoredDeck> = {}): StoredDeck {
@@ -47,10 +49,10 @@ describe('What a row may offer', () => {
     expect(row.accessLabel).toBe('Yours');
   });
 
-  it('offers a shared deck study and nothing that belongs to its owner', () => {
+  it('offers a study-only share study and nothing that belongs to its owner', () => {
     const list = buildDeckList({
       owned: [],
-      shared: [deck({ access: 'shared' })],
+      shared: [deck({ access: 'shared', shareScope: 'study', sourceAccess: false })],
       documentNames,
     });
     const row = list.shared[0];
@@ -63,11 +65,47 @@ describe('What a row may offer', () => {
     expect(row.can.share).toBe(false);
     expect(row.can.remove).toBe(false);
 
-    // And the screen says why, with the owner's document name withheld even though the viewer can
-    // read it: the source document is not part of the share.
+    // And the screen says why, with the owner's document name withheld: the source document is not
+    // part of this share, so naming it would be naming a file this account cannot open.
     expect(row.exportBlockedReason).toContain('owner');
+    expect(row.sourceBlockedReason).toContain('study only');
     expect(row.documentName).toBeNull();
     expect(row.accessLabel).toBe('Shared with you');
+  });
+
+  it('offers a source share the viewer, the original and the figures', () => {
+    const list = buildDeckList({
+      owned: [],
+      shared: [deck({ access: 'shared', shareScope: 'study_and_source', sourceAccess: true })],
+      documentNames,
+    });
+    const row = list.shared[0];
+
+    // The document is readable through the share, so the row may offer its source by name.
+    expect(row.can.readSource).toBe(true);
+    expect(row.sourceBlockedReason).toBeNull();
+    expect(row.documentName).toBe('Glycolysis.docx');
+    expect(row.accessDetail).toContain('source');
+
+    // Everything that changes the deck is still the owner's, whatever the scope.
+    expect(row.can.open).toBe(false);
+    expect(row.can.exportPackage).toBe(false);
+    expect(row.can.share).toBe(false);
+    expect(row.can.remove).toBe(false);
+  });
+
+  it('withholds the source of a share whose scope the server did not state', () => {
+    // `sourceAccess` is the server's answer. A row that arrived without it — an older server, or a
+    // client that invented the flag — offers nothing extra rather than guessing in the reader's
+    // favour: a viewer the server refuses is worse than a viewer that was never offered.
+    const list = buildDeckList({
+      owned: [],
+      shared: [deck({ access: 'shared', sourceAccess: undefined })],
+      documentNames,
+    });
+
+    expect(list.shared[0].can.readSource).toBe(false);
+    expect(list.shared[0].sourceBlockedReason).not.toBeNull();
   });
 
   it('refuses to export a deck with no cards, and says so', () => {
@@ -95,6 +133,9 @@ describe('What a row may offer', () => {
     expect(row.can.open).toBe(false);
     expect(row.can.readSource).toBe(false);
     expect(row.openBlockedReason).toContain('deleted');
+    // Missing for an owner is not the share rule, so the row does not blame a scope that was never
+    // involved: the deleted-document reason is the one shown.
+    expect(row.sourceBlockedReason).toBeNull();
     // Its cards are still there, so it can still be studied and exported.
     expect(row.can.study).toBe(true);
     expect(row.can.exportPackage).toBe(true);

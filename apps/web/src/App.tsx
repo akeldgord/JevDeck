@@ -75,6 +75,26 @@ function readInvitationToken(): string | null {
   return params.get('token') ?? params.get('invite');
 }
 
+/**
+ * Applies a change to every section in the tree, not only its top level.
+ *
+ * A subsection is selectable material in its own right — the server expands a selected parent, but
+ * a parent cannot be made to stand in for a child somebody wants excluded — so a toggle that only
+ * walked the top level would silently do nothing on the rows the outline nests.
+ */
+function mapSectionTree(
+  list: DocumentSection[],
+  change: (section: DocumentSection) => DocumentSection
+): DocumentSection[] {
+  return list.map(section => {
+    const changed = change(section);
+    const children = section.subsections;
+    return children && children.length > 0
+      ? { ...changed, subsections: mapSectionTree(children, change) }
+      : changed;
+  });
+}
+
 export default function App() {
   const session = useSession();
   const capabilities = session.capabilities;
@@ -156,6 +176,14 @@ export default function App() {
   const [activeDeckAccess, setActiveDeckAccess] = useState<'owner' | 'shared'>('owner');
   /** The shared deck currently being opened, so its button can show progress. */
   const [openingDeckId, setOpeningDeckId] = useState<string | null>(null);
+  /**
+   * Names of documents read through a share, keyed by document id.
+   *
+   * The stored-document list is the caller's own, so a document reached through a shared deck is
+   * not in it. Its name is learned when the deck is opened, and kept so the row can name the file
+   * it can actually open rather than showing a shared source document as anonymous.
+   */
+  const [sharedDocumentNames, setSharedDocumentNames] = useState<Record<string, string>>({});
 
   // Generation progress, exactly as the API reports it. `null` means no run has been started.
   const [generation, setGeneration] = useState<JobStatus | null>(null);
@@ -343,10 +371,14 @@ export default function App() {
   }, []);
 
   const handleToggleSection = (id: string) =>
-    setSections(previous => previous.map(section => (section.id === id ? { ...section, selected: !section.selected } : section)));
+    setSections(previous =>
+      mapSectionTree(previous, section =>
+        section.id === id ? { ...section, selected: !section.selected } : section
+      )
+    );
 
   const handleSelectAll = (select: boolean) =>
-    setSections(previous => previous.map(section => ({ ...section, selected: select })));
+    setSections(previous => mapSectionTree(previous, section => ({ ...section, selected: select })));
 
   /**
    * A deck is bound to exactly one document, so loading a new document starts a new deck and
@@ -417,9 +449,14 @@ export default function App() {
       setActiveDeckId(createdDeck.deck.id);
       setActiveDeckAccess('owner');
       // What was read is now the server's record, so the report is rebuilt from the stored rows
-      // rather than left showing the browser's copy of the parse.
-      const stored = await api.getDocument(created.document.id);
-      setReadReport(readReportFromStored(stored));
+      // rather than left showing the browser's copy of the parse. The section tree comes from there
+      // too, and for a reason that is not cosmetic: the parser's section ids are its own (`sec-1`),
+      // while a run is scoped by the ids the server assigned. Keeping the browser's copy would send
+      // a selection the server cannot match, and the run would stop with nothing selected.
+      //
+      // `hasCustomToc` is deliberately left as the reader reported it: it records whether the file
+      // states an outline of its own, and a chunked fallback section is not a table of contents.
+      await reloadStoredSource(created.document.id);
 
       setDeck(previous =>
         previous
@@ -490,8 +527,10 @@ export default function App() {
       setSections(storedSections);
       setHasCustomToc(storedSections.length > 0);
       // The reader's own account of this document, from the stored rows: the page kinds it
-      // recorded, its stored limitations, and the images it kept.
-      setReadReport(readReportFromStored(detail));
+      // recorded, its stored limitations, and the images it kept. Held in a local as well, because
+      // the state it is written to is not readable in this closure yet.
+      const report = readReportFromStored(detail);
+      setReadReport(report);
       setInspectingCard(null);
       setActiveDocumentId(documentId);
       setActiveDeckId(usableDeck.id);
@@ -515,8 +554,11 @@ export default function App() {
         new Map(detail.sections.map(section => [section.id, section.title]))
       );
 
-      // The stored original, when it was retained, so the source viewer shows the real page.
-      if (detail.version.hasSourceBytes) {
+      // The stored original, when it was retained *and* this format can be re-rendered here. A
+      // Word or slide original is kept and downloadable, but the browser has no page renderer for
+      // it, and attaching those bytes to the page viewer draws a broken frame where the source
+      // should be. What the viewer says instead is that the stored text is the record.
+      if (report.rendersPages) {
         setPdfBytes(await api.fetchDocumentSource(documentId));
       } else {
         setPdfBytes(null);
@@ -533,11 +575,13 @@ export default function App() {
   };
 
   /**
-   * Opens a deck that someone else owns, for study.
+   * Opens a deck that someone else owns, for study — and at its source when the share carries it.
    *
-   * There is no document to read here: the source belongs to the owner, which is exactly what the
-   * server enforces. The deck's cards and this account's own schedule are read from the server, so
-   * a shared deck studies like any other deck while its source stays unreadable.
+   * Which of the two this is comes from the server's own answer on the row (`sourceAccess`), not
+   * from a guess here: a `study_and_source` share reads the document representation, the stored
+   * pages and the original file exactly as the owner does, and a `study` share reaches none of it.
+   * Either way the cards and this account's own schedule come from the server, so a shared deck
+   * studies like any other.
    */
   const handleOpenSharedDeck = async (deckId: string): Promise<boolean> => {
     const storedDeck = storedDecks.find(entry => entry.id === deckId);
@@ -555,18 +599,63 @@ export default function App() {
       setGenerationError(null);
       setInspectingCard(null);
 
-      // Nothing about the owner's document is loaded, because none of it is readable here.
+      setActiveDeckId(storedDeck.id);
+      setActiveDeckAccess(storedDeck.access);
+
+      // A share that carries source access opens the deck the same way its owner's would: the
+      // document representation, the stored pages and the original file. The server states which
+      // scopes carry it, so this is not a client-side guess about a permission.
+      if (storedDeck.sourceAccess && storedDeck.documentId) {
+        const detail = await api.getDocument(storedDeck.documentId);
+        const storedPages = pagesFromStoredDocument(detail);
+        const storedSections = sectionsFromStoredDocument(detail, storedPages);
+
+        const report = readReportFromStored(detail);
+
+        setPages(storedPages);
+        setSections(storedSections);
+        setHasCustomToc(storedSections.length > 0);
+        setReadReport(report);
+        setActiveDocumentId(storedDeck.documentId);
+        setSharedDocumentNames(previous => ({
+          ...previous,
+          [storedDeck.documentId as string]: detail.document.name,
+        }));
+        setDeck(
+          deckFromStoredDeck(storedDeck, {
+            name: detail.document.name,
+            pageCount: detail.document.pageCount,
+          })
+        );
+
+        await loadDeckCards(
+          storedDeck.id,
+          storedDeck.documentId,
+          new Map(detail.sections.map(section => [section.id, section.title]))
+        );
+
+        if (report.rendersPages) {
+          setPdfBytes(await api.fetchDocumentSource(storedDeck.documentId));
+        } else {
+          setPdfBytes(null);
+        }
+
+        setStorageNotice(
+          `Opened “${storedDeck.title}”, shared with you for study and source.`
+        );
+        return true;
+      }
+
+      // A study-only share: none of the owner's document is readable here.
       setActiveDocumentId(null);
       setPages([]);
       setSections([]);
       setHasCustomToc(false);
       setPdfBytes(null);
-      // The source document is not readable here, so there is no read report to show: a report
-      // built from a document this account cannot open would be a report about someone else's file.
+      // No readable document means no read report: a report built from a file this account cannot
+      // open would be a report about someone else's document.
       setReadReport(null);
 
-      setActiveDeckId(storedDeck.id);
-      setActiveDeckAccess(storedDeck.access);
       setDeck(
         deckFromStoredDeck(storedDeck, { name: storedDeck.title, pageCount: 0 })
       );
@@ -729,10 +818,11 @@ export default function App() {
   };
 
   /**
-   * Opens the deck a browsing row names, with its source when this account owns it.
+   * Opens the deck a browsing row names, with its source when this account may read it.
    *
-   * A shared deck opens its cards and nothing else, because its document is not readable here —
-   * the server refuses it, so offering the source would be a dead end.
+   * A shared deck opens its cards, and its source too when the share carries it; a study-only
+   * share reaches no further, because the server refuses the document and offering it would be a
+   * dead end.
    */
   const handleOpenDeckRow = async (deckId: string): Promise<boolean> => {
     const row = storedDecks.find(entry => entry.id === deckId);
@@ -888,6 +978,21 @@ export default function App() {
    * Demo mode is the only path that produces cards locally, and it is labelled as a simulation.
    */
   /**
+   * Rebuilds the source view from the stored rows.
+   *
+   * Called after anything that writes to those rows — an upload, and a run that read pages nobody
+   * had read. The section ids are the server's, which is also what a selection has to send, and the
+   * coverage report describes the source as it is stored now rather than as it was when loaded.
+   */
+  const reloadStoredSource = async (documentId: string): Promise<void> => {
+    const detail = await api.getDocument(documentId);
+    const storedPages = pagesFromStoredDocument(detail);
+    setPages(storedPages);
+    setSections(sectionsFromStoredDocument(detail, storedPages));
+    setReadReport(readReportFromStored(detail));
+  };
+
+  /**
    * Follows a queued run to its end and loads what it produced.
    *
    * Separate from starting one because a resumed run has to be followed too: resuming puts the job
@@ -971,6 +1076,16 @@ export default function App() {
           }
         : previous
     );
+
+    // A run reads the pages whose content is a picture (step F2), which changes the stored source:
+    // a page that was unread content is now text read off a picture. The screen follows the rows
+    // rather than the parse it uploaded, so the coverage it reports is the one that exists now.
+    const runDocumentId = stored.deck.documentId ?? deck?.documentId ?? '';
+    if (runDocumentId) {
+      await reloadStoredSource(runDocumentId).catch(() => undefined);
+      if (!stillCurrent()) return;
+    }
+
     setActiveTab('study');
   };
 
@@ -1171,13 +1286,28 @@ export default function App() {
       return;
     }
 
+    // What the person is told about the run they just queued. Both facts matter and they are not
+    // alternatives, so they are stated together rather than one overwriting the other: whether it is
+    // continuing from stored progress or starting its plan again, and whether continuing repeats
+    // any call that was sent but never answered — which is a real possibility of a second charge.
+    const notices: string[] = [];
+
     // A resumed run with no stored progress is not the same promise as one continuing from it, so
     // the screen says which of the two happened rather than leaving the button's label to imply it.
     if (!result.fromCheckpoint) {
-      setJobActionNotice(
-        'This run had no stored progress, so it was queued to start from the beginning.'
+      notices.push('This run had no stored progress, so it was queued to start from the beginning.');
+    }
+
+    if (result.repeatedDispatches > 0) {
+      const calls = result.repeatedDispatches === 1 ? 'call' : 'calls';
+      notices.push(
+        `${result.repeatedDispatches} provider ${calls} were sent before this run stopped and their ` +
+          'outcome was never recorded, so repeating them may incur another charge; their reservations ' +
+          'are kept for an administrator to reconcile against the invoice.'
       );
     }
+
+    if (notices.length > 0) setJobActionNotice(notices.join(' '));
 
     const runId = generationRunRef.current + 1;
     generationRunRef.current = runId;
@@ -1365,18 +1495,21 @@ export default function App() {
    * The decks screen's rows.
    *
    * Derived from what the server returned, with the actions each row may offer matching what the
-   * server will allow — export and source access are owner-only, and a shared row says why instead
-   * of showing a button that would be refused.
+   * server will allow — export is owner-only, source access follows the share's scope, and a row
+   * says why an action is unavailable instead of showing a button that would be refused.
    */
   const deckList = useMemo(
     () =>
       buildDeckList({
         owned: storedDecks.filter(entry => entry.access === 'owner'),
         shared: sharedDecks,
-        documentNames: new Map(storedDocuments.map(document => [document.id, document.name])),
+        documentNames: new Map([
+          ...storedDocuments.map(document => [document.id, document.name] as const),
+          ...Object.entries(sharedDocumentNames),
+        ]),
         activeDeckId,
       }),
-    [activeDeckId, sharedDecks, storedDecks, storedDocuments]
+    [activeDeckId, sharedDecks, storedDecks, storedDocuments, sharedDocumentNames]
   );
 
   /** Why generation is unavailable right now, or `null` when it is available. */
@@ -1447,6 +1580,7 @@ export default function App() {
                   id: deck.id,
                   title: deck.title,
                   cardCount: deck.cardCount,
+                  sourceAccess: deck.sourceAccess === true,
                 }))}
                 onOpen={deckId => void handleOpenSharedDeck(deckId)}
                 busyDeckId={openingDeckId}

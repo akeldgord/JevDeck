@@ -97,6 +97,11 @@ export const GenerationResult: React.FC<Props> = ({
   // tells them apart — the state alone does not, because a cancelled run is terminal too.
   const wasCancelled = jobStatus?.job.errorCode === 'cancelled_by_user';
   const wasPaused = jobStatus?.job.state === 'paused' || jobStatus?.job.errorCode === 'paused_by_user';
+  // A run that stopped because a call was sent and never answered is neither a breakage nor a stop
+  // somebody asked for: it is waiting for a decision about money. It reads as that, and its control
+  // says what continuing costs rather than implying it is free.
+  const needsChargeDecision = jobStatus?.job.errorCode === 'charge_confirmation_required';
+  const quiet = wasCancelled || wasPaused || needsChargeDecision;
   // Anything stopped can ask to be queued again, and the server answers with what will actually
   // happen: it continues from stored progress, or it starts its plan from the beginning, or it
   // refuses and asks for a new run. Requiring a checkpoint here would have hidden the first and
@@ -110,12 +115,12 @@ export const GenerationResult: React.FC<Props> = ({
     return (
       <div
         className={`bg-slate-900/70 border rounded-2xl p-6 space-y-3 ${
-          wasCancelled || wasPaused ? 'border-slate-800' : 'border-red-900/60'
+          quiet ? 'border-slate-800' : 'border-red-900/60'
         }`}
       >
         <h2
           className={`text-sm font-bold flex items-center gap-2 ${
-            wasCancelled || wasPaused ? 'text-slate-200' : 'text-red-200'
+            quiet ? 'text-slate-200' : 'text-red-200'
           }`}
         >
           {wasPaused ? (
@@ -129,12 +134,12 @@ export const GenerationResult: React.FC<Props> = ({
             ? 'Generation is paused'
             : wasCancelled
               ? 'Generation was cancelled'
-              : 'Generation did not finish'}
+              : needsChargeDecision
+                ? 'This run needs a decision before it continues'
+                : 'Generation did not finish'}
         </h2>
         <p
-          className={`text-xs leading-relaxed ${
-            wasCancelled || wasPaused ? 'text-slate-400' : 'text-red-200/90'
-          }`}
+          className={`text-xs leading-relaxed ${quiet ? 'text-slate-400' : 'text-red-200/90'}`}
         >
           {error}
         </p>
@@ -148,12 +153,14 @@ export const GenerationResult: React.FC<Props> = ({
               className="inline-flex items-center gap-2 rounded-lg border border-emerald-800 bg-emerald-950/50 px-3 py-1.5 text-xs font-semibold text-emerald-200 transition-colors hover:bg-emerald-950 disabled:opacity-60"
             >
               <Play className="w-3.5 h-3.5" />
-              {busy ? 'Resuming…' : 'Resume run'}
+              {busy ? 'Resuming…' : needsChargeDecision ? 'Continue run anyway' : 'Resume run'}
             </button>
             <p className="text-[11px] text-slate-500">
-              {jobStatus?.job.hasCheckpoint
-                ? 'Resuming continues from the concepts and cards this run had already paid for, rather than generating them again.'
-                : 'This run has no stored progress yet, so resuming it starts this work from the beginning.'}
+              {needsChargeDecision
+                ? 'Resuming repeats the call whose outcome was never recorded. It may already have been charged, and repeating it may incur a second charge; everything else this run paid for is reused rather than generated again.'
+                : jobStatus?.job.hasCheckpoint
+                  ? 'Resuming continues from the concepts and cards this run had already paid for, rather than generating them again.'
+                  : 'This run has no stored progress yet, so resuming it starts this work from the beginning.'}
             </p>
           </div>
         )}

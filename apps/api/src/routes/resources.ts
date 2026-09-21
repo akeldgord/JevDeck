@@ -2,15 +2,34 @@ import { Database } from 'bun:sqlite';
 // The `.apkg` writer only, through its own entry point: the package root is the browser-safe
 // formatter module, and importing the writer from there would drag `bun:sqlite` into the web bundle.
 import { buildApkg } from '@jevdeck/anki-export/apkg';
-import { COVERAGE_MODES, CoverageMode } from '@jevdeck/contracts';
 import {
+  COVERAGE_MODES,
+  CoverageMode,
+  SHARE_SCOPES,
+  ShareScope,
+  ShareScopeChoice,
+  SOURCE_SHARE_SCOPE,
+  shareGrantsSource,
+} from '@jevdeck/contracts';
+import {
+  figuresByEvidence,
+  MEDIA_ANCHORS,
   MEDIA_KINDS,
+  OCR_STATUSES,
   PAGE_KINDS,
   SUPPORTED_FORMATS,
+  TEXT_SOURCES,
+  imageTypeOf,
+  type StoredFigure,
+  type MediaAnchor,
   type MediaKind,
   type PageKind,
+  type OcrProvenance,
+  type OcrStatus,
   type Pagination,
   type SourceFormat,
+  type TextSource,
+  pageIsReadable,
 } from '@jevdeck/ingestion';
 import { calculateSM2 } from '@jevdeck/scheduling';
 import {
@@ -64,14 +83,117 @@ const PAGINATIONS: readonly Pagination[] = ['explicit', 'virtual', 'mixed'];
  * a caller calling the page blank.
  */
 function readPageKind(value: unknown, text: string, field: string): PageKind {
-  if (text.length > 0) return 'text';
-  if (value === undefined || value === null) return 'blank';
+  if (value === undefined || value === null) return text.length > 0 ? 'text' : 'blank';
   if (!PAGE_KINDS.includes(value as PageKind)) {
     throw badRequest(`\`${field}\` must be one of: ${PAGE_KINDS.join(', ')}.`, 'invalid_page_kind', {
       field,
     });
   }
-  return value as PageKind;
+
+  const kind = value as PageKind;
+
+  // Text always wins over the label: extractable prose cannot be made to disappear by a caller
+  // calling the page blank. The reverse is refused rather than silently corrected, because a
+  // caller claiming text on a page it sent nothing for is describing a page that does not exist.
+  if (!pageIsReadable(kind)) return text.length > 0 ? 'text' : kind;
+  if (text.length === 0) {
+    throw badRequest(
+      `\`${field}\` says \`${kind}\`, but no text was supplied for that page.`,
+      'page_text_required',
+      { field }
+    );
+  }
+  return kind;
+}
+
+/**
+ * Where a page's text came from, and — when it was read off a picture — what read it.
+ *
+ * Stored rather than inferred, because the two are different facts about a document and the
+ * coverage report is built on the difference: a page the document wrote and a page a model read out
+ * of a scan can both hold text, and only one of them is the document speaking. The rules are
+ * deliberately strict in the direction of *not* letting OCR text pass as the document's own:
+ *
+ *   - text said to come from OCR must name the reading that produced it and say it succeeded;
+ *   - `ocr-text` and `textSource: 'ocr'` must agree, so a citation cannot tell two different stories;
+ *   - a page nobody read is `none`, which is what an `image-only` or blank page is.
+ */
+function readPageProvenance(
+  entry: Record<string, unknown>,
+  index: number,
+  kind: PageKind,
+  text: string
+): { textSource: TextSource; ocr: OcrProvenance | null } {
+  const field = `pages[${index}]`;
+  const declared = entry.textSource;
+
+  if (declared !== undefined && declared !== null && !TEXT_SOURCES.includes(declared as TextSource)) {
+    throw badRequest(
+      `\`${field}.textSource\` must be one of: ${TEXT_SOURCES.join(', ')}.`,
+      'invalid_text_source',
+      { field: `${field}.textSource` }
+    );
+  }
+
+  const textSource: TextSource =
+    (declared as TextSource | undefined) ?? (pageIsReadable(kind) ? 'native' : 'none');
+
+  const ocrEntry = entry.ocr;
+  let ocr: OcrProvenance | null = null;
+
+  if (ocrEntry !== undefined && ocrEntry !== null) {
+    const record = ocrEntry as Record<string, unknown>;
+    const status = record.status;
+
+    if (typeof status !== 'string' || !OCR_STATUSES.includes(status as OcrStatus)) {
+      throw badRequest(
+        `\`${field}.ocr.status\` must be one of: ${OCR_STATUSES.join(', ')}.`,
+        'invalid_ocr_status',
+        { field: `${field}.ocr.status` }
+      );
+    }
+
+    const promptVersion = asOptionalString(record.promptVersion, `${field}.ocr.promptVersion`, 60);
+    const error = asOptionalString(record.error, `${field}.ocr.error`, 500);
+
+    ocr = {
+      status: status as OcrStatus,
+      // The engine that read the page is not decoration: without it, "this text came from OCR" is
+      // a claim nobody can check or attribute to a version of anything.
+      engine: asString(record.engine, `${field}.ocr.engine`, { maxLength: 120 }),
+      model: asString(record.model, `${field}.ocr.model`, { maxLength: 200 }),
+      ...(promptVersion ? { promptVersion } : {}),
+      confidence:
+        typeof record.confidence === 'number' && Number.isFinite(record.confidence)
+          ? Math.min(1, Math.max(0, record.confidence))
+          : null,
+      ...(error ? { error } : {}),
+    };
+  }
+
+  if (textSource === 'ocr' && (ocr === null || ocr.status !== 'succeeded')) {
+    throw badRequest(
+      `\`${field}\` says its text was read off a picture, but records no successful reading of one.`,
+      'ocr_provenance_required',
+      { field: `${field}.ocr` }
+    );
+  }
+  if (kind === 'ocr-text' && textSource !== 'ocr') {
+    throw badRequest(
+      `\`${field}.kind\` is \`ocr-text\`, so \`${field}.textSource\` must be \`ocr\`.`,
+      'text_source_mismatch',
+      { field: `${field}.textSource` }
+    );
+  }
+  if (textSource === 'ocr' && kind !== 'ocr-text') {
+    throw badRequest(
+      `\`${field}.textSource\` is \`ocr\`, so \`${field}.kind\` must be \`ocr-text\`.`,
+      'page_kind_mismatch',
+      { field: `${field}.kind` }
+    );
+  }
+
+  return { textSource, ocr };
 }
 
 function readSourceFormat(value: unknown): SourceFormat {
@@ -156,6 +278,40 @@ function parseStringList(value: unknown): string[] {
 }
 
 /**
+ * The page-kind counts of one stored version, counted from the version's own rows.
+ *
+ * Served on the single-document response as well as the list, because the list's SQL counts and
+ * this count describe the same pages: a document whose coverage differs depending on which endpoint
+ * returned it would be reporting two different documents. A block written before the kinds existed
+ * is judged by the text it carries, which is how it was stored (`text` if it has any, `blank` if not).
+ */
+function pageKindCounts(blocks: readonly unknown[]) {
+  let textPages = 0;
+  let ocrPages = 0;
+  let blankPages = 0;
+  let unextractedPages = 0;
+
+  for (const entry of blocks) {
+    const block = entry as { kind?: string | null; raw_text?: string | null };
+    const kind =
+      block.kind ?? ((block.raw_text ?? '').trim().length > 0 ? 'text' : 'blank');
+
+    if (kind === 'ocr-text') {
+      textPages += 1;
+      ocrPages += 1;
+    } else if (kind === 'text') {
+      textPages += 1;
+    } else if (kind === 'blank') {
+      blankPages += 1;
+    } else if (kind === 'image-only') {
+      unextractedPages += 1;
+    }
+  }
+
+  return { textPages, ocrPages, blankPages, unextractedPages };
+}
+
+/**
  * One row of the stored-documents list.
  *
  * The readable count is served beside the page count because they are different facts: a document
@@ -164,6 +320,7 @@ function parseStringList(value: unknown): string[] {
  */
 function publicDocumentSummary(row: Record<string, unknown>) {
   const textPages = Number(row.text_pages ?? 0);
+  const ocrPages = Number(row.ocr_pages ?? 0);
   const blankPages = Number(row.blank_pages ?? 0);
   const unextractedPages = Number(row.unextracted_pages ?? 0);
 
@@ -178,14 +335,17 @@ function publicDocumentSummary(row: Record<string, unknown>) {
     sourceFormat: (row.source_format as string) ?? 'pdf',
     pagination: (row.pagination as string) ?? 'explicit',
     limitations: parseStringList(row.limitations),
+    /** Every page cards can come from, including the ones a picture was read out of. */
     textPages,
+    /** How many of those readable pages are a *reading* of a picture rather than the document. */
+    ocrPages,
     blankPages,
     unextractedPages,
     mediaCount: Number(row.media_count ?? 0),
   };
 }
 
-function publicDeck(row: DeckRow, access: 'owner' | 'shared') {
+function publicDeck(row: DeckRow, access: 'owner' | 'shared', scope: ShareScope | null = null) {
   return {
     id: row.id,
     title: row.title,
@@ -197,6 +357,11 @@ function publicDeck(row: DeckRow, access: 'owner' | 'shared') {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     access,
+    // What the share grants, on the reader's own row. The client has to know whether it may ask
+    // for the source at all: opening the viewer and *then* failing would be a screen that offers
+    // something the server refuses, which is the shape of defect this scope exists to end.
+    shareScope: access === 'shared' ? scope : null,
+    sourceAccess: access === 'shared' ? shareGrantsSource(scope) : true,
   };
 }
 
@@ -224,43 +389,151 @@ function publicCard(row: CardRow) {
 }
 
 /**
- * Resolves a deck the caller is allowed to read.
+ * Resolves a deck the caller is allowed to read, and reports the scope of the share that allows it.
  *
- * Ownership is the primary rule. A deck shared with the caller is readable but not
- * writable. Anything else answers 404 rather than 403 so identifiers cannot be probed for
- * existence.
+ * Ownership is the primary rule. A deck shared with the caller is readable but not writable, and
+ * the scope it reports is what the caller's *source* access is decided by — this function is the
+ * deck's own check, `requireDocumentAccess` is the document's, and both read the same share row.
+ * Anything else answers 404 rather than 403 so identifiers cannot be probed for existence.
  */
 function requireReadableDeck(
   db: Database,
   deckId: string,
   userId: string
-): { deck: DeckRow; access: 'owner' | 'shared' } {
+): { deck: DeckRow; access: 'owner' | 'shared'; scope: ShareScope | null } {
   const deck = db.query('SELECT * FROM decks WHERE id = ?').get(deckId) as DeckRow | null;
   if (!deck) throw notFound('That deck does not exist.', 'deck_not_found');
 
-  if (deck.owner_id === userId) return { deck, access: 'owner' };
+  if (deck.owner_id === userId) return { deck, access: 'owner', scope: null };
 
   const share = db
     .query(
-      `SELECT id FROM deck_shares
+      `SELECT scope FROM deck_shares
         WHERE deck_id = ? AND shared_with_user_id = ? AND revoked_at IS NULL`
     )
-    .get(deckId, userId);
+    .get(deckId, userId) as { scope: ShareScope } | null;
 
-  if (share) return { deck, access: 'shared' };
+  if (share) return { deck, access: 'shared', scope: share.scope };
 
   throw notFound('That deck does not exist.', 'deck_not_found');
+}
+
+/**
+ * What a caller's access to a document is, and which version of it they may read.
+ *
+ * `versionId` is the whole point of returning anything at all: an owner reads the current version,
+ * and a reader reads the version the shared deck was generated from — the material its cards cite.
+ */
+type DocumentAccess = {
+  access: 'owner' | 'shared';
+  versionId: string;
+  deckId: string | null;
+  scope: ShareScope | null;
+};
+
+/**
+ * The one authorization check for a document's readable material.
+ *
+ * Source material is reached through a deck: a deck the caller may read, generated from this
+ * document, under a share whose scope carries source access. It is one function rather than a rule
+ * repeated per endpoint because "the reader cannot open the page a card cites" was the result of
+ * three endpoints each deciding ownership for themselves — the metadata, the bytes and the figures
+ * drifted apart, and the copy on the sharing screen drifted with them.
+ *
+ * The deck join is what keeps a share from being a key to the owner's library: only the document
+ * *that deck* was generated from is readable, so sharing one deck does not expose another deck's
+ * document, and an unrelated document of the same owner answers 404 exactly as it does for a
+ * stranger.
+ *
+ * A revoked share is not a share — the row must be `revoked_at IS NULL` — so revocation blocks the
+ * next metadata, byte or figure request. It does not, and cannot, recall what a reader already
+ * downloaded; the sharing screen says so rather than implying otherwise.
+ */
+function requireDocumentAccess(
+  db: Database,
+  documentId: string,
+  userId: string
+): DocumentAccess {
+  const document = db
+    .query(
+      `SELECT d.id AS id, d.owner_id AS owner_id,
+              (SELECT id FROM document_versions WHERE document_id = d.id
+                ORDER BY version DESC LIMIT 1) AS latest_version_id
+         FROM documents d WHERE d.id = ?`
+    )
+    .get(documentId) as
+    | { id: string; owner_id: string; latest_version_id: string | null }
+    | null;
+
+  if (!document) throw notFound('That document does not exist.', 'document_not_found');
+
+  if (document.owner_id === userId) {
+    if (!document.latest_version_id) {
+      throw notFound('That document has no stored version.', 'document_not_found');
+    }
+    return { access: 'owner', versionId: document.latest_version_id, deckId: null, scope: null };
+  }
+
+  const share = db
+    .query(
+      `SELECT s.deck_id AS deck_id, s.scope AS scope, d.document_version_id AS version_id
+         FROM deck_shares s
+         JOIN decks d ON d.id = s.deck_id
+        WHERE s.shared_with_user_id = ?
+          AND s.revoked_at IS NULL
+          AND d.document_id = ?
+        ORDER BY s.created_at DESC LIMIT 1`
+    )
+    .get(userId, documentId) as
+    | { deck_id: string; scope: ShareScope; version_id: string | null }
+    | null;
+
+  // A share that does not carry source access is not a refusal to explain — it is the same answer
+  // a stranger gets, because the endpoint is reached by identifier and an identifier is not a
+  // capability. The deck itself remains readable; only its source material does not.
+  if (!share || !shareGrantsSource(share.scope) || !share.version_id) {
+    throw notFound('That document does not exist.', 'document_not_found');
+  }
+
+  return {
+    access: 'shared',
+    // The version the shared deck was generated from, not whatever the owner has uploaded since:
+    // the evidence, the page numbers and the figures a reader sees are the ones its cards cite.
+    versionId: share.version_id,
+    deckId: share.deck_id,
+    scope: share.scope,
+  };
+}
+
+/**
+ * The version guard on one stored figure.
+ *
+ * A figure is reached through its document *version*, and an owner may read any version of their
+ * own document. A reader is held to the version their access resolved to, so a share cannot be
+ * used to enumerate the versions of a document the owner has since re-uploaded, and a figure
+ * belonging to another document cannot be reached at all.
+ */
+function requireAccessibleFigureVersion(access: DocumentAccess, documentVersionId: string): void {
+  // An owner reads every version of their own document, including the ones a share may not reach.
+  if (access.access === 'owner') return;
+  if (access.versionId === documentVersionId) return;
+  throw notFound('That image does not exist.', 'media_not_found');
 }
 
 function requireOwnedDeck(db: Database, deckId: string, userId: string): DeckRow {
   const { deck, access } = requireReadableDeck(db, deckId, userId);
   if (access !== 'owner') {
-    // 403 rather than 404, and only here: a deck shared for study is one the caller can already
+    // 403 rather than 404, and only here: a deck shared with the caller is one they can already
     // see in their own list, so its existence is not a secret. What is refused is everything that
-    // belongs to the owner — changing it, exporting it, reading its source. A deck the caller
+    // belongs to the owner — changing it, re-generating it, deleting it, sharing it on, exporting
+    // it. Reading its source is *not* on this list: that is decided by the share's scope in
+    // `requireDocumentAccess`, because it is the one thing a share may carry. A deck the caller
     // cannot read at all never reaches this line: `requireReadableDeck` answers 404, so an
     // identifier cannot be probed for existence.
-    throw forbidden('This deck belongs to another account. Only its owner can change it, export it or read its source.', 'deck_not_owned');
+    throw forbidden(
+      'This deck belongs to another account. Only its owner can change it, re-generate it, export it or share it.',
+      'deck_not_owned'
+    );
   }
   return deck;
 }
@@ -285,6 +558,119 @@ function sourceContentType(format: string): string {
   return SOURCE_CONTENT_TYPES[format] ?? 'application/octet-stream';
 }
 
+/**
+ * Whether a deck's document has any source material to grant.
+ *
+ * The stored original, or the figures kept for it: either is something the cards cite and a reader
+ * would otherwise have to take on trust. A document with neither has no source to share, and the
+ * source scope is refused rather than stored as a permission that grants nothing — which is what
+ * the previous behaviour did, in the other direction.
+ */
+function deckHasShareableSource(db: Database, deckId: string): boolean {
+  const row = db
+    .query(
+      `SELECT (v.source_bytes IS NOT NULL) AS has_source,
+              (SELECT COUNT(*) FROM media m WHERE m.document_version_id = v.id) AS media_count
+         FROM decks d
+         JOIN document_versions v ON v.id = d.document_version_id
+        WHERE d.id = ?`
+    )
+    .get(deckId) as { has_source: number; media_count: number } | null;
+
+  return row !== null && (row.has_source === 1 || row.media_count > 0);
+}
+
+/** A stored figure with its bytes, so an export can write them and the app can serve them. */
+interface DeckFigure {
+  stored: StoredFigure;
+  bytes: Uint8Array;
+  contentType: string;
+}
+
+/**
+ * Every figure stored for a document version, with the bytes this caller is allowed to read.
+ *
+ * Read in one query for the whole deck rather than per card: the association rule needs to know how
+ * many figures a page holds and how many cards cite it, so "the figures of this version" is the
+ * unit of work, not "the figures of this card".
+ */
+function readDeckFigures(db: Database, documentVersionId: string | null): DeckFigure[] {
+  // A deck with no document version is a deck with no source, so it has no figures. Returning an
+  // empty list rather than throwing keeps the caller free of a branch it would have to get right.
+  if (documentVersionId === null) return [];
+
+  const rows = db
+    .query(
+      `SELECT id, page_index, kind, name, content_type, caption, context, page_anchored, bytes
+         FROM media
+        WHERE document_version_id = ?
+        ORDER BY page_index ASC, name ASC`
+    )
+    .all(documentVersionId) as Array<{
+    id: string;
+    page_index: number;
+    kind: string;
+    name: string;
+    content_type: string;
+    caption: string | null;
+    context: string | null;
+    page_anchored: number;
+    bytes: Uint8Array | null;
+  }>;
+
+  return rows.map(row => ({
+    stored: {
+      id: row.id,
+      pageIndex: row.page_index,
+      kind: row.kind,
+      name: row.name,
+      caption: row.caption ?? null,
+      context: row.context ?? '',
+      pageAnchored: row.page_anchored === 1,
+    },
+    // A row whose bytes were never stored is listed, so the app can say an image exists, and is
+    // never exported: the export refuses an image it cannot write rather than referring to a file
+    // that would not be in the package.
+    bytes: row.bytes ?? new Uint8Array(),
+    contentType: row.content_type,
+  }));
+}
+
+/**
+ * What each scope grants, in the words the person sharing it reads.
+ *
+ * The same sentence is served with the share list and returned when a share is created, so the
+ * interface never has to invent its own account of a permission — and the source scope names what
+ * a reader actually receives: the whole stored original, not only the pages this deck covers. A
+ * deck covers the sections it was generated from; the endpoint serves every page of the file, and
+ * saying otherwise would be the kind of copy that is true of the intent and false of the system.
+ */
+const SHARE_SCOPE_CHOICES: readonly ShareScopeChoice[] = [
+  {
+    value: 'study',
+    label: 'Study only',
+    description: 'The cards, and the recipient\u2019s own review schedule for them.',
+    disclosure:
+      'The recipient sees the cards and their citations, keeps their own schedule, and cannot open ' +
+      'the document, change the deck, re-generate it or export it.',
+  },
+  {
+    value: SOURCE_SHARE_SCOPE,
+    label: 'Study and source',
+    description: 'The cards, and the document they were built from.',
+    disclosure:
+      'The recipient can open the source this deck was built from: its stored pages and figures, and ' +
+      'the original file itself when the upload retained it. That is the whole document, not only the ' +
+      'sections this deck covers. Changing, re-generating, deleting and exporting stay with you, and ' +
+      'revoking the share stops the next request for any of it \u2014 it cannot recall what a recipient ' +
+      'already downloaded.',
+  },
+];
+
+function shareScopeChoice(scope: ShareScope): ShareScopeChoice {
+  return SHARE_SCOPE_CHOICES.find(choice => choice.value === scope) ?? SHARE_SCOPE_CHOICES[0];
+}
+
 export function registerResourceRoutes(router: Router): void {
   // -------------------------------------------------------------------------
   // Documents
@@ -301,7 +687,10 @@ export function registerResourceRoutes(router: Router): void {
                 d.source_format, v.pagination, v.limitations,
                 (SELECT COUNT(*) FROM sections s WHERE s.document_version_id = v.id) AS section_count,
                 (SELECT COUNT(*) FROM source_blocks b
-                  WHERE b.document_version_id = v.id AND b.kind = 'text') AS text_pages,
+                  WHERE b.document_version_id = v.id
+                    AND b.kind IN ('text', 'ocr-text')) AS text_pages,
+                (SELECT COUNT(*) FROM source_blocks b
+                  WHERE b.document_version_id = v.id AND b.kind = 'ocr-text') AS ocr_pages,
                 (SELECT COUNT(*) FROM source_blocks b
                   WHERE b.document_version_id = v.id AND b.kind = 'blank') AS blank_pages,
                 (SELECT COUNT(*) FROM source_blocks b
@@ -401,8 +790,10 @@ export function registerResourceRoutes(router: Router): void {
 
       const insertBlock = ctx.db.prepare(
         `INSERT INTO source_blocks
-           (id, document_version_id, page_index, page_label, ordinal, kind, raw_text, normalized_text)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+           (id, document_version_id, page_index, page_label, ordinal, kind, raw_text,
+            normalized_text, text_source, ocr_status, ocr_engine, ocr_model,
+            ocr_prompt_version, ocr_confidence, ocr_error)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       );
 
       pages.forEach((page: unknown, index: number) => {
@@ -427,6 +818,10 @@ export function registerResourceRoutes(router: Router): void {
 
         const text = raw.trim();
         const kind = readPageKind(entry.kind, text, `pages[${index}].kind`);
+        // Where the text came from, and what read it when it came off a picture. Read separately
+        // from the kind because the two are separate claims: a page can be readable *and* state
+        // that what is readable is a reading of a scan rather than the document's own text.
+        const { textSource, ocr } = readPageProvenance(entry, index, kind, text);
         const pageIndex = asInteger(entry.pageIndex ?? index + 1, `pages[${index}].pageIndex`, {
           min: 1,
           max: MAX_PAGES_PER_DOCUMENT,
@@ -441,7 +836,14 @@ export function registerResourceRoutes(router: Router): void {
           index + 1,
           kind,
           text,
-          text.replace(/\s+/g, ' ').trim()
+          text.replace(/\s+/g, ' ').trim(),
+          textSource,
+          ocr?.status ?? null,
+          ocr?.engine ?? null,
+          ocr?.model ?? null,
+          ocr?.promptVersion ?? null,
+          ocr?.confidence ?? null,
+          ocr?.error ?? null
         );
       });
 
@@ -511,8 +913,8 @@ export function registerResourceRoutes(router: Router): void {
       const insertMedia = ctx.db.prepare(
         `INSERT INTO media
            (id, document_version_id, page_index, kind, caption, byte_size, created_at, name,
-            content_type, bytes, page_anchored)
-         VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`
+            content_type, bytes, page_anchored, source, context)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       );
 
       let mediaBytes = 0;
@@ -555,17 +957,35 @@ export function registerResourceRoutes(router: Router): void {
           max: MAX_PAGES_PER_DOCUMENT,
         });
 
+        // The caption the document itself states, and the text around the figure. Both are stored
+        // because an extracted figure with neither is a picture no card can cite: the sentence
+        // explaining a diagram is usually the sentence the card is built from.
+        const caption = asOptionalString(row.caption, `media[${index}].caption`, 1000);
+        const context = asOptionalString(row.context, `media[${index}].context`, 4000) ?? '';
+        const anchor = row.source;
+
+        if (anchor !== undefined && anchor !== null && !MEDIA_ANCHORS.includes(anchor as MediaAnchor)) {
+          throw badRequest(
+            `\`media[${index}].source\` must be one of: ${MEDIA_ANCHORS.join(', ')}.`,
+            'invalid_media_anchor',
+            { field: `media[${index}].source` }
+          );
+        }
+
         insertMedia.run(
           newId('med'),
           versionId,
           pageNumber,
           kind,
+          caption,
           bytes.byteLength,
           createdAt,
           asString(row.name, `media[${index}].name`, { maxLength: 300 }),
           asString(row.contentType, `media[${index}].contentType`, { maxLength: 120 }),
           bytes,
-          pageNumber > 0 ? 1 : 0
+          pageNumber > 0 ? 1 : 0,
+          (anchor as MediaAnchor | undefined) ?? 'embedded',
+          context
         );
       });
     })();
@@ -595,15 +1015,18 @@ export function registerResourceRoutes(router: Router): void {
   /**
    * One document with its stored source, including the original bytes flag.
    *
-   * Owner-only. A caller who guesses an identifier that belongs to someone else gets 404,
-   * not 403, so the endpoint cannot be used to discover which ids exist.
+   * Readable by its owner, or by a reader whose share of a deck generated from this document
+   * carries source access (`study_and_source`) — the representation the cards were built from, and
+   * nothing else. A caller who guesses an identifier that is not theirs gets 404, not 403, so the
+   * endpoint cannot be used to discover which ids exist.
    */
   router.get('/api/documents/:id', ctx => {
     const session = requireSession(ctx);
+    const access = requireDocumentAccess(ctx.db, ctx.params.id, session.user.id);
 
     const document = ctx.db
-      .query('SELECT * FROM documents WHERE id = ? AND owner_id = ?')
-      .get(ctx.params.id, session.user.id) as
+      .query('SELECT * FROM documents WHERE id = ?')
+      .get(ctx.params.id) as
       | {
           id: string;
           name: string;
@@ -621,16 +1044,20 @@ export function registerResourceRoutes(router: Router): void {
       .query(
         `SELECT id, version, content_hash, pagination, limitations,
                 (source_bytes IS NOT NULL) AS has_source_bytes
-           FROM document_versions WHERE document_id = ? ORDER BY version DESC LIMIT 1`
+           FROM document_versions WHERE id = ?`
       )
-      .get(document.id) as {
-      id: string;
-      version: number;
-      content_hash: string;
-      pagination: Pagination;
-      limitations: string;
-      has_source_bytes: number;
-    };
+      .get(access.versionId) as
+      | {
+          id: string;
+          version: number;
+          content_hash: string;
+          pagination: Pagination;
+          limitations: string;
+          has_source_bytes: number;
+        }
+      | null;
+
+    if (!version) throw notFound('That document does not exist.', 'document_not_found');
 
     const blocks = ctx.db
       .query(
@@ -638,7 +1065,9 @@ export function registerResourceRoutes(router: Router): void {
         // than mistaking an absent page for one that was never uploaded. `normalized_text` is
         // served beside `raw_text` because the two are the mapping: whitespace and line breaks
         // differ between them and nothing else does.
-        `SELECT id, page_index, page_label, ordinal, kind, raw_text, normalized_text
+        `SELECT id, page_index, page_label, ordinal, kind, raw_text, normalized_text,
+                text_source, ocr_status, ocr_engine, ocr_model, ocr_prompt_version,
+                ocr_confidence, ocr_error
            FROM source_blocks WHERE document_version_id = ? ORDER BY ordinal ASC`
       )
       .all(version.id);
@@ -654,10 +1083,15 @@ export function registerResourceRoutes(router: Router): void {
     // and the bytes arrive one at a time from the media route below.
     const media = ctx.db
       .query(
-        `SELECT id, page_index, kind, name, content_type, byte_size, page_anchored
+        `SELECT id, page_index, kind, name, content_type, byte_size, page_anchored, caption,
+                context, source
            FROM media WHERE document_version_id = ? ORDER BY page_index ASC, kind ASC, name ASC`
       )
       .all(version.id) as Array<Record<string, unknown>>;
+
+    // Read for the document beside `version`, so the opened document reports the same coverage the
+    // list does — including how much of it nobody has read.
+    const counts = pageKindCounts(blocks);
 
     return json({
       document: {
@@ -668,6 +1102,14 @@ export function registerResourceRoutes(router: Router): void {
         byteSize: document.byte_size,
         createdAt: document.created_at,
         sourceFormat: document.source_format ?? 'pdf',
+        sectionCount: sections.length,
+        pagination: version.pagination,
+        limitations: parseStringList(version.limitations),
+        textPages: counts.textPages,
+        ocrPages: counts.ocrPages,
+        blankPages: counts.blankPages,
+        unextractedPages: counts.unextractedPages,
+        mediaCount: media.length,
       },
       version: {
         id: version.id,
@@ -689,6 +1131,12 @@ export function registerResourceRoutes(router: Router): void {
         // False when the format did not place the image on a page, so the screen can say so
         // instead of pinning it to whatever page happens to be nearby.
         pageAnchored: row.page_anchored === 1,
+        // The document's own caption for the figure and the text around it, served with the row:
+        // a card that cites a figure cites the sentence beside it, and a reader who has to open
+        // the page to find out what an image is has been told nothing.
+        caption: (row.caption as string | null) ?? null,
+        context: (row.context as string | null) ?? '',
+        source: (row.source as string | null) ?? 'embedded',
       })),
     });
   });
@@ -696,12 +1144,17 @@ export function registerResourceRoutes(router: Router): void {
   /**
    * The original uploaded file, byte for byte.
    *
-   * Owner-only, like every other document endpoint: the identifier is not a capability. A
-   * caller who guesses someone else's document id gets 404, and the bytes are never served
-   * from a public path.
+   * Authorized by the same check as the representation above and by no second rule: the owner of
+   * the document, or a reader whose share of a deck generated from it carries source access. The
+   * stored original is served **whole** — every page of it, not only the pages the deck covers —
+   * which is exactly what the sharing screen says before anyone is added.
+   *
+   * The identifier is not a capability. A caller who guesses a document that is not theirs gets
+   * 404, and the bytes are never served from a public path.
    */
   router.get('/api/documents/:id/source', ctx => {
     const session = requireSession(ctx);
+    const access = requireDocumentAccess(ctx.db, ctx.params.id, session.user.id);
 
     const record = ctx.db
       .query(
@@ -709,10 +1162,9 @@ export function registerResourceRoutes(router: Router): void {
                 d.source_format AS source_format
            FROM document_versions v
            JOIN documents d ON d.id = v.document_id
-          WHERE d.id = ? AND d.owner_id = ?
-          ORDER BY v.version DESC LIMIT 1`
+          WHERE v.id = ?`
       )
-      .get(ctx.params.id, session.user.id) as
+      .get(access.versionId) as
       | {
           source_bytes: Uint8Array | null;
           content_hash: string;
@@ -737,8 +1189,14 @@ export function registerResourceRoutes(router: Router): void {
       status: 200,
       headers: {
         // The type of the format that was actually read, not an assumption that every stored
-        // original is a PDF: a .docx served as application/pdf would be a download that lies.
-        'content-type': sourceContentType(record.source_format),
+        // original is a PDF: a .docx served as application/pdf would be a download that lies. An
+        // image upload has no single type by format — PNG, JPEG, GIF, WebP and BMP are all
+        // `image` — so its own bytes answer that question, and bytes this build cannot identify
+        // are served as a download rather than mislabelled as something they may not be.
+        'content-type':
+          record.source_format === 'image'
+            ? (imageTypeOf(bytes)?.contentType ?? 'application/octet-stream')
+            : sourceContentType(record.source_format),
         'content-disposition': `inline; filename="${safeFileName(record.name)}"`,
         // A private document must not sit in a shared cache.
         'cache-control': 'private, no-store',
@@ -750,23 +1208,37 @@ export function registerResourceRoutes(router: Router): void {
   /**
    * One stored image, byte for byte.
    *
-   * Owner-only, and by the same rule as the source text rather than by a second one: the image is
-   * reached through its version's document, so a deck shared for study carries no readable media
-   * either. A caller who guesses an identifier that is not theirs gets 404, never 403.
+   * Authorized by the same check as the source text rather than by a second one — the card that
+   * cites a figure and the card that cites a passage stand or fall together — and then by the
+   * version guard: a reader reaches the figures of the version the shared deck was generated from.
+   * A figure belonging to another document, or another version, answers 404, never 403.
    */
   router.get('/api/media/:id', ctx => {
     const session = requireSession(ctx);
+
+    const lookup = ctx.db
+      .query(
+        `SELECT m.document_version_id AS document_version_id, v.document_id AS document_id
+           FROM media m
+           JOIN document_versions v ON v.id = m.document_version_id
+          WHERE m.id = ?`
+      )
+      .get(ctx.params.id) as
+      | { document_version_id: string; document_id: string }
+      | null;
+
+    if (!lookup) throw notFound('That image does not exist.', 'media_not_found');
+
+    const access = requireDocumentAccess(ctx.db, lookup.document_id, session.user.id);
+    requireAccessibleFigureVersion(access, lookup.document_version_id);
 
     const record = ctx.db
       .query(
         `SELECT m.name AS name, m.content_type AS content_type, m.bytes AS bytes,
                 m.byte_size AS byte_size
-           FROM media m
-           JOIN document_versions v ON v.id = m.document_version_id
-           JOIN documents d ON d.id = v.document_id
-          WHERE m.id = ? AND d.owner_id = ?`
+           FROM media m WHERE m.id = ?`
       )
-      .get(ctx.params.id, session.user.id) as
+      .get(ctx.params.id) as
       | { name: string; content_type: string; bytes: Uint8Array | null; byte_size: number }
       | null;
 
@@ -803,16 +1275,16 @@ export function registerResourceRoutes(router: Router): void {
 
     const shared = ctx.db
       .query(
-        `SELECT d.* FROM decks d
+        `SELECT d.*, s.scope AS share_scope FROM decks d
            JOIN deck_shares s ON s.deck_id = d.id
           WHERE s.shared_with_user_id = ? AND s.revoked_at IS NULL
           ORDER BY d.created_at DESC`
       )
-      .all(session.user.id) as DeckRow[];
+      .all(session.user.id) as Array<DeckRow & { share_scope: ShareScope }>;
 
     return json({
       decks: owned.map(deck => publicDeck(deck, 'owner')),
-      sharedDecks: shared.map(deck => publicDeck(deck, 'shared')),
+      sharedDecks: shared.map(deck => publicDeck(deck, 'shared', deck.share_scope)),
     });
   });
 
@@ -870,8 +1342,8 @@ export function registerResourceRoutes(router: Router): void {
 
   router.get('/api/decks/:id', ctx => {
     const session = requireSession(ctx);
-    const { deck, access } = requireReadableDeck(ctx.db, ctx.params.id, session.user.id);
-    return json({ deck: publicDeck(deck, access) });
+    const { deck, access, scope } = requireReadableDeck(ctx.db, ctx.params.id, session.user.id);
+    return json({ deck: publicDeck(deck, access, scope) });
   });
 
   router.delete('/api/decks/:id', ctx => {
@@ -890,7 +1362,7 @@ export function registerResourceRoutes(router: Router): void {
 
   router.get('/api/decks/:id/cards', ctx => {
     const session = requireSession(ctx);
-    const { deck } = requireReadableDeck(ctx.db, ctx.params.id, session.user.id);
+    const { deck, access, scope } = requireReadableDeck(ctx.db, ctx.params.id, session.user.id);
 
     const cards = ctx.db
       .query(
@@ -907,9 +1379,48 @@ export function registerResourceRoutes(router: Router): void {
         `SELECT e.* FROM evidence e JOIN cards c ON c.id = e.card_id
           WHERE c.deck_id = ? ORDER BY e.page_index ASC`
       )
-      .all(deck.id);
+      .all(deck.id) as Array<{
+      id: string;
+      card_id: string;
+      page_index: number;
+      span_start: number;
+      span_end: number;
+      excerpt: string;
+    }>;
 
-    return json({ deck: publicDeck(deck, 'owner'), cards: cards.map(publicCard), evidence });
+    // The figures each citation may show, decided by the same rule the export uses: the figures on
+    // the cited page whose caption or surrounding text touches the excerpt. A card with no figure
+    // gets an empty list, which is a true statement about the source rather than a gap in the UI.
+    const figures = readDeckFigures(ctx.db, deck.document_version_id);
+    const figuresForCard = figuresByEvidence(
+      figures.map(figure => figure.stored),
+      evidence.map(entry => ({
+        id: entry.id,
+        pageNumber: entry.page_index,
+        excerpt: entry.excerpt,
+      }))
+    );
+    const figuresById = new Map(figures.map(figure => [figure.stored.id, figure]));
+
+    return json({
+      deck: publicDeck(deck, access, scope),
+      cards: cards.map(publicCard),
+      evidence: evidence.map(entry => ({
+        ...entry,
+        figures: (figuresForCard.get(entry.id) ?? []).map(figure => {
+          const row = figuresById.get(figure.id)!;
+          return {
+            id: figure.id,
+            pageIndex: figure.pageIndex,
+            kind: figure.kind,
+            name: figure.name,
+            caption: figure.caption,
+            contentType: row.contentType,
+            hasBytes: row.bytes.byteLength > 0,
+          };
+        }),
+      })),
+    });
   });
 
   // -------------------------------------------------------------------------
@@ -919,9 +1430,12 @@ export function registerResourceRoutes(router: Router): void {
   /**
    * Shares a deck with another account, by email.
    *
-   * Only study sharing is implemented. `study_and_source` is refused rather than stored, because
-   * the document endpoints are owner-only and a stored scope that changes nothing would be a
-   * permission the UI implies but the server does not grant.
+   * Two scopes, and the server grants exactly the one that was asked for — there is no scope it
+   * stores and does not honour. `study` is the cards and the reader's own schedule; `source` is
+   * that *plus* the source material the cards were built from, which means the stored original is
+   * served whole rather than page by page, because that is what the endpoint does. The response
+   * says so in words, and the interface shows the same sentence before anybody is added: an owner
+   * disclosing what they are sharing is the point of the mode, not a disclaimer on it.
    */
   router.post('/api/decks/:id/shares', async ctx => {
     assertOriginAllowed(ctx);
@@ -931,9 +1445,15 @@ export function registerResourceRoutes(router: Router): void {
     const body = await readJson<Record<string, unknown>>(ctx);
 
     const scope = body.scope === undefined ? 'study' : asString(body.scope, 'scope', { maxLength: 40 });
-    if (scope !== 'study') {
+    if (!SHARE_SCOPES.includes(scope as ShareScope)) {
       throw badRequest(
-        'Only study sharing is available: source access stays with the owner, so a share cannot grant it.',
+        `A share is either ${SHARE_SCOPES.map(value => `'${value}'`).join(' or ')}.`,
+        'share_scope_unavailable'
+      );
+    }
+    if (shareGrantsSource(scope as ShareScope) && !deckHasShareableSource(ctx.db, deck.id)) {
+      throw badRequest(
+        'This document has no stored original and no figures, so there is no source to share. Share it for study instead.',
         'share_scope_unavailable'
       );
     }
@@ -970,9 +1490,30 @@ export function registerResourceRoutes(router: Router): void {
         .run(newId('shr'), deck.id, target.id, scope, now);
     }
 
-    return json({ share: { deckId: deck.id, userId: target.id, email, scope, shareable: true } }, 201);
+    return json(
+      {
+        share: {
+          deckId: deck.id,
+          userId: target.id,
+          email,
+          scope: scope as ShareScope,
+          sourceAccess: shareGrantsSource(scope as ShareScope),
+          shareable: true,
+          // What was actually granted, stated back. A scope stored and not honoured was the old
+          // defect; a scope honoured and not stated is the next one.
+          disclosure: shareScopeChoice(scope as ShareScope).disclosure,
+        },
+      },
+      201
+    );
   });
 
+  /**
+   * The share list, with the scopes that can be chosen beside it.
+   *
+   * Both come from one place: the rows say what each account currently has, and the choices say
+   * what the owner's interface may offer and what each choice actually grants.
+   */
   router.get('/api/decks/:id/shares', ctx => {
     const session = requireSession(ctx);
     const deck = requireOwnedDeck(ctx.db, ctx.params.id, session.user.id);
@@ -987,7 +1528,14 @@ export function registerResourceRoutes(router: Router): void {
       )
       .all(deck.id);
 
-    return json({ shares });
+    return json({
+      shares,
+      scopes: SHARE_SCOPE_CHOICES,
+      // Whether this deck's document can be opened at all: a document whose original was not
+      // retained has no source to share, so the interface does not offer a scope that would
+      // promise bytes the server cannot serve.
+      sourceAvailable: deckHasShareableSource(ctx.db, deck.id),
+    });
   });
 
   /** Revokes one account's access. The next request from them answers 404, as if never shared. */
@@ -1147,11 +1695,33 @@ export function registerResourceRoutes(router: Router): void {
       .all(deck.id) as Array<{ card_id: string; page_index: number; excerpt: string }>;
 
     const evidenceByCard = new Map(evidence.map(entry => [entry.card_id, entry]));
+    const figures = readDeckFigures(ctx.db, deck.document_version_id);
+
+    // Which figures belong to which card is decided once, here, by the same rule the app uses to
+    // show them beside an answer — so a card cannot carry a figure in one place and not the other.
+    const figuresForCard = figuresByEvidence(
+      figures.map(figure => figure.stored),
+      evidence.map(entry => ({
+        id: entry.card_id,
+        pageNumber: entry.page_index,
+        excerpt: entry.excerpt,
+      }))
+    );
+
+    const bytesById = new Map(figures.map(figure => [figure.stored.id, figure]));
 
     const exported = buildApkg({
       deck: { id: deck.id, title: deck.title, description: deck.description },
       cards: cards.map(card => {
         const citation = evidenceByCard.get(card.id);
+        const cited = (figuresForCard.get(card.id) ?? [])
+          .map(figure => bytesById.get(figure.id))
+          .filter((figure): figure is DeckFigure => figure !== undefined)
+          .map(figure => ({
+            name: figure.stored.name,
+            bytes: figure.bytes,
+            contentType: figure.contentType,
+          }));
 
         return {
           id: card.id,
@@ -1164,6 +1734,9 @@ export function registerResourceRoutes(router: Router): void {
           excerpt: citation?.excerpt ?? null,
           pageNumber: citation?.page_index ?? null,
           sectionTitle: card.section_title ?? null,
+          // The card's own figures, and only those: an image the page holds beside somebody else's
+          // claim is not this card's media, so it is not written into this note.
+          ...(cited.length > 0 ? { media: cited } : {}),
         };
       }),
     });
@@ -1309,6 +1882,10 @@ export function registerResourceRoutes(router: Router): void {
    *   version, coverage mode, section selection, checkpoint format or pipeline changed). Its reason
    *   is returned, the stored progress is left where it is, and the caller is told to start a new
    *   run rather than spending again under the label “resume”.
+   *
+   * `repeatedDispatches` is the number of calls whose outcome was never recorded and which this
+   * resume has therefore accepted the risk of paying for twice. It is part of the answer, not a
+   * footnote: resuming a run stopped for that reason is a spending decision.
    */
   router.post('/api/jobs/:id/resume', async ctx => {
     assertOriginAllowed(ctx);
@@ -1324,6 +1901,10 @@ export function registerResourceRoutes(router: Router): void {
       resumed: result.outcome === 'resumed',
       // Only present for `restart_required`: why the stored progress cannot be continued.
       reason: result.reason ?? null,
+      // How many calls this resume accepted the risk of having already been charged. A run stopped
+      // by an unresolved dispatch holds one, and the screen says so rather than letting the button
+      // imply that continuing is free.
+      repeatedDispatches: result.repeatedDispatches,
       job: toContractJob(requireJob(ctx.db, ctx.params.id)),
     });
   });

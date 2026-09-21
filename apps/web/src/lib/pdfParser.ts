@@ -1,6 +1,17 @@
 import * as pdfjsLib from 'pdfjs-dist';
 import { DocumentPage, DocumentSection } from '@jevdeck/contracts';
-import type { PageKind, Pagination, SourceFormat } from './parsedDocument';
+import {
+  boxForMatrix,
+  dominantImage,
+  figureName,
+  multiplyMatrix,
+  selectPageFigures,
+  toPngBytes,
+  type DecodedImage,
+  type PageTextLine,
+  type PaintedImage,
+} from './pdfFigures';
+import type { ParsedMedia, PageKind, Pagination, SourceFormat } from './parsedDocument';
 
 // Configure the worker for client-side processing
 if (typeof window !== 'undefined') {
@@ -35,6 +46,11 @@ export interface ParsedPdfResult {
   limitations: string[];
   /** Extracted text of every page, retained so generation and the page viewer use the real document. */
   pages: ParsedPdfPage[];
+  /**
+   * Pictures lifted out of the pages: figures with their captions and context, and the plate a
+   * scanned page is made of. The scanned page's plate is what the reading pass later reads.
+   */
+  media: ParsedMedia[];
   /**
    * An intact copy of the uploaded bytes. `pdf.js` detaches the buffer it is
    * given, so the original cannot be reused for rendering later.
@@ -160,10 +176,13 @@ export async function parsePdfDocument(
   // Extract text for every page and retain it
   onProgress?.(55, 'Extracting page text...');
   const pages: ParsedPdfPage[] = [];
+  const media: ParsedMedia[] = [];
   const pageWordCounts: number[] = [];
   const blankPages: number[] = [];
   const unextractedPages: number[] = [];
+  const unreadableFigures: number[] = [];
   let totalWords = 0;
+  let figuresSkippedPages = 0;
 
   for (let pageNum = 1; pageNum <= pageCount; pageNum++) {
     const page = await pdfDoc.getPage(pageNum);
@@ -171,18 +190,76 @@ export async function parsePdfDocument(
     // Line structure is kept: the server stores this as the raw extraction and derives its own
     // normalized copy, so the two columns are genuinely different representations.
     const text = textFromItems(textContent.items as any[]);
+    const viewport = page.getViewport({ scale: 1 });
+
+    // The pictures on the page. Read for every page within the cap, because a page with text can
+    // hold the figure a card should be built from — and read lazily enough that a 5,000-page
+    // document does not hold every page's operator list at once.
+    const withinFigureBudget = pageNum <= MAX_FIGURE_PAGES;
+    if (!withinFigureBudget) figuresSkippedPages += 1;
+
+    const painted = withinFigureBudget ? await readPaintedImages(page, viewport.height) : [];
 
     // A page with no text is classified by what is on it, not assumed to be blank. A scanned
     // plate and a blank divider both extract to nothing; only one of them is a coverage gap.
     let kind: PageKind = 'text';
     if (text.trim().length === 0) {
-      kind = (await pageDrawsAnImage(page)) ? 'image-only' : 'blank';
+      kind = painted.length > 0 ? 'image-only' : 'blank';
       if (kind === 'blank') blankPages.push(pageNum);
       else unextractedPages.push(pageNum);
     }
 
     const label = pageLabels?.[pageNum - 1] ?? null;
     pages.push({ pageNumber: pageNum, pageLabel: label ?? undefined, text, kind });
+
+    // The page's own pictures, in the two roles they can have. A page whose content is a picture
+    // stores that picture as a `scan` — it is the page, not a figure beside the text, and it is what
+    // the reading pass will read. A page with text stores the figures that are big enough to be
+    // figures, each with whatever caption the document states for it.
+    const lines = textLinesFromItems(textContent.items as any[], viewport.height);
+
+    if (kind === 'image-only') {
+      const plate = dominantImage(painted, viewport.width, viewport.height);
+      const bytes = plate?.image ? toPngBytes(plate.image) : null;
+
+      if (plate && bytes) {
+        media.push({
+          pageNumber: pageNum,
+          kind: 'scan',
+          name: figureName(pageNum, plate, 0),
+          contentType: 'image/png',
+          bytes,
+          anchor: 'embedded',
+        });
+      } else {
+        // A page that is one picture and whose picture could not be read is a coverage gap with a
+        // reason, and saying which page it is beats a count the reader cannot act on.
+        unreadableFigures.push(pageNum);
+      }
+    } else if (kind === 'text' && withinFigureBudget) {
+      const figures = selectPageFigures({
+        images: painted,
+        lines,
+        pageWidth: viewport.width,
+        pageHeight: viewport.height,
+      });
+
+      figures.forEach((figure, index) => {
+        const bytes = figure.painted.image ? toPngBytes(figure.painted.image) : null;
+        if (!bytes) return;
+
+        media.push({
+          pageNumber: pageNum,
+          kind: 'figure',
+          name: figureName(pageNum, figure.painted, index),
+          contentType: 'image/png',
+          bytes,
+          ...(figure.caption ? { caption: figure.caption } : {}),
+          ...(figure.context ? { context: figure.context } : {}),
+          anchor: 'embedded',
+        });
+      });
+    }
 
     const words = text.length === 0 ? 0 : text.split(/\s+/).filter(w => w.length > 0).length;
     pageWordCounts.push(words);
@@ -298,11 +375,28 @@ export async function parsePdfDocument(
 
   // What this reader did not do, stated rather than left to be inferred from a count of pages.
   const limitations: string[] = [
-    'Text and printed page labels are read from the PDF text layer. Images inside pages are not extracted or stored, and no OCR is applied, so a page whose content is a picture contributes no text.',
+    'Text and printed page labels are read from the PDF text layer. Figures at least 36 points across are extracted with the caption the page states for them, and a page whose content is one picture is stored whole as a scan.',
   ];
+  if (media.length > 0) {
+    const figures = media.filter(item => item.kind === 'figure').length;
+    const scans = media.filter(item => item.kind === 'scan').length;
+    limitations.push(
+      `${figures} figure(s) and ${scans} scanned page(s) were stored as images. A figure smaller than a figure is left out rather than stored as clip art.`
+    );
+  }
   if (unextractedPages.length > 0) {
     limitations.push(
-      `${unextractedPages.length} page(s) contain no extractable text but do draw an image, so their content was not read.`
+      `${unextractedPages.length} page(s) contain no text and are made of a picture, so their text is whatever the reading pass reads off that picture; until then they contribute no text.`
+    );
+  }
+  if (unreadableFigures.length > 0) {
+    limitations.push(
+      `${unreadableFigures.length} scanned page(s) hold a picture this build could not decode, so they were stored without one and cannot be read.`
+    );
+  }
+  if (figuresSkippedPages > 0) {
+    limitations.push(
+      `Figures were extracted from the first ${MAX_FIGURE_PAGES} pages only; the remaining ${figuresSkippedPages} page(s) were read for text alone, so a figure on them was not stored.`
     );
   }
   if (blankPages.length > 0) {
@@ -327,6 +421,7 @@ export async function parsePdfDocument(
     unextractedPages,
     limitations,
     pages,
+    media,
     bytes: retainedBytes,
     hasToc: flatOutline.length > 0,
   };
@@ -354,21 +449,211 @@ const IMAGE_OPERATORS = IMAGE_OPERATOR_NAMES.map(name => OPS_BY_NAME[name]).filt
 );
 
 /**
- * Whether a page paints any image at all.
+ * How many pages one import will look at for figures.
  *
- * Used only for pages that produced no text, and only to tell a scan from a blank divider. The
- * operator list is read for those pages alone: it is the expensive call, and a page with text
- * needs no classification.
+ * Reading a page's operator list and decoding every picture on it is the expensive half of parsing,
+ * and a 5,000-page document would hold the whole thing in memory at once. Beyond this many pages
+ * the text is still read in full and the reader says in its limitations exactly which pages were
+ * not searched for figures, so the limit is a stated bound rather than a silent truncation.
  */
-async function pageDrawsAnImage(page: any): Promise<boolean> {
+export const MAX_FIGURE_PAGES = 300;
+
+/**
+ * The pictures one page painted, in the order it painted them.
+ *
+ * The current transform is tracked through the operator list because the picture's own size is not
+ * where it was drawn: a 40-pixel icon painted through a 6× matrix covers a quarter of the page, and
+ * the box is what decides whether it is a figure. `q`/`Q` are honoured through a stack, because a
+ * figure inside a nested transform would otherwise be placed at the wrong size.
+ *
+ * Boxes are converted to the viewport's own top-down coordinates here, so the text lines and the
+ * figures can be compared without either of them having to know how PDF space works.
+ */
+async function readPaintedImages(page: any, pageHeight: number): Promise<PaintedImage[]> {
+  let operators: { fnArray: number[]; argsArray: any[] };
+
   try {
-    const operators = await page.getOperatorList();
-    return (operators.fnArray as number[]).some(fn => IMAGE_OPERATORS.includes(fn));
+    operators = await page.getOperatorList();
   } catch {
-    // A page whose operator list cannot be read is not evidence that it is blank, so it is
-    // reported as unread content rather than as an empty page.
-    return true;
+    return [];
   }
+
+  const transformOp = OPS_BY_NAME.transform;
+  const saveOp = OPS_BY_NAME.save;
+  const restoreOp = OPS_BY_NAME.restore;
+  const inlineOp = OPS_BY_NAME.paintInlineImageXObject;
+
+  let matrix = [1, 0, 0, 1, 0, 0];
+  const stack: number[][] = [];
+  const painted: PaintedImage[] = [];
+
+  for (let index = 0; index < operators.fnArray.length; index++) {
+    const fn = operators.fnArray[index];
+    const args = operators.argsArray[index];
+
+    if (fn === transformOp && Array.isArray(args) && args.length >= 6) {
+      matrix = multiplyMatrix(matrix, args as number[]);
+      continue;
+    }
+    if (fn === saveOp) {
+      stack.push([...matrix]);
+      continue;
+    }
+    if (fn === restoreOp) {
+      matrix = stack.pop() ?? [1, 0, 0, 1, 0, 0];
+      continue;
+    }
+
+    if (!IMAGE_OPERATORS.includes(fn)) continue;
+
+    const name = typeof args?.[0] === 'string' ? (args[0] as string) : `inline-${index}`;
+    const raw = boxForMatrix(matrix);
+
+    // PDF space has its origin at the bottom left; the viewport's top left is where the text lines
+    // are measured from, so the box is flipped once, here, and nowhere else.
+    const box = {
+      x: raw.x,
+      y: pageHeight - (raw.y + raw.height),
+      width: raw.width,
+      height: raw.height,
+    };
+
+    const image = fn === inlineOp ? decodedImage(args?.[0]) : await readImageObject(page, name);
+    painted.push({ name, box, image });
+  }
+
+  return painted;
+}
+
+/**
+ * The decoded samples behind one painted picture name.
+ *
+ * pdf.js resolves image objects lazily and, depending on the version, either returns one straight
+ * away or takes a callback. Both are handled, and a bounded wait gives up rather than hanging a
+ * parse: a picture this build could not decode is reported as unreadable, which is honest, while a
+ * reader that never returns is a hung import.
+ */
+function readImageObject(page: any, name: string): Promise<DecodedImage | null> {
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = (value: DecodedImage | null) => {
+      if (!settled) {
+        settled = true;
+        resolve(value);
+      }
+    };
+
+    try {
+      const direct = page.objs.get(name);
+      const decoded = decodedImage(direct);
+      if (decoded) {
+        finish(decoded);
+        return;
+      }
+    } catch {
+      // Not resolved yet: the callback form below is the answer.
+    }
+
+    try {
+      page.objs.get(name, (value: unknown) => finish(decodedImage(value)));
+    } catch {
+      finish(null);
+    }
+
+    setTimeout(() => finish(null), IMAGE_READ_TIMEOUT_MS);
+  });
+}
+
+/** How long one picture is given to decode before the import treats it as unreadable. */
+const IMAGE_READ_TIMEOUT_MS = 3_000;
+
+/**
+ * Normalizes what pdf.js hands over into samples this build can encode.
+ *
+ * `kind` is pdf.js's own layout marker (1 = 1-bit greyscale, 2 = RGB, 3 = RGBA). A value this build
+ * does not know is refused rather than guessed: writing the wrong layout produces an image that
+ * renders as noise, which is worse than reporting the picture as unreadable.
+ */
+function decodedImage(value: unknown): DecodedImage | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const record = value as Record<string, unknown>;
+
+  const width = record.width;
+  const height = record.height;
+  const data = record.data;
+
+  if (typeof width !== 'number' || typeof height !== 'number') return null;
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) return null;
+  if (data === undefined || data === null || typeof (data as ArrayLike<number>).length !== 'number') {
+    return null;
+  }
+
+  const kind = record.kind;
+  const samples = data as ArrayLike<number>;
+
+  if (kind === 1 || kind === 2 || kind === 3) {
+    return { kind, data: samples, width, height };
+  }
+
+  // No marker: the sample count tells the layout, and anything else is refused.
+  if (samples.length === width * height * 3) return { kind: 2, data: samples, width, height };
+  if (samples.length === width * height * 4) return { kind: 3, data: samples, width, height };
+
+  return null;
+}
+
+/**
+ * The text of a page as positioned lines, which is what a figure's caption is found from.
+ *
+ * Lines are built in the same top-down space as the figures: the baseline comes from the item's own
+ * transform, and the line's box extends upward from it by the height pdf.js reports.
+ */
+export function textLinesFromItems(
+  items: Array<{ str?: string; transform?: number[]; width?: number; height?: number }>,
+  pageHeight = 0
+): PageTextLine[] {
+  const lines: PageTextLine[] = [];
+  let current: { texts: string[]; x: number; baseline: number; width: number; height: number } | null = null;
+
+  const flush = () => {
+    if (!current) return;
+    const text = current.texts.join(' ').replace(/[ \t]+/g, ' ').trim();
+    if (text.length > 0) {
+      lines.push({
+        text,
+        x: current.x,
+        y: pageHeight > 0 ? pageHeight - current.baseline - current.height : current.baseline,
+        width: current.width,
+        height: Math.max(current.height, 1),
+      });
+    }
+    current = null;
+  };
+
+  for (const item of items) {
+    const value = typeof item.str === 'string' ? item.str : '';
+    const transform = Array.isArray(item.transform) && item.transform.length >= 6 ? item.transform : null;
+    const baseline = transform ? transform[5] : null;
+
+    if (current && baseline !== null && Math.abs(baseline - current.baseline) > 1.5) flush();
+    if (!current && baseline !== null) {
+      current = {
+        texts: [],
+        x: transform ? transform[4] : 0,
+        baseline,
+        width: typeof item.width === 'number' ? item.width : 0,
+        height: typeof item.height === 'number' ? item.height : 0,
+      };
+    }
+    if (current && value.length > 0) {
+      current.texts.push(value);
+      current.width = Math.max(current.width, typeof item.width === 'number' ? item.width : 0);
+      current.height = Math.max(current.height, typeof item.height === 'number' ? item.height : 0);
+    }
+  }
+
+  flush();
+  return lines;
 }
 
 /**

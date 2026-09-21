@@ -8,7 +8,13 @@ import { ServerConfig, loadConfig } from '../apps/api/src/config';
 import { startServer, type RunningServer } from '../apps/api/src/server';
 import { createGenerationProvider } from '../packages/providers/src';
 import { GenerationWorker } from '../apps/worker/src/worker';
-import { claimNextJob, enqueueGenerationJob, failJob, requireJob } from '../apps/worker/src/queue';
+import {
+  claimIdentityOf,
+  claimNextJob,
+  enqueueGenerationJob,
+  failJob,
+  requireJob,
+} from '../apps/worker/src/queue';
 import { startStubProvider, type StubProvider } from './helpers/stubProvider';
 
 /**
@@ -443,17 +449,19 @@ describe('A run that already finished', () => {
       maxAttempts: 3,
     });
 
+    // Claimed properly, so the run has a real lease and claim epoch: a stop is settled by the
+    // worker that holds the run, and `failJob` now refuses a claim that has none.
+    const held = claimNextJob(workerDb, { workerId: 'wrk_failing' });
+    expect(held?.id).toBe(cancelled.id);
+    const claim = claimIdentityOf(held!);
+
     workerDb
-      .prepare(
-        `UPDATE generation_jobs
-            SET state = 'processing', worker_id = 'wrk_failing', cancel_requested_at = ?
-          WHERE id = ?`
-      )
+      .prepare('UPDATE generation_jobs SET cancel_requested_at = ? WHERE id = ?')
       .run(new Date().toISOString(), cancelled.id);
 
     // A retryable failure raised after the stop was requested must not resurrect the run: the
     // claim guard refuses a cancelled job, so `pending` would strand it forever.
-    const state = failJob(workerDb, cancelled.id, {
+    const state = failJob(workerDb, claim, {
       code: 'provider_unavailable',
       message: 'The provider could not be reached.',
       retryable: true,

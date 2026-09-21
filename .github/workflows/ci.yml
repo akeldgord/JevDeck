@@ -40,9 +40,18 @@ jobs:
       - name: Typecheck every project
         run: bun run typecheck
 
+      - name: Install the browser the UI suite drives
+        # `tests/browser-journey.test.ts` drives a real Chromium through the real product and runs as
+        # part of `bun test`: a UI suite that only runs when somebody remembers to enable it is a
+        # suite that stops running. Playwright needs its own browser plus the system libraries that
+        # browser links against.
+        run: bunx playwright install --with-deps chromium
+
       - name: Run the test suite
         # Includes the migration, backup/restore, budget, study-persistence and end-to-end
         # workflow suites. The suites create their own temporary databases and remove them.
+        # The browser suite is part of this run; the live-provider smoke test skips itself unless a
+        # provider credential is configured, so this job still needs no repository secret.
         run: bun test
 
       - name: Build the web application
@@ -58,3 +67,120 @@ jobs:
             echo "Demo fixtures, synthetic identities or server-only configuration were found in the production bundle."
             exit 1
           fi
+
+  # The deployment check: the image is built the way a self-hoster builds it, run the way the
+  # documented commands run it, and then driven over its own HTTP surface — including a backup and
+  # restore inside the image, with a second container serving the restored database.
+  #
+  # It is a separate job because it needs a Docker daemon, and because a container failure should be
+  # readable on its own rather than buried in a four-minute unit-test log. `tests/container-deployment.test.ts`
+  # skips itself unless `JEVDECK_CONTAINER_BASE_URL` is set, which is what this job supplies; that is
+  # also why a local `bun test` is not affected by a missing daemon.
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The same pinned toolchain the verify job uses, so the image and the tests it is checked with
+      # come from one version of Bun.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+
+      - name: Install from the lockfile
+        run: bun install --frozen-lockfile
+
+      - name: Start the loopback provider the image is pointed at
+        # The container calls this provider for generation. It runs on the runner's host network and
+        # the container is started with `--network host`, so the address below is simply loopback —
+        # no proxy, no service discovery, nothing that only this workflow knows how to set up.
+        run: |
+          nohup bun tests/helpers/stubProviderServer.ts 4319 > /tmp/stub-provider.log 2>&1 &
+          for attempt in $(seq 1 50); do
+            if curl -fsS -o /dev/null http://127.0.0.1:4319/v1/chat/completions -X POST -d '{}'; then
+              exit 0
+            fi
+            sleep 0.2
+          done
+          echo "The stub provider never came up:"
+          cat /tmp/stub-provider.log
+          exit 1
+
+      - name: Build the image
+        # The Bun version comes from `.bun-version`, the same file the verify job's toolchain is
+        # pinned to, so the image cannot be built on a runtime the tests never ran against.
+        run: docker build --build-arg "BUN_VERSION=$(cat .bun-version)" --tag jevdeck:ci .
+
+      - name: Run the documented container
+        # The command from the Dockerfile's own comment and docs/self-hosting.md, with the provider
+        # pointed at the loopback stub. `--network host` is what lets the container reach it.
+        run: |
+          docker run --detach --name jevdeck-ci --network host \
+            --volume jevdeck-ci-data:/data \
+            --env PORT=3001 \
+            --env JEVDECK_DB_PATH=/data/jevdeck.sqlite \
+            --env JEVDECK_PROVIDER_KIND=openai-compatible \
+            --env JEVDECK_PROVIDER_API_KEY=ci-stub-provider-key \
+            --env JEVDECK_PROVIDER_BASE_URL=http://127.0.0.1:4319/v1 \
+            --env JEVDECK_PROVIDER_MODEL=stub-model \
+            --env JEVDECK_PROVIDER_DECISION_MODEL=stub-model \
+            jevdeck:ci
+          for attempt in $(seq 1 60); do
+            if curl -fsS -o /dev/null http://127.0.0.1:3001/api/health; then
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "The container never reported a healthy database:"
+          docker logs jevdeck-ci
+          exit 1
+
+      - name: Drive the deployed image as a fresh installation
+        env:
+          JEVDECK_CONTAINER_BASE_URL: http://127.0.0.1:3001
+          JEVDECK_CONTAINER_MODE: fresh
+        run: bun test tests/container-deployment.test.ts
+
+      - name: Back the running installation up inside the image
+        # Run through the image's own documented command, against the volume the server is using.
+        run: docker exec jevdeck-ci bun scripts/backup.ts /data/ci-backup.sqlite
+
+      - name: Restore that backup inside the image
+        run: docker exec jevdeck-ci bun scripts/restore.ts /data/ci-backup.sqlite /data/restored.sqlite
+
+      - name: Run a second container against the restored database
+        run: |
+          docker run --detach --name jevdeck-ci-restored --network host \
+            --volume jevdeck-ci-data:/data \
+            --env PORT=3002 \
+            --env JEVDECK_DB_PATH=/data/restored.sqlite \
+            --env JEVDECK_PROVIDER_KIND=openai-compatible \
+            --env JEVDECK_PROVIDER_API_KEY=ci-stub-provider-key \
+            --env JEVDECK_PROVIDER_BASE_URL=http://127.0.0.1:4319/v1 \
+            --env JEVDECK_PROVIDER_MODEL=stub-model \
+            --env JEVDECK_PROVIDER_DECISION_MODEL=stub-model \
+            jevdeck:ci
+          for attempt in $(seq 1 60); do
+            if curl -fsS -o /dev/null http://127.0.0.1:3002/api/health; then
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "The restored installation never reported a healthy database:"
+          docker logs jevdeck-ci-restored
+          exit 1
+
+      - name: Verify the restored installation serves the same installation
+        env:
+          JEVDECK_CONTAINER_BASE_URL: http://127.0.0.1:3002
+          JEVDECK_CONTAINER_MODE: restored
+        run: bun test tests/container-deployment.test.ts
+
+      - name: Container logs, when something above failed
+        if: failure()
+        run: |
+          docker logs jevdeck-ci 2>&1 | tail -100 || true
+          docker logs jevdeck-ci-restored 2>&1 | tail -100 || true
+          cat /tmp/stub-provider.log || true

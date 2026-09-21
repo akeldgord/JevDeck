@@ -143,7 +143,7 @@ authoritative. That was implemented for negation as "the claim's negation state 
 page's" — and a page of dense prose almost always contains a negation, so a claim that faithfully
 restated one sentence was rejected because a *different* sentence was negative. Since the model can
 withhold but never rescue, those cards were withheld with no appeal, and the coverage metric counted
-them as gaps. The reproducer is in `docs/remediation-status.md` (F-AA).
+them as gaps. The reproducer is in `docs/remediation-status-history.md` (F-AA).
 
 The check is now scoped: when one or more source sentences clearly restate the claim, the claim is
 compared against those; when none is close enough, the coarse whole-page comparison is kept so an

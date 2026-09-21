@@ -43,9 +43,10 @@ export async function parseDocumentFile(
       totalWords: parsed.totalWords,
       sections: parsed.sections,
       pages: parsed.pages,
-      // Images inside PDF pages are not extracted: the package would have to render and re-encode
-      // every page, and the reader says so in its limitations rather than shipping placeholders.
-      media: [],
+      // The figures the pages painted, each with the caption the document states for it, and the
+      // plate a scanned page is made of — which is what the reading pass later reads. A picture the
+      // parse could not decode is absent here and named in the reader's limitations.
+      media: parsed.media,
       blankPages: parsed.blankPages,
       unextractedPages: parsed.unextractedPages,
       limitations: parsed.limitations,
@@ -82,7 +83,16 @@ function ingestedFromPdf(parsed: ParsedPdfResult): IngestedSource {
     totalWords: parsed.totalWords,
     pages: parsed.pages,
     sections: parsed.sections as DocumentSection[],
-    media: [],
+    media: parsed.media.map(item => ({
+      pageNumber: item.pageNumber,
+      kind: item.kind,
+      name: item.name,
+      contentType: item.contentType,
+      bytes: item.bytes,
+      ...(item.caption ? { caption: item.caption } : {}),
+      ...(item.context ? { context: item.context } : {}),
+      ...(item.anchor ? { anchor: item.anchor } : {}),
+    })),
     hasToc: parsed.hasToc,
     pagination: 'explicit',
     blankPages: parsed.blankPages,

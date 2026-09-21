@@ -9,10 +9,26 @@ import type { TokenUsage } from './types';
  * are read here and never logged, never returned, never put in an error message.
  */
 
+/** A picture sent with a request, as the bytes and their media type. */
+export interface ChatImage {
+  mediaType: string;
+  /** Base64 of the image bytes, without a data-URL prefix. */
+  base64: string;
+}
+
 export interface ChatRequest {
   model: string;
   system: string;
   user: string;
+  /**
+   * Pictures the request asks about, when it asks about any.
+   *
+   * A request with no images sends its user message as a plain string, exactly as every request did
+   * before this field existed: a transport that quietly changed the shape of every message would
+   * break for every provider that only accepts strings. The multi-part form is used when, and only
+   * when, there is something to attach.
+   */
+  images?: ChatImage[];
   /** Ask the provider for a JSON object. Ignored by transports that have no such switch. */
   jsonMode: boolean;
   maxOutputTokens: number;
@@ -230,13 +246,27 @@ export function createOpenAiCompatibleTransport(
   const jsonMode = config.jsonMode ?? true;
 
   return async request => {
+    const images = request.images ?? [];
+
     const body: Record<string, unknown> = {
       model: request.model,
       temperature: request.temperature,
       max_tokens: request.maxOutputTokens,
       messages: [
         { role: 'system', content: request.system },
-        { role: 'user', content: request.user },
+        {
+          role: 'user',
+          content:
+            images.length === 0
+              ? request.user
+              : [
+                  { type: 'text', text: request.user },
+                  ...images.map(image => ({
+                    type: 'image_url',
+                    image_url: { url: `data:${image.mediaType};base64,${image.base64}` },
+                  })),
+                ],
+        },
       ],
     };
 
@@ -275,7 +305,18 @@ export function createAnthropicTransport(config: TransportConfig): ChatTransport
         max_tokens: request.maxOutputTokens,
         temperature: request.temperature,
         system: request.system,
-        messages: [{ role: 'user', content: request.user }],
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: request.user },
+              ...(request.images ?? []).map(image => ({
+                type: 'image',
+                source: { type: 'base64', media_type: image.mediaType, data: image.base64 },
+              })),
+            ],
+          },
+        ],
       },
       timeoutMs: config.timeoutMs,
       providerLabel: label,

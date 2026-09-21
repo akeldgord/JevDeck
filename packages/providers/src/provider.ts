@@ -20,11 +20,13 @@ import type {
   ConceptExtractionRequest,
   ConceptExtractionResult,
   GenerationProvider,
+  PageOcrRequest,
+  PageOcrResult,
   PreparedCall,
   ProviderInfo,
   TokenUsage,
 } from './types';
-import type { ChatRequest, ChatTransport } from './transport';
+import type { ChatImage, ChatRequest, ChatTransport } from './transport';
 
 export const CONCEPT_KINDS: readonly ConceptKind[] = [
   'definition',
@@ -77,10 +79,7 @@ export interface CreateProviderOptions {
  * are checked field by field, and anything unreadable raises `malformed_output` instead of
  * being coerced into a plausible-looking card.
  */
-export function createProvider(options: CreateProviderOptions): GenerationProvider & {
-  promptVersions: Record<string, string>;
-  promptHashes: Record<string, string>;
-} {
+export function createProvider(options: CreateProviderOptions): GenerationProvider {
   const { info, transport, prompts } = options;
   const temperature = options.temperature ?? 0.2;
   const timeoutMs = options.timeoutMs ?? 90_000;
@@ -89,6 +88,7 @@ export function createProvider(options: CreateProviderOptions): GenerationProvid
   const conceptPrompt = prompts.require('concepts/extract.v1');
   const cardPrompt = prompts.require('cards/generate.v1');
   const supportPrompt = prompts.require('validation/support.v1');
+  const ocrPrompt = prompts.require('ocr/read-page.v1');
 
   /**
    * Builds a call without sending it.
@@ -103,14 +103,25 @@ export function createProvider(options: CreateProviderOptions): GenerationProvid
     user: string,
     model: string,
     jsonMode: boolean,
-    parse: (text: string, usage: TokenUsage) => T
+    parse: (text: string, usage: TokenUsage) => T,
+    /**
+     * Pictures the request carries, when it carries any.
+     *
+     * Part of the serialized `payload`, which is what makes the image bytes part of the operation's
+     * identity and of the reservation derived from it: the same page read twice is one operation,
+     * and a *different* page is not — a distinction a request body without the image could not make.
+     */
+    images: ChatImage[] = []
   ): PreparedCall<T> => {
     const request: ChatRequest = {
       model,
       system: prompt.content,
       user,
+      ...(images.length > 0 ? { images } : {}),
       jsonMode,
-      maxOutputTokens: estimateMaxOutputTokens(prompt.content.length + user.length),
+      maxOutputTokens: estimateMaxOutputTokens(
+        prompt.content.length + user.length + images.reduce((total, image) => total + image.base64.length, 0)
+      ),
       temperature,
     };
 
@@ -154,11 +165,13 @@ export function createProvider(options: CreateProviderOptions): GenerationProvid
       'concepts/extract.v1': conceptPrompt.version,
       'cards/generate.v1': cardPrompt.version,
       'validation/support.v1': supportPrompt.version,
+      'ocr/read-page.v1': ocrPrompt.version,
     },
     promptHashes: {
       'concepts/extract.v1': conceptPrompt.hash,
       'cards/generate.v1': cardPrompt.hash,
       'validation/support.v1': supportPrompt.hash,
+      'ocr/read-page.v1': ocrPrompt.hash,
     },
 
     /**
@@ -390,6 +403,71 @@ export function createProvider(options: CreateProviderOptions): GenerationProvid
 
     async assessClaimSupport(request: ClaimSupportRequest): Promise<ClaimSupportResult> {
       const call = this.prepareClaimSupport(request);
+      return call.parse(await call.send());
+    },
+
+    /**
+     * Reading a page's picture — a bounded transcription of one image.
+     *
+     * The page number and the document name go in the prompt rather than into the image's bytes, so
+     * a retry of the same page is the same request. The result is deliberately allowed to be empty:
+     * a page with no words on it is a page with no words on it, and a provider asked to find text in
+     * a photograph will find text in a photograph.
+     */
+    preparePageOcr(request: PageOcrRequest): PreparedCall<PageOcrResult> {
+      const payload = {
+        task: 'read_page_image',
+        documentName: request.documentName,
+        pageNumber: request.pageNumber,
+        ...(request.pageLabel ? { pageLabel: request.pageLabel } : {}),
+        instructions:
+          'Transcribe the words on the image. Empty text is the correct answer for an image with no ' +
+          'legible words; do not describe the image and do not guess.',
+      };
+
+      return prepare(
+        'ocr/read-page.v1',
+        ocrPrompt,
+        JSON.stringify(payload),
+        info.decisionModel,
+        true,
+        (text, usage) => {
+          const parsed = parseJsonObject(text, 'Page reading');
+          const rawText = parsed.text;
+
+          // `text` must be present and a string, but it is allowed to be *empty*: a page whose
+          // picture holds no words has been read successfully and has nothing on it. Requiring a
+          // non-empty string here would turn "this photograph has no text" into an unusable answer
+          // and send the run looking for text that is not there.
+          if (typeof rawText !== 'string') {
+            throw new ProviderError(
+              'malformed_output',
+              'Page reading did not return a `text` field, so it is not known what the image said.'
+            );
+          }
+          if (rawText.length > 100_000) {
+            throw new ProviderError('malformed_output', 'Page reading returned more text than a page can hold.');
+          }
+
+          const read = rawText.replace(/\r\n/g, '\n').trim();
+          const confidence =
+            typeof parsed.confidence === 'number' && Number.isFinite(parsed.confidence)
+              ? Math.min(1, Math.max(0, parsed.confidence))
+              : null;
+
+          return {
+            text: read,
+            confidence,
+            notes: asOptionalString(parsed.notes, 'notes', 2000) ?? '',
+            usage,
+          };
+        },
+        [{ mediaType: request.image.mediaType, base64: request.image.base64 }]
+      );
+    },
+
+    async readPageImage(request: PageOcrRequest): Promise<PageOcrResult> {
+      const call = this.preparePageOcr(request);
       return call.parse(await call.send());
     },
   };

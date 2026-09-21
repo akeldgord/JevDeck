@@ -49,7 +49,7 @@ was finally decided — which is what makes the ledger a record of spend rather 
 while the original estimate remains visible in history.
 
 This was not theoretical: the released case left the ledger claiming the full estimate for a charge
-that had been decided against (F-AB in `docs/remediation-status.md`).
+that had been decided against (F-AB in `docs/remediation-status-history.md`).
 
 ## Consequences and limitations
 

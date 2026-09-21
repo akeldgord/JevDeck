@@ -1,16 +1,36 @@
 import { readDocx } from './docx';
+import { readImageSource, imageTypeOf, UnreadableImageError, type ImageType } from './image';
 import { readPptx } from './pptx';
 import { readTextSource } from './textSource';
 import { ZipError } from './zip';
+import { textSourceOf } from './types';
 import type { ExtractionSummary, IngestedSource, SourceFormat } from './types';
 
 export * from './types';
+export { readImageSource, imageTypeOf, UnreadableImageError, type ImageType } from './image';
+export { encodePng, isEncodablePng, expandOneBitRow, type PngInput } from './png';
 export { readDocx, parseParagraphs, headingLevel } from './docx';
 export { readPptx, slideTitle, slideBody } from './pptx';
 export { readTextSource, markdownBlocks } from './textSource';
 export { paginateBlocks, sectionsFromHeadings, splitOversizedText, VIRTUAL_PAGE_CHARS } from './text';
 export { readZipDirectory, readZipEntry, ZipError } from './zip';
 export { collectMedia, contentTypeFor, DEFAULT_MEDIA_BUDGET } from './ooxml';
+export {
+  figuresByEvidence,
+  figuresForEvidence,
+  figureSupportsEvidence,
+  looksLikeCaption,
+  sharedTermCount,
+  significantTerms,
+  MAX_CONTEXT_CHARS,
+  MAX_FIGURES_PER_CARD,
+  MIN_SHARED_TERMS_BUSY_PAGE,
+  MIN_SHARED_TERMS_SINGLE_FIGURE,
+  MIN_TERM_LENGTH,
+  type AssociationContext,
+  type CitedEvidence,
+  type StoredFigure,
+} from './figures';
 
 /**
  * What this build can read, stated once.
@@ -65,6 +85,12 @@ export const SUPPORTED_FORMATS: readonly FormatSupport[] = [
     extensions: [],
     note: 'Text you paste directly, read the same way as a plain-text file.',
   },
+  {
+    format: 'image',
+    label: 'Picture or scan (PNG, JPEG, GIF, WebP, BMP)',
+    extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'],
+    note: 'Stored as one page with the picture kept whole. Its text is read by OCR when a run needs it, and the page is reported as unread until then.',
+  },
 ];
 
 /**
@@ -94,10 +120,10 @@ export const UNSUPPORTED_FORMATS: readonly UnsupportedFormat[] = [
     reason: 'E-book containers are not read by this build. Export the chapters you need as PDF or text.',
   },
   {
-    extensions: ['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'tif', 'tiff', 'heic'],
-    label: 'Images and photographs',
+    extensions: ['tif', 'tiff', 'heic', 'heif', 'svg'],
+    label: 'Image formats this build does not store',
     reason:
-      'Reading text out of an image needs OCR, which is not implemented in this build. Upload a PDF of the scan instead: the pages will be stored and reported as unextracted rather than silently ignored.',
+      'TIFF, HEIC and SVG have no fixed signature this build can check, so their bytes would be stored as a picture nothing can render. Convert the file to PNG or JPEG and upload that.',
   },
   {
     extensions: ['rtf', 'pages', 'key', 'zip', 'html', 'htm'],
@@ -116,6 +142,7 @@ export function detectFormat(fileName: string, mimeType?: string): SourceFormat 
   const mime = (mimeType ?? '').toLowerCase();
   if (mime === 'application/pdf') return 'pdf';
   if (mime === 'text/markdown') return 'markdown';
+  if (mime.startsWith('image/')) return 'image';
   if (mime.startsWith('text/')) return 'text';
 
   return null;
@@ -174,6 +201,12 @@ export async function ingestDocument(input: {
       return readDocx({ fileName: input.fileName, bytes: input.bytes });
     case 'pptx':
       return readPptx({ fileName: input.fileName, bytes: input.bytes });
+    case 'image':
+      return readImageSource({
+        fileName: input.fileName,
+        bytes: input.bytes,
+        ...(input.mimeType ? { contentType: input.mimeType } : {}),
+      });
     case 'markdown':
     case 'text':
       return readTextSource({
@@ -200,11 +233,19 @@ export async function ingestDocument(input: {
  * material the system never read.
  */
 export function summariseExtraction(source: IngestedSource): ExtractionSummary {
-  const textPages = source.pages.filter(page => page.kind === 'text').length;
+  const textPages = source.pages.filter(
+    page => page.kind === 'text' || (page.kind === 'ocr-text' && textSourceOf(page) === 'native')
+  ).length;
+  const ocrPages = source.pages.filter(page => page.kind === 'ocr-text' && textSourceOf(page) === 'ocr').length;
   const blankPages = source.pages.filter(page => page.kind === 'blank').length;
   const unextractedPages = source.pages.filter(page => page.kind === 'image-only').length;
 
-  const parts = [`${textPages} of ${source.pageCount} page(s) readable`];
+  const readable = textPages + ocrPages;
+  // "readable" is every page that can support a card, so a page a picture was read out of counts.
+  // Saying so beside the count is the difference between a report and a claim: the reader is told
+  // how much of the readable text was read off a picture rather than out of the document.
+  const parts = [`${readable} of ${source.pageCount} page(s) readable`];
+  if (ocrPages > 0) parts.push(`${ocrPages} of them read by OCR`);
   if (blankPages > 0) parts.push(`${blankPages} blank`);
   if (unextractedPages > 0) parts.push(`${unextractedPages} with unread content`);
   if (source.media.length > 0) parts.push(`${source.media.length} image(s) stored`);
@@ -221,12 +262,13 @@ export function summariseExtraction(source: IngestedSource): ExtractionSummary {
     format: source.format,
     pageCount: source.pageCount,
     textPages,
+    ocrPages,
     blankPages,
     unextractedPages,
     totalWords: source.totalWords,
     sectionCount: countSections(source.sections),
     mediaCount: source.media.length,
-    readable: textPages,
+    readable,
     sentence,
   };
 }

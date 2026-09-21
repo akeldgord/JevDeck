@@ -130,7 +130,7 @@ named. The `.env.example` blocker is recorded as a tooling limit rather than qui
 the corollary is that a status table which understates the implementation is also untrue — it
 sends the next reader to rebuild something that exists. An audit written at an earlier revision
 stays accurate about that revision, which is why this record and the dated update in
-`docs/remediation-status.md` are separate from the tables they correct.
+`docs/remediation-status-history.md` are separate from the tables they correct.
 
 ## Amendments after audit
 

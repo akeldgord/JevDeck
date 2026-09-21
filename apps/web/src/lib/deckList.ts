@@ -10,11 +10,10 @@ import type { StoredDeck } from './api';
  *   - a deck belongs to the caller or was shared with them, and the server says which (`access`);
  *   - **export is owner-only** — `GET /api/decks/:id/export.apkg` resolves the deck with
  *     `requireOwnedDeck`, so offering it on a shared deck would produce a dead button;
- *   - **source access is owner-only too**, and not by accident: the share route refuses any scope
- *     other than `study` ("source access stays with the owner, so a share cannot grant it"), so a
- *     shared deck has no readable document and no page to render — which is why a shared row shows
- *     no document name rather than the owner's;
- *   - deleting and sharing are owner-only, like everything that changes the deck;
+ *   - **source access follows the share's scope**, and the server states the answer on the row
+ *     (`sourceAccess`) rather than letting this module guess it: an owner reads the document, a
+ *     `study_and_source` share reads it, and a plain `study` share does not;
+ *   - deleting, re-generating and sharing on are owner-only, like everything that changes the deck;
  *   - a deck whose document was deleted still lists, because its cards still exist, but it cannot
  *     be reopened as a source document.
  *
@@ -52,6 +51,8 @@ export interface DeckRow {
   exportBlockedReason: string | null;
   /** Why `open` is false, or `null` when it is available. */
   openBlockedReason: string | null;
+  /** Why `readSource` is false, or `null` when it is available. */
+  sourceBlockedReason: string | null;
 }
 
 export interface DeckListInput {
@@ -84,11 +85,20 @@ function rowFor(
 ): DeckRow {
   const isOwner = access === 'owner';
   const documentId = deck.documentId ?? null;
-  const documentName = isOwner && documentId ? (input.documentNames?.get(documentId) ?? null) : null;
+  // The server's answer, not this module's reconstruction of the rule. An owner always has it.
+  const sourceAccess = isOwner ? true : deck.sourceAccess === true;
+  // A shared reader may name the document they can open; one who cannot open it gets no name,
+  // because the name of a document they may not read is the owner's business, not theirs.
+  const documentName = documentId && sourceAccess ? (input.documentNames?.get(documentId) ?? null) : null;
 
   const openBlockedReason =
     isOwner && documentId === null
       ? 'The document this deck was built from was deleted, so there is no source to reopen.'
+      : null;
+
+  const sourceBlockedReason =
+    !isOwner && documentId !== null && !sourceAccess
+      ? 'This share covers study only, so the document this deck was built from is not readable here.'
       : null;
 
   const exportBlockedReason = !isOwner
@@ -105,7 +115,9 @@ function rowFor(
     accessLabel: isOwner ? 'Yours' : 'Shared with you',
     accessDetail: isOwner
       ? 'You own this deck.'
-      : 'Shared for study. The source document stays with its owner.',
+      : sourceAccess
+        ? 'Shared with you for study and source: you can open the document this deck was built from.'
+        : 'Shared for study. The source document stays with its owner.',
     documentId,
     documentName,
     coverageLabel: coverageLabel(deck.coverage),
@@ -113,15 +125,18 @@ function rowFor(
     createdAt: deck.createdAt,
     isActive: input.activeDeckId === deck.id,
     can: {
+      // "Open" is the generator and viewer on a document: owner-only, because it is the screen
+      // that can re-generate the deck and it is built around the caller's own sections.
       open: isOwner && documentId !== null,
       study: true,
       exportPackage: isOwner && (deck.cardCount ?? 0) > 0,
-      readSource: isOwner && documentId !== null,
+      readSource: documentId !== null && sourceAccess,
       share: isOwner,
       remove: isOwner,
     },
     exportBlockedReason,
     openBlockedReason,
+    sourceBlockedReason,
   };
 }
 

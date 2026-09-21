@@ -16,12 +16,27 @@ export const LEASE_SECONDS = 120;
 /** Delay before a retried job is claimable again. */
 export const RETRY_BACKOFF_SECONDS = 5;
 
-/** The fields of a job a stored checkpoint has to agree with before it may be continued. */
+/**
+ * The fields of a job a stored checkpoint has to agree with before it may be continued.
+ *
+ * Every field comes off the job row, which is what lets the queue reach the *same* verdict the
+ * pipeline does rather than a weaker one: the source version, the selection and the coverage mode
+ * were always here, and the pipeline records the batch plan, the models, the prompt hashes and the
+ * validator version on the row when the run starts. Without those the queue could answer "resumed"
+ * for progress the pipeline then refuses — which is a run that silently re-spends under the label
+ * Resume, the exact outcome the fingerprint exists to prevent.
+ */
 export function checkpointIdentityOf(job: GenerationJobRow): CheckpointIdentity {
   return {
     documentVersionId: job.document_version_id,
     coverage: job.coverage,
     selectedSectionIds: readSectionIds(job),
+    pipelineVersion: job.pipeline_version,
+    batchPlanId: job.batch_plan_id,
+    promptHashes: job.prompt_hashes ? safeJson(job.prompt_hashes) : null,
+    model: job.model,
+    decisionModel: job.decision_model,
+    validatorVersion: job.validator_version,
   };
 }
 
@@ -40,6 +55,10 @@ export interface GenerationJobRow {
   prompt_version: string | null;
   prompt_versions: string | null;
   prompt_hashes: string | null;
+  /** Identity of the batch plan the stored progress was produced under. */
+  batch_plan_id: string | null;
+  /** The validator version the run's accepted cards were judged by. */
+  validator_version: string | null;
   omission_reasons: string | null;
   coverage_summary: string | null;
   concept_count: number;
@@ -47,6 +66,8 @@ export interface GenerationJobRow {
   attempts: number;
   max_attempts: number;
   worker_id: string | null;
+  /** Incremented on every claim, so a reclaimed job is distinguishable from the claim before it. */
+  claim_epoch: number;
   lease_expires_at: string | null;
   started_at: string | null;
   finished_at: string | null;
@@ -116,6 +137,54 @@ function iso(date: Date): string {
 
 function isoAfter(seconds: number, from = new Date()): string {
   return new Date(from.getTime() + seconds * 1000).toISOString();
+}
+
+/**
+ * Who is allowed to write to a job.
+ *
+ * `workerId` alone is not an identity: a worker that loses its lease and later reclaims the same
+ * job is the same worker id making a *different* claim, and a write from the first claim must not
+ * be accepted under the second. `epoch` is what separates them.
+ */
+export interface ClaimIdentity {
+  jobId: string;
+  workerId: string;
+  epoch: number;
+}
+
+/**
+ * The claim a claimed row already carries.
+ *
+ * Claiming is the only thing that increments the epoch and the only thing that sets `worker_id`, so
+ * a row that is `processing` under a lease describes exactly one claim, and this rebuilds it.
+ */
+export function claimIdentityOf(job: GenerationJobRow, workerId?: string): ClaimIdentity {
+  return {
+    jobId: job.id,
+    workerId: workerId ?? job.worker_id ?? 'inline',
+    epoch: job.claim_epoch,
+  };
+}
+
+/**
+ * Thrown when a worker finds it no longer owns the job it is running.
+ *
+ * Deliberately neither a provider failure nor a cancellation: there is no retry to attempt and
+ * nothing to record against the job, because the job is no longer this worker's to describe. What
+ * its already-dispatched calls cost is settled under their own attempt and reservation ids —
+ * losing the authority to write *progress* is not the same as un-spending money.
+ */
+export class JobClaimLostError extends Error {
+  readonly code = 'claim_lost';
+
+  constructor(readonly jobId: string) {
+    super('Another worker took this run over, so this worker stopped without writing to it.');
+    this.name = 'JobClaimLostError';
+  }
+}
+
+export function isJobClaimLost(cause: unknown): cause is JobClaimLostError {
+  return cause instanceof JobClaimLostError;
 }
 
 export interface EnqueueInput {
@@ -203,6 +272,7 @@ export function claimNextJob(db: Database, options: ClaimOptions): GenerationJob
           SET state = 'processing',
               attempts = attempts + 1,
               worker_id = ?,
+              claim_epoch = claim_epoch + 1,
               lease_expires_at = ?,
               started_at = COALESCE(started_at, ?),
               updated_at = ?
@@ -295,15 +365,32 @@ export function recoverAbandonedStops(db: Database): number {
   return settled;
 }
 
-/** Extends the lease while the attempt is still running. */
-export function renewLease(db: Database, jobId: string, workerId: string, leaseSeconds = LEASE_SECONDS): boolean {
+/**
+ * Extends the lease, but only for the claim that still holds it.
+ *
+ * Two conditions carry the weight. The **identity** has to match, so a worker whose job was
+ * reclaimed cannot renew the new claim's lease. And the lease has to still be **live**: renewal
+ * must never revive an expired claim, because an expired lease under no owner is exactly the state
+ * another worker is entitled to claim. Recovering from an expired lease is a fresh claim with a new
+ * epoch, never an extension of the old one.
+ *
+ * Returns `false` when either condition fails, which is the caller's signal that it has lost the
+ * run and must stop writing to it.
+ */
+export function renewLease(db: Database, claim: ClaimIdentity, leaseSeconds = LEASE_SECONDS): boolean {
+  const now = iso(new Date());
+
   const result = db
     .prepare(
       `UPDATE generation_jobs
           SET lease_expires_at = ?, updated_at = ?
-        WHERE id = ? AND worker_id = ? AND state = 'processing'`
+        WHERE id = ?
+          AND state = 'processing'
+          AND worker_id = ?
+          AND claim_epoch = ?
+          AND lease_expires_at IS NOT NULL AND lease_expires_at > ?`
     )
-    .run(isoAfter(leaseSeconds), iso(new Date()), jobId, workerId);
+    .run(isoAfter(leaseSeconds), now, claim.jobId, claim.workerId, claim.epoch, now);
 
   return Number(result.changes) === 1;
 }
@@ -351,16 +438,17 @@ export type FinalisationOutcome =
  * has been re-checked, and it must be synchronous: the transaction holds the database's write lock
  * for its duration, so a provider call in here would hold it for the length of an HTTP request.
  *
- * Ownership, lease, state and pending stop requests are all re-checked *inside* the transaction —
- * as one conditional statement whose affected-row count is the answer — so the check and the
- * publication it authorises cannot be separated by a concurrent claim.
+ * Ownership, lease, state, pending stop requests and the claim epoch are all re-checked *inside*
+ * the transaction — as one conditional statement whose affected-row count is the answer — so the
+ * check and the publication it authorises cannot be separated by a concurrent claim. That is
+ * requirement 9 of Step C: the ownership check is *in* the publication transaction, not before it.
  */
 export function finaliseWithPublication(
   db: Database,
-  jobId: string,
-  input: CompleteInput & { workerId: string },
+  input: CompleteInput & { claim: ClaimIdentity },
   publish: () => void
 ): FinalisationOutcome {
+  const claim = input.claim;
   let outcome: FinalisationOutcome = { outcome: 'completed' };
 
   // Immediate rather than deferred: the write lock is taken before the claim is re-read, so a
@@ -370,13 +458,14 @@ export function finaliseWithPublication(
 
     const row = db
       .query(
-        `SELECT state, worker_id, lease_expires_at, cancel_requested_at, pause_requested_at,
-                coverage_summary, concept_count, card_count
+        `SELECT state, worker_id, claim_epoch, lease_expires_at, cancel_requested_at,
+                pause_requested_at, coverage_summary, concept_count, card_count
            FROM generation_jobs WHERE id = ?`
       )
-      .get(jobId) as {
+      .get(claim.jobId) as {
       state: GenerationJobState;
       worker_id: string | null;
+      claim_epoch: number;
       lease_expires_at: string | null;
       cancel_requested_at: string | null;
       pause_requested_at: string | null;
@@ -385,7 +474,7 @@ export function finaliseWithPublication(
       card_count: number;
     } | null;
 
-    if (!row) throw new Error(`Generation job ${jobId} does not exist.`);
+    if (!row) throw new Error(`Generation job ${claim.jobId} does not exist.`);
 
     // Finished already. Its own record is the result, and rewriting it would replace cards a
     // reader may have studied since — so nothing is written, not even the same figures again.
@@ -408,19 +497,23 @@ export function finaliseWithPublication(
           WHERE id = ?
             AND state = 'processing'
             AND worker_id = ?
+            AND claim_epoch = ?
             AND lease_expires_at IS NOT NULL
             AND lease_expires_at > ?
             AND cancel_requested_at IS NULL
             AND pause_requested_at IS NULL`
       )
-      .run(now, jobId, input.workerId, now);
+      .run(now, claim.jobId, claim.workerId, claim.epoch, now);
 
     if (Number(authorised.changes) !== 1) {
       // Which condition failed decides what this is. A job this worker no longer holds is not a
       // job it may stop: reporting "paused" for somebody else's run would be the stale-worker
       // mistake this check exists to prevent. Only a run the worker still holds, and which was
       // stopped on purpose, is recorded as stopped here.
-      const stillHeld = row.state === 'processing' && row.worker_id === input.workerId;
+      const stillHeld =
+        row.state === 'processing' &&
+        row.worker_id === claim.workerId &&
+        row.claim_epoch === claim.epoch;
 
       outcome = !stillHeld
         ? { outcome: 'claim_lost' }
@@ -433,6 +526,12 @@ export function finaliseWithPublication(
     }
 
     publish();
+
+    // Reusable call results have no meaning once the run is finished, so they go in the same
+    // transaction rather than being swept up later — a cleanup that could fail on its own is a
+    // cleanup that eventually leaks. Billing evidence is not touched: `provider_attempts` and
+    // `budget_reservations` are the accounting record, not a cache of this run's answers.
+    db.prepare('DELETE FROM operation_results WHERE job_id = ?').run(claim.jobId);
 
     // The completion half of the same transaction. The checkpoint goes with it: from here the
     // stored cards are the record of this run, and a checkpoint that outlived them would be a
@@ -457,7 +556,7 @@ export function finaliseWithPublication(
       input.cardCount,
       now,
       now,
-      jobId
+      claim.jobId
     );
   }).immediate();
 
@@ -471,68 +570,80 @@ export interface FailureInput {
   retryable: boolean;
 }
 
+export type FailureOutcome = 'pending' | 'failed' | 'paused' | 'claim_lost';
+
 /**
- * Records a failed attempt.
+ * Records a failed attempt, for the claim that is still running the job.
  *
  * A retryable failure with attempts left goes back to `pending` behind a short backoff; anything
  * else is terminal. Either way the reason is stored, because "nothing happened" is not an
  * acceptable answer to a user who asked for cards.
+ *
+ * The claim is checked in the same statement that writes the outcome, because this is where a
+ * *late* exception does its damage: a worker that lost its lease mid-run and then threw would
+ * otherwise mark the new worker's in-flight job failed, ending a run somebody else is holding.
+ * `claim_lost` says nothing was written for that reason.
  */
 export function failJob(
   db: Database,
-  jobId: string,
+  claim: ClaimIdentity,
   failure: FailureInput
-): 'pending' | 'failed' | 'paused' {
-  const job = requireJob(db, jobId);
+): FailureOutcome {
+  const job = requireJob(db, claim.jobId);
 
   // A cancelled run is terminal whatever went wrong afterwards. Without this, a retryable failure
   // raised after the stop was requested would put the job back to `pending` — where the claim
   // guard refuses it, leaving a run nobody can retry and nobody will collect.
   if (job.cancel_requested_at != null) {
-    finaliseCancellation(
-      db,
-      jobId,
-      `${failure.message} The run had already been cancelled, so it was stopped rather than retried.`
-    );
-    return 'failed';
+    const message = `${failure.message} The run had already been cancelled, so it was stopped rather than retried.`;
+    return finaliseCancellation(db, claim, message) ? 'failed' : 'claim_lost';
   }
 
   // Same reasoning for a pause: the owner asked for this run to stop, so a retryable failure must
   // not put it back in the queue behind their back. Its checkpoint is kept, which is the whole
   // difference from a cancellation.
   if (job.pause_requested_at != null) {
-    finalisePause(
-      db,
-      jobId,
-      `${failure.message} The run had already been paused, so it was stopped and kept its progress.`
-    );
-    return 'paused';
+    const message = `${failure.message} The run had already been paused, so it was stopped and kept its progress.`;
+    return finalisePause(db, claim, message) ? 'paused' : 'claim_lost';
   }
 
   const now = iso(new Date());
   const canRetry = failure.retryable && job.attempts < job.max_attempts;
   const nextState: 'pending' | 'failed' = canRetry ? 'pending' : 'failed';
 
-  db.prepare(
-    `UPDATE generation_jobs
-        SET state = ?,
-            error_code = ?,
-            error_message = ?,
-            lease_expires_at = ?,
-            worker_id = NULL,
-            finished_at = ?,
-            updated_at = ?
-      WHERE id = ?`
-  ).run(
-    nextState,
-    failure.code,
-    failure.message,
-    // Behind a backoff so a retry does not hammer a rate-limited provider.
-    canRetry ? isoAfter(RETRY_BACKOFF_SECONDS) : null,
-    canRetry ? null : now,
-    now,
-    jobId
-  );
+  const result = db
+    .prepare(
+      `UPDATE generation_jobs
+          SET state = ?,
+              error_code = ?,
+              error_message = ?,
+              lease_expires_at = ?,
+              worker_id = NULL,
+              finished_at = ?,
+              updated_at = ?
+        WHERE id = ?
+          AND state = 'processing'
+          AND worker_id = ?
+          AND claim_epoch = ?
+          AND lease_expires_at IS NOT NULL AND lease_expires_at > ?`
+    )
+    .run(
+      nextState,
+      failure.code,
+      failure.message,
+      // Behind a backoff so a retry does not hammer a rate-limited provider.
+      canRetry ? isoAfter(RETRY_BACKOFF_SECONDS) : null,
+      canRetry ? null : now,
+      now,
+      claim.jobId,
+      claim.workerId,
+      claim.epoch,
+      now
+    );
+
+  // The claim moved on while this failure was being recorded. Nothing is written: the run belongs
+  // to whoever holds it now, and this worker's exception is not a fact about their job.
+  if (Number(result.changes) !== 1) return 'claim_lost';
 
   return nextState;
 }
@@ -707,23 +818,34 @@ function pauseOutright(db: Database, job: GenerationJobRow): 'paused' | null {
  *
  * `omission_reasons` carries the message too, so the sentence a person sees beside the run is the
  * same sentence `GET /api/jobs/:id` returns as an omission.
+ *
+ * Returns `false` when the claim that asked for this no longer owns the run, in which case nothing
+ * was written: a superseded claim must not be able to stop the run that replaced it.
  */
-export function finaliseCancellation(db: Database, jobId: string, message: string): void {
+export function finaliseCancellation(db: Database, claim: ClaimIdentity, message: string): boolean {
   const now = iso(new Date());
 
-  db.prepare(
-    `UPDATE generation_jobs
-        SET state = 'failed',
-            error_code = 'cancelled_by_user',
-            error_message = ?,
-            omission_reasons = ?,
-            cancel_requested_at = COALESCE(cancel_requested_at, ?),
-            lease_expires_at = NULL,
-            worker_id = NULL,
-            finished_at = ?,
-            updated_at = ?
-      WHERE id = ?`
-  ).run(message, JSON.stringify([message]), now, now, now, jobId);
+  const result = db
+    .prepare(
+      `UPDATE generation_jobs
+          SET state = 'failed',
+              error_code = 'cancelled_by_user',
+              error_message = ?,
+              omission_reasons = ?,
+              cancel_requested_at = COALESCE(cancel_requested_at, ?),
+              lease_expires_at = NULL,
+              worker_id = NULL,
+              finished_at = ?,
+              updated_at = ?
+        WHERE id = ?
+          AND state = 'processing'
+          AND worker_id = ?
+          AND claim_epoch = ?
+          AND lease_expires_at IS NOT NULL AND lease_expires_at > ?`
+    )
+    .run(message, JSON.stringify([message]), now, now, now, claim.jobId, claim.workerId, claim.epoch, now);
+
+  return Number(result.changes) === 1;
 }
 
 /** Whether a pause has been asked for but the owning worker has not acted on it yet. */
@@ -752,14 +874,30 @@ export function readCheckpoint(db: Database, jobId: string): string | null {
   return row?.checkpoint ?? null;
 }
 
-/** Records the run's progress. Called after each batch, so a crash loses at most one batch. */
-export function writeCheckpoint(db: Database, jobId: string, checkpoint: string): void {
+/**
+ * Records the run's progress. Called after each batch, so a crash loses at most one batch.
+ *
+ * Only the claim that still owns the run may write it. Returns `false` when that no longer holds:
+ * the caller must stop rather than carry on, because a checkpoint written by a claim that has been
+ * superseded would be the new worker's progress overwritten by the old one's — the exact defect
+ * this guard exists to prevent.
+ */
+export function writeCheckpoint(db: Database, claim: ClaimIdentity, checkpoint: string): boolean {
   const now = iso(new Date());
-  db.prepare(
-    `UPDATE generation_jobs
-        SET checkpoint = ?, checkpoint_updated_at = ?, updated_at = ?
-      WHERE id = ?`
-  ).run(checkpoint, now, now, jobId);
+
+  const result = db
+    .prepare(
+      `UPDATE generation_jobs
+          SET checkpoint = ?, checkpoint_updated_at = ?, updated_at = ?
+        WHERE id = ?
+          AND state = 'processing'
+          AND worker_id = ?
+          AND claim_epoch = ?
+          AND lease_expires_at IS NOT NULL AND lease_expires_at > ?`
+    )
+    .run(checkpoint, now, now, claim.jobId, claim.workerId, claim.epoch, now);
+
+  return Number(result.changes) === 1;
 }
 
 /** What a run that has not started records when it is paused. */
@@ -828,19 +966,31 @@ export function requestPause(
  *
  * `finished_at` is deliberately left alone — a pause is not an ending — and no omission is
  * recorded, because nothing was withheld: the run simply has not finished.
+ *
+ * Returns `false` when the claim that asked for this no longer owns the run, and writes nothing.
  */
-export function finalisePause(db: Database, jobId: string, message: string): void {
-  db.prepare(
-    `UPDATE generation_jobs
-        SET state = 'paused',
-            error_code = 'paused_by_user',
-            error_message = ?,
-            pause_requested_at = COALESCE(pause_requested_at, ?),
-            lease_expires_at = NULL,
-            worker_id = NULL,
-            updated_at = ?
-      WHERE id = ?`
-  ).run(message, iso(new Date()), iso(new Date()), jobId);
+export function finalisePause(db: Database, claim: ClaimIdentity, message: string): boolean {
+  const now = iso(new Date());
+
+  const result = db
+    .prepare(
+      `UPDATE generation_jobs
+          SET state = 'paused',
+              error_code = 'paused_by_user',
+              error_message = ?,
+              pause_requested_at = COALESCE(pause_requested_at, ?),
+              lease_expires_at = NULL,
+              worker_id = NULL,
+              updated_at = ?
+        WHERE id = ?
+          AND state = 'processing'
+          AND worker_id = ?
+          AND claim_epoch = ?
+          AND lease_expires_at IS NOT NULL AND lease_expires_at > ?`
+    )
+    .run(message, now, now, claim.jobId, claim.workerId, claim.epoch, now);
+
+  return Number(result.changes) === 1;
 }
 
 export type ResumeOutcome =
@@ -865,6 +1015,15 @@ export interface ResumeResult {
   fromCheckpoint: boolean;
   /** Why the run cannot continue from what it has stored, for `restart_required`. */
   reason?: string;
+  /**
+   * How many calls this resume accepted the risk of paying for a second time.
+   *
+   * A run stopped by an unresolved dispatch holds calls that were sent and never resolved, so
+   * repeating them may incur a second charge. Resuming is the explicit decision to repeat them, and
+   * this is how many the owner has just decided about — the interface says so rather than quietly
+   * spending again.
+   */
+  repeatedDispatches: number;
 }
 
 /**
@@ -906,18 +1065,27 @@ export function resumeJob(db: Database, jobId: string, ownerId: string): ResumeR
 
   if (!job) return null;
 
-  if (job.state === 'completed') return { outcome: 'completed', fromCheckpoint: false };
+  if (job.state === 'completed') return { outcome: 'completed', fromCheckpoint: false, repeatedDispatches: 0 };
   if (job.state === 'pending' || job.state === 'processing') {
-    return { outcome: 'already_running', fromCheckpoint: job.checkpoint !== null };
+    return {
+      outcome: 'already_running',
+      fromCheckpoint: job.checkpoint !== null,
+      repeatedDispatches: 0,
+    };
   }
   if (job.state === 'failed' && job.error_code === 'cancelled_by_user') {
-    return { outcome: 'cancelled', fromCheckpoint: false };
+    return { outcome: 'cancelled', fromCheckpoint: false, repeatedDispatches: 0 };
   }
 
   const verdict = checkpointFor<unknown>(checkpointIdentityOf(job), job.checkpoint);
 
   if (verdict.status === 'incompatible') {
-    return { outcome: 'restart_required', fromCheckpoint: false, reason: verdict.reason };
+    return {
+      outcome: 'restart_required',
+      fromCheckpoint: false,
+      reason: verdict.reason,
+      repeatedDispatches: 0,
+    };
   }
 
   const fromCheckpoint = verdict.status === 'valid';
@@ -947,22 +1115,48 @@ export function resumeJob(db: Database, jobId: string, ownerId: string): ResumeR
     return describeResumeState(requireJob(db, jobId), fromCheckpoint);
   }
 
-  return { outcome: 'resumed', fromCheckpoint };
+  // The owner has just chosen to continue, which is the explicit decision that a call sent without a
+  // recorded outcome may be repeated. Only here — never on an automatic retry — because this is the
+  // one path where a person has been told it may cost them another charge. Written here rather than
+  // through `operations.ts` to keep that module's dependency one-way: it reads and writes the
+  // results table, and this is a job transition that happens to touch it.
+  const repeatedDispatches = Number(
+    db
+      .prepare(
+        `UPDATE operation_results
+            SET status = 'superseded', updated_at = ?
+          WHERE job_id = ? AND status = 'dispatched'`
+      )
+      .run(iso(new Date()), jobId).changes
+  );
+
+  return { outcome: 'resumed', fromCheckpoint, repeatedDispatches };
 }
 
 /** What a resume attempt finds when its own update did not apply. */
 function describeResumeState(job: GenerationJobRow, fromCheckpoint: boolean): ResumeResult {
   if (job.state === 'pending' || job.state === 'processing') {
-    return { outcome: 'already_running', fromCheckpoint: job.checkpoint !== null };
+    return {
+      outcome: 'already_running',
+      fromCheckpoint: job.checkpoint !== null,
+      repeatedDispatches: 0,
+    };
   }
-  if (job.state === 'completed') return { outcome: 'completed', fromCheckpoint: false };
+  if (job.state === 'completed') {
+    return { outcome: 'completed', fromCheckpoint: false, repeatedDispatches: 0 };
+  }
   if (job.state === 'failed' && job.error_code === 'cancelled_by_user') {
-    return { outcome: 'cancelled', fromCheckpoint: false };
+    return { outcome: 'cancelled', fromCheckpoint: false, repeatedDispatches: 0 };
   }
 
   // Still stopped, un-run, and unchanged: the update failed for a reason this call cannot name, so
   // the honest answer is that nothing was queued.
-  return { outcome: 'restart_required', fromCheckpoint, reason: 'the run could not be queued again' };
+  return {
+    outcome: 'restart_required',
+    fromCheckpoint,
+    reason: 'the run could not be queued again',
+    repeatedDispatches: 0,
+  };
 }
 
 export interface ProviderAttemptInput {
@@ -970,7 +1164,7 @@ export interface ProviderAttemptInput {
   ownerId: string;
   /** Stable per call, so the attempt record and its budget reservation share one key. */
   attemptId?: string;
-  phase: 'concepts' | 'cards' | 'support' | 'repair';
+  phase: 'concepts' | 'cards' | 'support' | 'repair' | 'ocr';
   attemptNumber: number;
   provider: string;
   /** The model this call was billed against, which is not always the generation model. */
@@ -1140,7 +1334,10 @@ function safeJson(value: string): Record<string, string> | null {
   }
 }
 
-/** Records the provider configuration a job ran with, so the run can be explained later. */
+/**
+ * Records the configuration a job ran under, so the run can be explained later — and so that the
+ * queue can decide, from the row alone, whether stored progress was produced under the same rules.
+ */
 export function recordJobProvider(
   db: Database,
   jobId: string,
@@ -1151,12 +1348,15 @@ export function recordJobProvider(
     decisionModel: string;
     promptVersions: Record<string, string>;
     promptHashes: Record<string, string>;
+    batchPlanId: string;
+    validatorVersion: string;
   }
 ): void {
   db.prepare(
     `UPDATE generation_jobs
         SET pipeline_version = ?, provider = ?, model = ?, decision_model = ?,
-            prompt_versions = ?, prompt_hashes = ?, updated_at = ?
+            prompt_versions = ?, prompt_hashes = ?, batch_plan_id = ?, validator_version = ?,
+            updated_at = ?
       WHERE id = ?`
   ).run(
     input.pipelineVersion,
@@ -1165,6 +1365,8 @@ export function recordJobProvider(
     input.decisionModel,
     JSON.stringify(input.promptVersions),
     JSON.stringify(input.promptHashes),
+    input.batchPlanId,
+    input.validatorVersion,
     iso(new Date()),
     jobId
   );

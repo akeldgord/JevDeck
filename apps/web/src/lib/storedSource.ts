@@ -206,6 +206,22 @@ export function cardsFromStoredDeck(
           (card.sectionId ? (context.sectionTitleBySection.get(card.sectionId) ?? '') : ''),
         // What was actually checked, recorded by the pipeline, instead of a score.
         ...(card.validation?.codes?.length ? { validationCodes: card.validation.codes } : {}),
+        // The figures this citation may show, as the server associated them. Passed through
+        // unmapped rather than re-decided here: two implementations of "which picture belongs to
+        // this claim" would eventually disagree, and the export uses the server's.
+        ...(citation?.figures && citation.figures.length > 0
+          ? {
+              figures: citation.figures.map(figure => ({
+                id: figure.id,
+                pageNumber: figure.pageIndex,
+                kind: figure.kind,
+                name: figure.name,
+                caption: figure.caption,
+                contentType: figure.contentType,
+                hasBytes: figure.hasBytes,
+              })),
+            }
+          : {}),
       },
       tags: card.tags,
       createdAt: card.createdAt,

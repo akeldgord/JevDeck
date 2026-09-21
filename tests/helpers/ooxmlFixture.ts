@@ -152,11 +152,24 @@ function blockXml(block: DocxBlock): string {
  */
 export async function buildDocx(
   blocks: DocxBlock[],
-  options: { deflate?: boolean; imageRelationshipId?: string } = {}
+  options: {
+    deflate?: boolean;
+    imageRelationshipId?: string;
+    /**
+     * The bytes to embed as `media/image1.png`.
+     *
+     * Defaults to `PNG`, which is a real signature followed by filler: enough for a suite that
+     * asserts the bytes were carried and served, not enough for a browser to decode. A suite that
+     * renders the figure has to pass real PNG bytes, because an assertion about a picture the
+     * browser drew is only meaningful if the browser could draw it.
+     */
+    imageBytes?: Uint8Array;
+  } = {}
 ): Promise<Uint8Array> {
   const deflate = options.deflate ?? true;
   const relationshipId = options.imageRelationshipId ?? 'rId5';
   const hasImage = blocks.some(block => block.kind === 'image');
+  const imageBytes = options.imageBytes ?? PNG;
 
   const document = `<?xml version="1.0" encoding="UTF-8"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -180,7 +193,7 @@ export async function buildDocx(
       </Relationships>`,
       deflate,
     });
-    files.push({ name: 'word/media/image1.png', data: PNG, deflate });
+    files.push({ name: 'word/media/image1.png', data: imageBytes, deflate });
   }
 
   return makeZip(files);

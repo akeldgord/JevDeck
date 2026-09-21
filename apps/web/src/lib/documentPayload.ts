@@ -1,5 +1,5 @@
 import { toBase64 } from './bytes';
-import type { ParsedDocument } from './parsedDocument';
+import type { PageKind, ParsedDocument } from './parsedDocument';
 import { flattenSectionsForStorage, type SectionForStorage } from './storedSource';
 
 /**
@@ -28,7 +28,23 @@ export interface DocumentUploadPayload {
     pageIndex: number;
     pageLabel?: string;
     text: string;
-    kind?: 'text' | 'blank' | 'image-only';
+    kind?: PageKind;
+    /**
+     * Where this page's text came from.
+     *
+     * Sent whenever it is not the ordinary case, so a page read off a picture is stored as one. A
+     * server that had to guess would either call OCR text the document's own or lose the
+     * distinction the coverage report is built on.
+     */
+    textSource?: 'native' | 'ocr' | 'none';
+    ocr?: {
+      status: 'succeeded' | 'failed' | 'unavailable';
+      engine: string;
+      model: string;
+      promptVersion?: string;
+      confidence: number | null;
+      error?: string;
+    };
   }>;
   sections: SectionForStorage[];
   media?: Array<{
@@ -37,6 +53,11 @@ export interface DocumentUploadPayload {
     name: string;
     contentType: string;
     bytesBase64: string;
+    /** The document's own caption for the figure, when one was found nearby. */
+    caption?: string;
+    /** The text around the figure. */
+    context?: string;
+    source?: 'embedded' | 'page-crop';
   }>;
 }
 
@@ -69,6 +90,24 @@ export function documentUploadPayload(
       // A page with no text is recorded as blank or as content this build could not read. The two
       // are different facts, and only the reader knows which one it is looking at.
       ...(page.text.trim().length === 0 ? { kind: page.kind } : {}),
+      // Where the text came from, and — for a page whose picture was read — what read it. The
+      // ordinary case is stated too when it is not `native`, because "this page's text came off a
+      // picture" is not something a server may infer from a page that happens to have text.
+      ...(page.textSource && page.textSource !== 'native' ? { textSource: page.textSource } : {}),
+      // `running` is the OCR pass's own in-flight marker and is never sent by a reader: a page the
+      // server is still reading is not a page whose reading has an outcome to report.
+      ...(page.ocr && page.ocr.status !== 'running'
+        ? {
+            ocr: {
+              status: page.ocr.status,
+              engine: page.ocr.engine,
+              model: page.ocr.model,
+              ...(page.ocr.promptVersion ? { promptVersion: page.ocr.promptVersion } : {}),
+              confidence: page.ocr.confidence,
+              ...(page.ocr.error ? { error: page.ocr.error } : {}),
+            },
+          }
+        : {}),
     })),
     sections: flattenSectionsForStorage(document.sections),
     // Images the format carried, stored so a card can point at the figure it came from.
@@ -80,6 +119,12 @@ export function documentUploadPayload(
             name: item.name,
             contentType: item.contentType,
             bytesBase64: toBase64(item.bytes),
+            // The caption the document itself states, and the text around the figure: without
+            // them an extracted image is a picture with no relation to the sentence explaining
+            // it, and a card cannot cite what it does not have.
+            ...(item.caption ? { caption: item.caption } : {}),
+            ...(item.context ? { context: item.context } : {}),
+            ...(item.anchor ? { source: item.anchor } : {}),
           })),
         }
       : {}),

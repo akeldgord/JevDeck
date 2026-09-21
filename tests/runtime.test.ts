@@ -10,6 +10,23 @@ import { DEMO_MODE_NOTICE, loadDemoWorkspace } from '../apps/web/src/demo/demoWo
 const read = (relativePath: string) =>
   readFileSync(new URL(relativePath, import.meta.url), 'utf8');
 
+describe('The shipped image is built on the toolchain that was tested', () => {
+  it('pins the Dockerfile to `.bun-version` instead of floating within a major', () => {
+    // The lockfile and the SQLite binding are version-sensitive, so the image and the tests that
+    // check it have to come from one version of Bun. This is the assertion that keeps somebody from
+    // bumping one of the two files and leaving the other behind: a floating `oven/bun:1-alpine`
+    // would build cleanly and ship a runtime nobody tested.
+    const pinned = read('../.bun-version').trim();
+    const dockerfile = read('../Dockerfile');
+
+    expect(pinned.length).toBeGreaterThan(0);
+    expect(dockerfile).toContain(`ARG BUN_VERSION=${pinned}`);
+    expect(dockerfile).toContain('FROM oven/bun:${BUN_VERSION}-alpine AS build');
+    expect(dockerfile).toContain('FROM oven/bun:${BUN_VERSION}-alpine AS runtime');
+    expect(dockerfile).not.toContain('oven/bun:1-alpine');
+  });
+});
+
 describe('Runtime environment resolution', () => {
   it('is off unless the demo flag is exactly "true"', () => {
     for (const flag of [undefined, '', 'false', '0', '1', 'yes', 'TRUE', 'True', 'demo']) {

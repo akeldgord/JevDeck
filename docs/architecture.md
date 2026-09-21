@@ -16,10 +16,11 @@ is [`remediation-status.md`](remediation-status.md).
 
 | Layer | Status |
 | --- | --- |
-| `apps/web` | Implemented: multi-format ingestion (PDF, `.docx`, `.pptx`, Markdown, text, pasted notes), a "what was read" report with the reader's own limitations, section selection, coverage choice, SM-2 study, cram mode, page viewer, stored media, deck browsing, text exports, invitation/sign-in flow, stored-document list. `lib/documentParser.ts` only decides which reader to run; the shape every reader converges on, and the mapping into the upload payload, are in `lib/parsedDocument.ts` and `lib/documentPayload.ts`, so the non-PDF path does not need the browser's PDF engine |
-| `packages/ingestion` | Implemented: OOXML (`.docx`, `.pptx`), Markdown, text and pasted-note readers, a ZIP reader, image collection, and the coverage summary. Format detection and refusals name the formats that do work |
+| `apps/web` | Implemented: multi-format ingestion (PDF, `.docx`, `.pptx`, Markdown, text, pasted notes, standalone images), a "what was read" report with the reader's own limitations and its OCR provenance, section selection, coverage choice, SM-2 study, cram mode, page viewer, stored media, deck browsing, text exports, invitation/sign-in flow, stored-document list. `lib/documentParser.ts` only decides which reader to run; the shape every reader converges on, and the mapping into the upload payload, are in `lib/parsedDocument.ts` and `lib/documentPayload.ts`, so the non-PDF path does not need the browser's PDF engine |
+| `packages/ingestion` | Implemented: OOXML (`.docx`, `.pptx`), Markdown, text, pasted-note and standalone-image readers, a ZIP reader, PDF figure extraction, the figure-to-card association rule, and the coverage summary. Format detection and refusals name the formats that do work |
 | `packages/generation` | Implemented: the concept inventory, the two coverage modes and the single format decision the real pipeline uses. Its demo simulator is separate and heuristic, and is unreachable unless demo mode is enabled. |
-| `packages/contracts`, `packages/scheduling`, `packages/validation`, `packages/anki_export` | Implemented |
+| `packages/contracts`, `packages/scheduling`, `packages/validation` | Implemented |
+| `packages/anki_export` | Implemented, including media: the figure's real bytes in the media map, deterministic collision-safe file names, and answer-side references |
 | `apps/api` | Implemented: HTTP server, versioned migrations, accounts, sessions, invitations, owner-scoped documents/decks/cards/evidence/reviews/jobs, static hosting of the built web app |
 | `apps/worker` | Implemented: the durable queue and the generation pipeline, run in-process by the API or standalone |
 | `packages/providers` | Implemented: OpenAI-compatible and Anthropic transports, versioned prompt loading with hashes, strict output parsing, typed errors |
@@ -120,6 +121,20 @@ it is, and a resume of a run that never dispatched is `resumed` with `fromCheckp
 checkpoint is not a precondition for continuing work that has not started. The table is written out
 in `docs/decisions/0009-resuming-an-interrupted-run.md`.
 
+**A claim is an identity, and every write a run makes requires it.** Claiming increments a
+`claim_epoch` along with taking the lease, so a claim is the triple job id, worker id and epoch —
+which is what makes a worker that *loses* its lease distinguishable from one that reclaims the same
+job later. Lease renewal, checkpoint writes, the failure and stop settlements and the publication
+are each conditional on that identity under `state = 'processing'` with a lease that is still live,
+and their affected-row count is the answer: a refused write means the run belongs to someone else
+now, and the worker stops instead of overwriting them. Renewal may not revive an expired claim — an
+unowned expired lease is exactly what another worker is entitled to claim — and the lease is kept
+alive by a heartbeat at a third of its duration for the whole run, including across a provider
+call, plus an ownership check immediately before every paid call. Losing a claim writes nothing and
+is reported as `claim_lost`; the calls it had already dispatched are still settled under their own
+attempt and reservation ids, because losing the authority to describe the job is not the same as
+un-spending the money. The rule is written out in `docs/decisions/0013-claim-ownership.md`.
+
 **A run is published and finished in one transaction, and there is no state in between.** The last
 phase of the pipeline calls `finaliseWithPublication`, which re-checks the claim, the lease, the
 state and any pending stop request *inside* an immediate transaction and then — in that same
@@ -133,16 +148,74 @@ exactly as they are — identities, evidence and reviews — and only the comple
 
 **Progress is stored, so a stop is not a restart.** After every batch the pipeline writes a
 checkpoint onto the job — how many extraction batches are complete with the concepts they returned,
-how many generation batches are complete with the cards they produced and verified — and clears it
-in the same transaction that publishes the cards and marks the run finished. A later attempt loads it, validates it against the job's source version,
-coverage mode, selection and pipeline version, and skips the batches it covers. Everything
-downstream of those batches — the inventory, the coverage selection, the format decisions — is a
-pure function of the candidates and the stored source, so it is recomputed rather than stored, at
-no provider cost. The identity check lives in `apps/worker/src/checkpoint.ts` so the queue and the
-loader reach the same verdict, and it is never repaired: an explicit `resume` on progress that does
-not apply answers `restart_required` with the reason and queues nothing, while a claimed retry
-ignores such a checkpoint and re-derives. Silently starting the plan over under the label “resume”
-is the one outcome this design exists to prevent.
+how many generation batches are complete with the cards they produced and verified, **and what
+became of every concept it has extracted** — and clears it in the same transaction that publishes
+the cards and marks the run finished. Outcomes are keyed by the concept's own identity (a digest of
+its section, page, label and excerpt), not by its position, and the counts a person reads are
+derived from those records in one pass rather than accumulated beside them: that is what makes a
+continued run's coverage report identical to an uninterrupted run's, instead of quietly forgetting
+the exclusions its earlier session decided. Each card carries its validation record — validator
+version, verdict, the citation span resolved in the immutable source, the judge's answer, the codes
+— so a published card is an explained assertion and a withheld one is an explained absence.
+
+What stored progress *applies to* is a complete fingerprint: checkpoint and pipeline version,
+source version, coverage mode, normalized selected sections, the batch plan's identity, the prompt
+hashes, both models and the validator version. The last two of those are on the job row as well, so
+the queue and the pipeline reach the same verdict from the same columns, and the fingerprint itself
+is stored in exactly one place — there is no second copy for a reader that could disagree with it.
+The check lives in `apps/worker/src/checkpoint.ts` and is never repaired: an explicit `resume` on
+progress that does not apply answers `restart_required` with the reason and queues nothing, while a
+claimed retry ignores such a checkpoint and re-derives. The same validator refuses *malformed*
+contents — a count that is not a count, more completed batches than planned, a centrality outside
+its range, a citation to a section this run never selected, a card whose concept is not recorded
+accepted — rather than coercing them into “no progress”, because "no progress" means starting the
+plan again and spending. Silently starting the plan over under the label “resume” is the one
+outcome this design exists to prevent.
+
+**Paid calls have durable results, and a batch is not the unit of paid work.** A card batch is a
+generation call, up to one bounded repair per card and a support judgement per card. Each is a
+*logical operation* recorded in `operation_results`, keyed by the job, the run's fingerprint, the
+phase and a digest of the complete request — so “the same operation” means the same question asked
+of the same model under the same instructions, not the same array position. The record is written
+before the request goes out, carrying the id its budget reservation was taken under; a usable
+response is recorded the moment it arrives, before the next call starts; and a continuation that
+finds one *reuses* it — no dispatch, no hold, no attempt. That is the difference between resuming
+and starting again, and it is why a pause inside a batch costs the calls whose answers had not yet
+arrived and nothing else. A response that arrived but could not be read stays charged and is
+deliberately not reusable; a call that did not answer is a failed attempt of the same operation, and
+a retry takes its own reservation. Every write is gated on the claim. Rows are deleted in the
+transaction that finishes the run — there is nothing left to reuse once it is complete — while
+`provider_attempts` and `budget_reservations` are left alone, because accounting is evidence rather
+than a cache.
+
+**A call that was sent and never resolved is a question for a person, not a retry.** A record still
+saying `dispatched` means the provider may already have been paid and nobody knows. The run stops in
+an explicit needs-attention state — `charge_confirmation_required`, deliberately *not* retryable,
+because a retryable failure returns to `pending` and the next worker would dispatch the same call on
+its own — and the message names the phase and says that continuing repeats it. Its hold moves to
+`reconciling` and the ledger labels the figure `estimated`: the request was on the wire, so writing
+it off would be a guess in the expensive direction, and leaving it `reserved` would leave it
+invisible to the person who can settle it. It appears in the administrator's unresolved charges and
+is reconciled by hand, labelled as administrator-established rather than provider-reported. The
+owner's route onward is an explicit resume, which marks the dispatch `superseded` and reports how
+many calls it accepted the risk of repeating; the interface says so in words. Exactly-once billing
+across a process death is not claimed: it cannot be guaranteed, and the design's answer is an
+accounted-for uncertainty with a decision attached to it. Provider idempotency keys would close most
+of that window and are not used, because the OpenAI-compatible `chat/completions` envelope this
+build speaks has no idempotency parameter to verify. The reasoning is in
+`docs/decisions/0014-durable-progress.md`.
+
+Recovery from a crash is not argued from a pause. Five points of a run — after a call is dispatched,
+after its response is recorded, after a checkpoint is persisted, inside the completion before it
+commits, and immediately after it commits — are each proven by `SIGKILL`ing a real worker process at
+that point and finishing the run with a fresh one, against a temporary on-disk database and a
+controlled provider. Each case compares the recovered run against an uninterrupted one and asserts
+the ownership trail, so "recovered" cannot mean "produced a different deck". The barriers those
+tests wait on live in the test entry point and in a trigger installed on the test's own database:
+**the application exposes no fault-injection endpoint, environment variable or request field, and no
+production code path consults a test barrier.** The five points, what each must leave behind, and
+the one state that stays an accounted-for uncertainty rather than a guarantee are in
+`docs/decisions/0015-recovery-proven-by-process-kills.md`.
 
 The pipeline is ordered so that the provider proposes and the stored source disposes:
 
@@ -181,19 +254,67 @@ PDF engine is, and `apps/web/src/lib/documentParser.ts` dispatches between them.
 the format and page-kind vocabulary against the same definitions the readers use.
 
 A page that yields no extractable text is one of two different facts and is stored as such: `blank`
-for a page with nothing on it, `image-only` for a page whose content is a picture this build cannot
-read. OCR is not implemented, so the second is a coverage gap, and the coverage report — not the
-page count — is where that shows. Text is the evidence: a page with text is a readable page
-whatever a caller labels it.
+for a page with nothing on it, `image-only` for a page whose content is a picture this build has not
+read. A page also states *where its text came from* — `native`, `ocr` or `none` — and a page that was
+read off a picture carries the provenance of that reading (engine, model, prompt version, the
+confidence actually reported and the reason when it failed). Text read off an image is a reading of
+an image and can be wrong; storing it as the document's own words is the difference this keeps.
+
+Reading a page whose content is a picture is a **paid provider call through the pipeline's own
+reservation and attempt machinery**, not a separate path: it is budgeted, its answer is durable and
+reused on a continuation, and an uncertain dispatch stops for a decision like any other. It runs
+only on pages with no readable text — a readable page keeps what the document said — and it is
+bounded per run (8 pages, 3 MiB a page, 9 MiB a run), with the pages beyond a bound named in the
+plan and left counted as unread. A standalone uploaded picture becomes a one-page document whose
+page is `image-only` until a reading exists. An original above 16 MiB is refused rather than
+dropped, so the viewer never claims to show a page image it does not have.
 
 Images are stored as rows beside the version that carried them and served one at a time from
-`GET /api/media/:id`, which resolves them through their document and answers 404 to anyone who does
-not own it. PDF images are not extracted, and the export bundles no media.
+`GET /api/media/:id`, which resolves them through their document and answers 404 to anyone who may
+not read that document. A figure belongs to a card when it sits on the page the card cites and its
+caption or nearest text touches the citation — one rule, in `packages/ingestion/src/figures.ts`,
+used by the API and by the export, so the app and the package cannot disagree about which picture a
+claim owns. Media therefore travels: the export writes the figure's real bytes into the `.apkg`
+media map under a deterministic, collision-safe name and refers to it from the note's answer side,
+with no absolute path or credential in a field.
+
+## Sharing a deck, and the source that follows it
+
+A deck can be shared with another account at one of two scopes. `study` is the cards and the
+recipient's own review schedule. `study_and_source` is that **plus** the material the cards were
+built from — the document representation, the stored original and the figures — because a card is a
+claim with a citation, and a reader who cannot open the cited page has to take it on trust.
+
+One check, `requireDocumentAccess`, decides this for the document representation, the original file
+and every figure; it is reached **through a deck**, so a share is not a key to the owner's library:
+another deck's document answers 404 to a reader exactly as it does to a stranger. It also decides
+*which version* is readable — the version the shared deck was generated from, not whatever the owner
+has uploaded since — so a share cannot enumerate re-uploads. Everything that changes a deck
+(re-generation, deletion, export, sharing it onward) stays with the owner at either scope, and so
+does the owner's study state.
+
+Sharing is a disclosure: the interface states what a scope grants before the address is submitted,
+and the server serves the same sentence beside the choices and returns it when a share is created.
+That sentence names what is easy to get wrong — the whole stored original is served, not only the
+sections the deck covers — and says that revocation stops the next request but cannot recall what a
+recipient already downloaded. The reasoning is in
+`docs/decisions/0016-source-access-follows-the-share.md`.
+
+## How the interface is verified
+
+Most acceptance suites drive the same libraries the screens use. The screens themselves are
+verified by `tests/browser-journey.test.ts`, which drives a real Chromium through the **production
+bundle** served by the real API on one origin, over a temporary database and the controlled
+loopback provider. The harness builds the web app, starts the API with its in-process worker
+disabled, and runs every job by hand — in-process for the ordinary flows, as a **separate killable
+process** where the point is what a crash leaves behind. It waits for a named fact to appear on
+screen rather than sleeping, and it needs Playwright's Chromium plus its system libraries, which CI
+installs; without a browser the suite reports itself **skipped**, never passing. It found six
+defects the library-level suites could not see, each now fixed and each with a case of its own.
 
 ## What the backend still does not do
 
-Read a scanned page, extract images from a PDF, or hold a card-approval queue (deliberately —
-withheld cards are counted and explained instead).
+Hold a card-approval queue (deliberately — withheld cards are counted and explained instead).
 
 ## The boundary that matters most
 

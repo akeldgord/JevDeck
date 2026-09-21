@@ -13,6 +13,15 @@ import { splitIntoSentences } from '../../packages/generation/src';
 export interface StubBehaviour {
   /** Delay every response, to exercise the timeout path. */
   delayMs?: number;
+  /**
+   * Delay one task's responses only.
+   *
+   * A run's calls have to be interrupted *one at a time* to test what survives an interruption at a
+   * call boundary: slowing everything means the test cannot tell which call was in flight, and
+   * slowing nothing means it cannot catch one. This holds one phase still while the rest of the run
+   * behaves normally.
+   */
+  delayTask?: { task: string; delayMs: number };
   /** Answer with prose instead of JSON. */
   malformed?: boolean;
   /**
@@ -37,6 +46,12 @@ export interface StubBehaviour {
   omitConcepts?: string[];
   /** Drop concepts whose excerpt contains this text. */
   skipConceptsMatching?: string;
+  /** What a page reading answers. Defaults to a plausible line about the page it was asked for. */
+  ocrText?: string;
+  /** Answer a page reading with no words at all: a picture that holds no text. */
+  ocrEmpty?: boolean;
+  /** The confidence a page reading reports. `null` sends none, which is not the same as 1. */
+  ocrConfidence?: number | null;
 }
 
 export interface RecordedRequest {
@@ -46,6 +61,14 @@ export interface RecordedRequest {
   raw: Record<string, any>;
   /** The `authorization` header exactly as received. */
   authorization: string | null;
+  /**
+   * The pictures sent with the request, as the data URLs they arrived as.
+   *
+   * Recorded because "the page was read" is only meaningful if the *picture* was on the wire: a
+   * request that asked a model to transcribe a page it was never given would pass every other
+   * assertion in these tests.
+   */
+  images: string[];
 }
 
 export interface StubProvider {
@@ -107,6 +130,39 @@ function buildConceptPayload(
   return { concepts };
 }
 
+/**
+ * What a page reading answers.
+ *
+ * The stub cannot read a picture, and pretending otherwise would make the tests worthless. What it
+ * does instead is answer honestly about the page it was *asked* about, so the assertions are about
+ * the machinery around the reading — that the picture was sent, that the text was stored with its
+ * provenance, that native text was left alone — rather than about transcription quality.
+ */
+function buildPageReading(
+  request: Record<string, any>,
+  behaviour: StubBehaviour
+): Record<string, unknown> {
+  if (behaviour.ocrEmpty) {
+    return {
+      text: '',
+      confidence: behaviour.ocrConfidence ?? 0.2,
+      notes: 'The picture holds no legible words.',
+    };
+  }
+
+  const pageNumber = Number(request.pageNumber ?? 0);
+  const text =
+    behaviour.ocrText ??
+    `Printed page ${pageNumber} reads: the mitochondrion is the site of oxidative phosphorylation, ` +
+      'and its folded inner membrane holds the electron transport chain that makes most of the cell’s ATP.';
+
+  return {
+    text,
+    confidence: behaviour.ocrConfidence === undefined ? 0.82 : behaviour.ocrConfidence,
+    notes: '',
+  };
+}
+
 function buildCardPayload(
   request: Record<string, any>,
   behaviour: StubBehaviour
@@ -162,13 +218,20 @@ function buildCardPayload(
   return { cards };
 }
 
-export function startStubProvider(initial: StubBehaviour = {}): StubProvider {
+/**
+ * Starts the controlled provider.
+ *
+ * `port` defaults to `0`, which is what every in-process suite wants: an ephemeral port cannot
+ * collide with anything else on the machine. It is settable because the container workflow runs this
+ * server in a *different* process (the host's) and has to tell the container where it is.
+ */
+export function startStubProvider(initial: StubBehaviour = {}, port = 0): StubProvider {
   let behaviour: StubBehaviour = initial;
   let remainingFailures = initial.failFirst?.count ?? 0;
   const requests: RecordedRequest[] = [];
 
   const server = Bun.serve({
-    port: 0,
+    port,
     hostname: '127.0.0.1',
     async fetch(request) {
       const url = new URL(request.url);
@@ -178,7 +241,19 @@ export function startStubProvider(initial: StubBehaviour = {}): StubProvider {
       }
 
       const body = (await request.json()) as Record<string, any>;
-      const userMessage = String(body.messages?.find((m: any) => m.role === 'user')?.content ?? '{}');
+
+      // A request with a picture sends its user turn as content parts rather than as one string,
+      // which is what the OpenAI-compatible envelope requires. Both shapes are read here so a
+      // request's *task* is never lost merely because it carried an image with it.
+      const rawContent = body.messages?.find((m: any) => m.role === 'user')?.content;
+      const parts: Array<Record<string, any>> = Array.isArray(rawContent) ? rawContent : [];
+      const userMessage =
+        typeof rawContent === 'string'
+          ? rawContent
+          : String(parts.find(part => part?.type === 'text')?.text ?? '{}');
+      const images = parts
+        .map(part => part?.image_url?.url)
+        .filter((url): url is string => typeof url === 'string');
 
       let parsed: Record<string, any> = {};
       try {
@@ -193,10 +268,13 @@ export function startStubProvider(initial: StubBehaviour = {}): StubProvider {
         body: parsed,
         raw: body,
         authorization: request.headers.get('authorization'),
+        images,
       });
 
-      if (behaviour.delayMs) {
-        await new Promise(resolve => setTimeout(resolve, behaviour.delayMs));
+      const delay =
+        behaviour.delayTask?.task === task ? behaviour.delayTask.delayMs : (behaviour.delayMs ?? 0);
+      if (delay > 0) {
+        await new Promise(resolve => setTimeout(resolve, delay));
       }
 
       if (remainingFailures > 0) {
@@ -225,7 +303,9 @@ export function startStubProvider(initial: StubBehaviour = {}): StubProvider {
           ? buildConceptPayload(parsed, behaviour, { value: 0 })
           : task === 'assess_claim_support'
             ? (behaviour.supportOverride ?? { supported: true, issues: [] })
-            : buildCardPayload(parsed, behaviour);
+            : task === 'read_page_image'
+              ? buildPageReading(parsed, behaviour)
+              : buildCardPayload(parsed, behaviour);
 
       return completion(JSON.stringify(payload));
     },

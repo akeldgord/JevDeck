@@ -1,4 +1,5 @@
 import type { DocumentSection } from '@jevdeck/contracts';
+import { looksLikeCaption, MAX_CONTEXT_CHARS } from './figures';
 import {
   attributeOf,
   collectMedia,
@@ -222,6 +223,54 @@ export function headingLevel(paragraphXml: string): number {
   return 0;
 }
 
+/** How many neighbouring blocks either side of a figure become its stored context. */
+export const CONTEXT_BLOCKS = 2;
+
+/**
+ * The paragraph that reads as the figure's own caption, or `null`.
+ *
+ * Word states a caption the way every other format does — a paragraph that begins `Figure 1:` — and
+ * the paragraph directly below the drawing is the one that states it. A block above is only looked
+ * at when nothing below is labelled, because a heading above a picture usually belongs to the
+ * section rather than to the picture. Nothing is ever read off the image itself.
+ */
+export function captionNear(blocks: TextBlock[], index: number): string | null {
+  const below = blocks[index + 1];
+  if (below && looksLikeCaption(below.text)) return below.text.trim();
+
+  const above = blocks[index - 1];
+  if (above && looksLikeCaption(above.text)) return above.text.trim();
+
+  return null;
+}
+
+/**
+ * The text around the figure: the blocks either side of it, on its own page.
+ *
+ * Context is what lets a figure be associated with a claim at all (see `figures.ts`), so a Word
+ * drawing with no context is a drawing no card can honestly carry. The blocks are the ones the body
+ * actually states, in reading order, and nothing is summarised or inferred.
+ */
+export function contextNear(blocks: TextBlock[], pageOfBlock: number[], index: number): string {
+  const page = pageOfBlock[index] ?? 0;
+  const near = (from: number, to: number): TextBlock[] =>
+    blocks
+      .slice(from, to)
+      .filter((block, offset) => (pageOfBlock[from + offset] ?? 0) === page);
+
+  const chosen = [
+    ...near(Math.max(0, index - CONTEXT_BLOCKS), index),
+    ...near(index + 1, index + 1 + CONTEXT_BLOCKS),
+  ];
+
+  const joined = chosen
+    .map(block => block.text.trim())
+    .filter(text => text.length > 0)
+    .join(' ');
+
+  return joined.length > MAX_CONTEXT_CHARS ? `${joined.slice(0, MAX_CONTEXT_CHARS)}…` : joined;
+}
+
 async function extractMedia(input: {
   zip: Uint8Array;
   entries: ZipEntry[];
@@ -249,7 +298,18 @@ async function extractMedia(input: {
 
       const pageNumber = input.pageOfBlock[index] ?? 0;
       const name = path.slice(path.lastIndexOf('/') + 1);
-      items.push({ pageNumber, kind: 'figure', name, contentType: contentTypeFor(name), bytes });
+      const caption = captionNear(input.blocks, index);
+      const context = contextNear(input.blocks, input.pageOfBlock, index);
+
+      items.push({
+        pageNumber,
+        kind: 'figure',
+        name,
+        contentType: contentTypeFor(name),
+        bytes,
+        ...(caption ? { caption } : {}),
+        ...(context.length > 0 ? { context } : {}),
+      });
       used.add(path);
       if (pageNumber > 0) anchoredPages.add(pageNumber);
     }

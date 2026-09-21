@@ -6,9 +6,11 @@ import { Database } from 'bun:sqlite';
 import {
   ANKI_SCHEMA_VERSION,
   NEW_CARD_FACTOR,
+  apkgMediaName,
   buildApkg,
   clozeIndices,
   crc32,
+  mediaExtensionFor,
   type ApkgCard,
 } from '../packages/anki_export/src/apkg';
 
@@ -195,7 +197,12 @@ describe('The collection is one Anki will import', () => {
       expect(values.some(model => model.type === 1)).toBe(true);
 
       const basic = values.find(model => model.type === 0)!;
-      expect(basic.flds.map(field => field.name)).toEqual(['Front', 'Back', 'Source']);
+      // `Media` is last and is the field a card's figures are written into. It exists on every
+      // note, and is empty on a card that cites no figure.
+      expect(basic.flds.map(field => field.name)).toEqual(['Front', 'Back', 'Source', 'Media']);
+
+      const cloze = values.find(model => model.type === 1)!;
+      expect(cloze.flds.map(field => field.name)).toEqual(['Text', 'Source', 'Media']);
 
       const decks = JSON.parse(col.decks) as Record<string, { name: string }>;
       expect(Object.values(decks)[0].name).toBe('Neurophysiology');
@@ -216,7 +223,7 @@ describe('The collection is one Anki will import', () => {
 
       const [qaNote, clozeNote] = notes;
       const qaFields = qaNote.flds.split('\u001f');
-      expect(qaFields).toHaveLength(3);
+      expect(qaFields).toHaveLength(4);
       expect(qaFields[0]).toContain('resting membrane potential');
       expect(qaFields[1]).toContain('-70 mV');
       // The citation travels with the card so a reader can find the source again.
@@ -230,7 +237,7 @@ describe('The collection is one Anki will import', () => {
       // The cloze card is written into the cloze model, not the basic one, so Anki renders the
       // deletion instead of printing the syntax.
       const clozeFields = clozeNote.flds.split('\u001f');
-      expect(clozeFields).toHaveLength(2);
+      expect(clozeFields).toHaveLength(3);
       expect(clozeFields[0]).toContain('{{c1::40 mV}}');
       expect(clozeNote.mid).not.toBe(qaNote.mid);
 
@@ -253,8 +260,9 @@ describe('The collection is one Anki will import', () => {
       expect(unicodeNote).toBeDefined();
 
       const fields = unicodeNote!.flds.split('\u001f');
-      // Three fields, so the separator inside the question was neutralised rather than splitting it.
-      expect(fields).toHaveLength(3);
+      // One field per column, so the separator inside the question was neutralised rather than
+      // splitting the row into an extra one.
+      expect(fields).toHaveLength(4);
       expect(fields[0]).toContain('café');
       expect(fields[0]).toContain('“μM”');
       expect(fields[0]).toContain('①');
@@ -395,6 +403,241 @@ describe('The collection is one Anki will import', () => {
     try {
       const count = db.query('SELECT COUNT(*) AS n FROM notes').get() as { n: number };
       expect(count.n).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Media: the figure a card cites travels inside the package
+// ---------------------------------------------------------------------------
+
+/** Two distinguishable images, so a mixed-up mapping is visible rather than plausible. */
+const PLATE = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4, 5, 6, 7, 8]);
+const TRACE = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 9, 9, 9, 9, 8, 8, 8, 8]);
+
+const FIGURE = {
+  name: 'p12-1-0-120-300-200-XObject5.png',
+  bytes: PLATE,
+  contentType: 'image/png',
+};
+
+const WITH_MEDIA: ApkgCard[] = [
+  {
+    id: 'card-a',
+    format: 'qa',
+    question: 'What does the trace show?',
+    answer: 'A resting potential of -70 mV.',
+    excerpt: 'The resting membrane potential is approximately -70 mV.',
+    pageNumber: 12,
+    sectionTitle: 'Membrane physiology',
+    media: [FIGURE],
+  },
+  {
+    id: 'card-b',
+    format: 'cloze',
+    clozeText: '{{c1::40 mV}} is the threshold.',
+    excerpt: 'The threshold is 40 mV.',
+    pageNumber: 12,
+    sectionTitle: 'Membrane physiology',
+    // The *same* figure: one file, cited by two cards, which is what the media map is for.
+    media: [FIGURE],
+  },
+  {
+    id: 'card-c',
+    format: 'qa',
+    question: 'What is the resting potential?',
+    answer: '-70 mV.',
+    excerpt: 'The resting membrane potential is approximately -70 mV.',
+    pageNumber: 12,
+    sectionTitle: 'Membrane physiology',
+    // A second figure, on the same page, cited by this card only.
+    media: [{ name: 'p12-2-0-400-300-200-XObject7.png', bytes: TRACE, contentType: 'image/png' }],
+  },
+];
+
+describe('A card’s figure travels inside the package', () => {
+  const result = buildApkg({
+    deck: { id: 'deck-1', title: 'Neurophysiology' },
+    cards: WITH_MEDIA,
+    now: NOW,
+  });
+
+  const entries = readZip(result.bytes);
+
+  it('writes the media map Anki reads, and the bytes beside it', () => {
+    const mediaMap = JSON.parse(new TextDecoder().decode(entries.get('media')!)) as Record<
+      string,
+      string
+    >;
+
+    // Two distinct images: the shared plate is one file, not two.
+    expect(result.mediaCount).toBe(2);
+    expect(Object.keys(mediaMap).sort()).toEqual(['0', '1']);
+    expect(new Set(Object.values(mediaMap)).size).toBe(2);
+
+    // Every name in the map is an entry, and its bytes are exactly the stored bytes.
+    for (const [key, fileName] of Object.entries(mediaMap)) {
+      const stored = entries.get(key);
+      expect(stored).toBeDefined();
+      expect([...stored!]).toEqual([...Object.values({ 0: PLATE, 1: TRACE })[Number(key)]]);
+      expect(fileName).toMatch(/^[A-Za-z0-9._-]+\.png$/);
+    }
+
+    expect(result.entries).toContain('0');
+    expect(result.entries).toContain('1');
+    expect(result.skippedMedia).toEqual([]);
+  });
+
+  it('refers to those files from the notes, and only on the answer side', () => {
+    const path = join(scratch, 'media.anki2');
+    writeFileSync(path, entries.get('collection.anki2')!);
+    const db = new Database(path, { readonly: true });
+
+    try {
+      const notes = db
+        .query('SELECT id, flds FROM notes ORDER BY id ASC')
+        .all() as Array<{ id: number; flds: string }>;
+
+      const plateName = result.mediaByCard.get('card-a')![0];
+      const traceName = result.mediaByCard.get('card-c')![0];
+
+      // The card that cites the plate refers to the plate; the card that cites the trace, the trace.
+      const qa = notes.find(note => note.flds.includes('resting membrane potential'))!;
+      expect(qa.flds).toContain(`<img src="${plateName}">`);
+
+      const cloze = notes.find(note => note.flds.includes('{{c1::40 mV}}'))!;
+      expect(cloze.flds).toContain(`<img src="${plateName}">`);
+
+      const other = notes.find(note => note.flds.includes('What is the resting potential?'))!;
+      expect(other.flds).toContain(`<img src="${traceName}">`);
+      expect(other.flds).not.toContain(plateName);
+
+      // A note with no figure carries an empty field, not a placeholder image.
+      const bare = buildApkg({ deck: { id: 'd', title: 'Bare' }, cards: CARDS, now: NOW });
+      const bareEntries = readZip(bare.bytes);
+      const barePath = join(scratch, 'bare.anki2');
+      writeFileSync(barePath, bareEntries.get('collection.anki2')!);
+      const bareDb = new Database(barePath, { readonly: true });
+
+      try {
+        const fields = (
+          bareDb.query('SELECT flds FROM notes ORDER BY id ASC').all() as Array<{ flds: string }>
+        ).map(row => row.flds.split('\u001f'));
+
+        expect(fields.every(parts => parts[parts.length - 1] === '')).toBe(true);
+        expect(
+          new TextDecoder().decode(bareEntries.get('media')!)
+        ).toBe('{}');
+      } finally {
+        bareDb.close();
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+  it('puts the media field on the answer template only', () => {
+    const path = join(scratch, 'templates.anki2');
+    writeFileSync(path, entries.get('collection.anki2')!);
+    const db = new Database(path, { readonly: true });
+
+    try {
+      const col = db.query('SELECT models FROM col').get() as { models: string };
+      const models = JSON.parse(col.models) as Record<
+        string,
+        { type: number; tmpls: Array<{ qfmt: string; afmt: string }> }
+      >;
+
+      // A figure above the question is the answer: every model shows it after the answer instead.
+      for (const model of Object.values(models)) {
+        expect(model.tmpls[0].qfmt).not.toContain('{{Media}}');
+        expect(model.tmpls[0].afmt).toContain('{{Media}}');
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+  it('names files deterministically and collision-safely, and refuses unsafe types', () => {
+    // Same name, different bytes: the digest keeps the two apart.
+    expect(apkgMediaName('figure.png', PLATE, 'image/png')).not.toBe(
+      apkgMediaName('figure.png', TRACE, 'image/png')
+    );
+    // Same name and same bytes: the same name, so re-exporting does not rename anything.
+    expect(apkgMediaName('figure.png', PLATE, 'image/png')).toBe(
+      apkgMediaName('figure.png', PLATE, 'image/png')
+    );
+    // A path, a quote and an angle bracket cannot reach a note field.
+    const hostile = apkgMediaName('../../etc/passwd"<>x.png', PLATE, 'image/png')!;
+    expect(hostile).toMatch(/^[A-Za-z0-9._-]+\.png$/);
+    expect(hostile).not.toContain('/');
+
+    // The extension follows the content type, not the stored name.
+    expect(apkgMediaName('figure.png', PLATE, 'image/jpeg')).toMatch(/\.jpg$/);
+    expect(mediaExtensionFor('image/webp')).toBe('.webp');
+    expect(mediaExtensionFor('application/pdf')).toBeNull();
+    expect(apkgMediaName('notes.pdf', PLATE, 'application/pdf')).toBeNull();
+    expect(apkgMediaName('empty.png', new Uint8Array(), 'image/png')).toBeNull();
+  });
+
+  it('reports an image it cannot carry instead of writing a broken reference', () => {
+    const mixed = buildApkg({
+      deck: { id: 'deck-1', title: 'Mixed' },
+      cards: [
+        {
+          id: 'card-mixed',
+          format: 'qa',
+          question: 'Q',
+          answer: 'A',
+          pageNumber: 3,
+          media: [
+            { name: 'scan.pdf', bytes: PLATE, contentType: 'application/pdf' },
+            { name: 'blank.png', bytes: new Uint8Array(), contentType: 'image/png' },
+            { name: 'good.png', bytes: TRACE, contentType: 'image/png' },
+          ],
+        },
+      ],
+      now: NOW,
+    });
+
+    expect(mixed.mediaCount).toBe(1);
+    expect(mixed.skippedMedia.length).toBe(2);
+    expect(mixed.skippedMedia.map(entry => entry.name).sort()).toEqual(['blank.png', 'scan.pdf']);
+
+    const packageEntries = readZip(mixed.bytes);
+    const mediaMap = JSON.parse(new TextDecoder().decode(packageEntries.get('media')!)) as Record<
+      string,
+      string
+    >;
+    expect(Object.values(mediaMap)).toEqual([mixed.mediaByCard.get('card-mixed')![0]]);
+
+    // The refused names appear nowhere in the package: no note text, no entry, no map value.
+    for (const entry of packageEntries.keys()) expect(entry).not.toContain('scan');
+  });
+
+  it('keeps only the exported file name in the note — no path, URL or credential', () => {
+    const path = join(scratch, 'nourl.anki2');
+    writeFileSync(path, entries.get('collection.anki2')!);
+    const db = new Database(path, { readonly: true });
+
+    try {
+      const rows = db.query('SELECT flds FROM notes').all() as Array<{ flds: string }>;
+      const all = rows.map(row => row.flds).join('\n');
+
+      expect(all).not.toContain('http://');
+      expect(all).not.toContain('https://');
+      expect(all).not.toContain('token');
+      expect(all).toMatch(/<img src="[A-Za-z0-9._-]+\.png">/);
+
+      // Determinism survives media: the same input twice is the same package, byte for byte.
+      const again = buildApkg({
+        deck: { id: 'deck-1', title: 'Neurophysiology' },
+        cards: WITH_MEDIA,
+        now: NOW,
+      });
+      expect([...again.bytes]).toEqual([...result.bytes]);
     } finally {
       db.close();
     }

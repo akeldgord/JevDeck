@@ -20,6 +20,7 @@ export const REQUIRED_PROMPTS = [
   'concepts/extract.v1',
   'cards/generate.v1',
   'validation/support.v1',
+  'ocr/read-page.v1',
 ] as const;
 
 export type PromptId = (typeof REQUIRED_PROMPTS)[number];

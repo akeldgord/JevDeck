@@ -12,9 +12,10 @@ import { startServer, type RunningServer } from '../apps/api/src/server';
  *
  * Two claims are checked here that no unit test can settle. Export is owner-only and produces a
  * real package — the download is opened as an archive and the SQLite collection inside it is read
- * with a second connection. Sharing grants study access and nothing else: a shared reader can see
- * the cards, cannot read the source document, cannot export, cannot generate, and loses all of it
- * the moment the share is revoked.
+ * with a second connection. Sharing grants exactly the scope it was given and no more: this deck is
+ * shared for **study**, so the reader sees the cards, keeps their own schedule, cannot read the
+ * source document, cannot export, cannot generate, and loses all of it the moment the share is
+ * revoked. The other scope, and the access it carries, is `tests/share-source-access.test.ts`.
  */
 
 const scratch = mkdtempSync(join(tmpdir(), 'jevdeck-share-'));
@@ -168,6 +169,10 @@ async function seedDeck(): Promise<void> {
       name: 'Share_Source.pdf',
       pageCount: 1,
       contentHash: 'share-source-hash',
+      // A retained original, so "the reader cannot read the source" is proved against a document
+      // whose source the owner *can* read. Without it the reader's 404 would be a statement about
+      // nobody having the file rather than about authorization.
+      bytesBase64: Buffer.from('%PDF-1.4\n% share rehearsal\n%%EOF\n', 'utf8').toString('base64'),
       pages: [{ pageIndex: 1, pageLabel: '1', text: PAGE_TEXT }],
       sections: SECTIONS,
     },
@@ -418,38 +423,53 @@ describe('Sharing grants study access and nothing more', () => {
     expect(self.body.error.code).toBe('share_self');
   });
 
-  it('refuses a source-sharing scope instead of storing a permission it does not grant', async () => {
-    const response = await admin.call(`/api/decks/${created.deckId}/shares`, {
-      method: 'POST',
-      body: { email: MEMBER_EMAIL, scope: 'study_and_source' },
-    });
-
-    expect(response.status).toBe(400);
-    expect(response.body.error.code).toBe('share_scope_unavailable');
-
+  it('defaults to study, and refuses a scope it does not have rather than silently granting one', async () => {
+    // No scope in the body means study, and the row says so.
     const row = db
       .query('SELECT scope FROM deck_shares WHERE deck_id = ? AND shared_with_user_id = ?')
       .get(created.deckId, created.memberId) as { scope: string };
     expect(row.scope).toBe('study');
+
+    const response = await admin.call(`/api/decks/${created.deckId}/shares`, {
+      method: 'POST',
+      body: { email: MEMBER_EMAIL, scope: 'study_and_bytes' },
+    });
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe('share_scope_unavailable');
+
+    // A refused scope changes nothing about the share that exists.
+    const after = db
+      .query('SELECT scope FROM deck_shares WHERE deck_id = ? AND shared_with_user_id = ?')
+      .get(created.deckId, created.memberId) as { scope: string };
+    expect(after.scope).toBe('study');
   });
 
-  it('lists the deck for the reader, with the cards but not the source', async () => {
+  it('lists the deck for the study reader, with the cards but not the source', async () => {
     const decks = await member.call('/api/decks');
     expect(decks.status).toBe(200);
     expect(decks.body.decks).toEqual([]);
     expect(decks.body.sharedDecks.map((deck: any) => deck.id)).toEqual([created.deckId]);
+    // The row states the grant, so the interface knows not to offer the viewer.
+    expect(decks.body.sharedDecks[0].shareScope).toBe('study');
+    expect(decks.body.sharedDecks[0].sourceAccess).toBe(false);
 
     const cards = await member.call(`/api/decks/${created.deckId}/cards`);
     expect(cards.status).toBe(200);
     expect(cards.body.cards.length).toBe(1);
     expect(cards.body.cards[0].answer).toBe('About -70 mV.');
 
-    // The retained source and its page text stay with the owner.
+    // The retained source and its page text stay with the owner: `/source` is the real endpoint,
+    // and 404 here is that endpoint refusing, not a mistyped path.
     const source = await member.call(`/api/documents/${created.documentId}`);
     expect(source.status).toBe(404);
 
-    const original = await member.download(`/api/documents/${created.documentId}/file`);
+    const original = await member.download(`/api/documents/${created.documentId}/source`);
     expect(original.status).toBe(404);
+
+    // The owner reads it: the refusal above is the scope, not a missing file.
+    const asOwner = await admin.download(`/api/documents/${created.documentId}/source`);
+    expect(asOwner.status).toBe(200);
+    expect(asOwner.headers.get('content-type')).toBe('application/pdf');
   });
 
   it('lets the reader study, and keeps their schedule separate from the owner\u2019s', async () => {

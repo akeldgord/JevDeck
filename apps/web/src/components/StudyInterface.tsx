@@ -7,6 +7,7 @@ import {
   type SM2Rating,
   type StudyQueue,
 } from '@jevdeck/scheduling';
+import { CardFigures } from './CardFigures';
 import {
   Ban,
   BookOpen,
@@ -436,6 +437,8 @@ export const StudyInterface: React.FC<Props> = ({
                   {currentCard.explanation}
                 </div>
               )}
+
+              <CardFigures figures={currentCard.grounding.figures ?? []} />
 
               <div className="p-3 bg-slate-950/60 border border-slate-800/80 rounded-xl flex items-start justify-between gap-3 text-xs">
                 <div className="space-y-1">

@@ -20,6 +20,26 @@ import { JobConcept, JobStatus, StoredDocumentSummary } from '../lib/api';
 import { GenerationResult } from './GenerationResult';
 import { Database, Loader2, AlertCircle as AlertIcon, CheckCircle2 } from 'lucide-react';
 
+/**
+ * The outline as a flat list of rows, each with how deep it sits in the tree.
+ *
+ * The tree is flattened rather than drawn from its top level, because a document's subsections are
+ * selectable material too: a screen that listed only chapters would hide most of what a run can be
+ * pointed at, and a subsection that cannot be seen cannot be excluded either.
+ */
+function flattenSections(
+  sections: DocumentSection[],
+  depth = 0
+): Array<{ section: DocumentSection; depth: number }> {
+  return sections.flatMap(section => [
+    { section, depth },
+    ...flattenSections(section.subsections ?? [], depth + 1),
+  ]);
+}
+
+/** Indentation by depth, from classes the stylesheet already defines. */
+const DEPTH_INDENT = ['', 'pl-8', 'pl-12', 'pl-16'] as const;
+
 interface Props {
   sections: DocumentSection[];
   onToggleSection: (id: string) => void;
@@ -138,7 +158,8 @@ export const GenerationView: React.FC<Props> = ({
   budgetNotice,
   readReport,
 }) => {
-  const selectedCount = sections.filter(s => s.selected).length;
+  const sectionRows = flattenSections(sections);
+  const selectedCount = sectionRows.filter(row => row.section.selected).length;
   const hasDocument = documentName.length > 0;
   const activeChoice = COVERAGE_CHOICES.find(c => c.value === coverageMode) ?? COVERAGE_CHOICES[0];
   const canGenerate = selectedCount > 0 && hasDocumentText;
@@ -291,14 +312,14 @@ export const GenerationView: React.FC<Props> = ({
               <Layers className="w-4 h-4 text-emerald-400" />
               Document Sections & Table of Contents
             </h2>
-            {sections.length > 0 && (
+            {sectionRows.length > 0 && (
               <span className="text-xs text-slate-400">
-                {selectedCount} of {sections.length} sections selected
+                {selectedCount} of {sectionRows.length} sections selected
               </span>
             )}
           </div>
 
-          {sections.length === 0 ? (
+          {sectionRows.length === 0 ? (
             <div className="bg-slate-900/40 border border-dashed border-slate-800 rounded-2xl p-10 text-center space-y-2">
               <FileSearch className="w-8 h-8 text-slate-600 mx-auto" />
               <p className="text-sm font-semibold text-slate-300">No document loaded</p>
@@ -309,7 +330,7 @@ export const GenerationView: React.FC<Props> = ({
             </div>
           ) : (
             <div className="bg-slate-900/40 border border-slate-800/80 rounded-2xl overflow-hidden divide-y divide-slate-800/60">
-              {sections.map(section => {
+              {sectionRows.map(({ section, depth }) => {
                 const isChapter = section.level === 1;
                 return (
                   <div
@@ -332,7 +353,11 @@ export const GenerationView: React.FC<Props> = ({
                       )}
                     </button>
 
-                    <div className={`flex-1 ${isChapter ? 'font-semibold text-slate-200' : 'text-slate-300 pl-2'}`}>
+                    <div
+                      className={`flex-1 ${
+                        DEPTH_INDENT[Math.min(depth, DEPTH_INDENT.length - 1)]
+                      } ${isChapter ? 'font-semibold text-slate-200' : 'text-slate-300'}`}
+                    >
                       <div className="flex items-center justify-between gap-3">
                         <span className="text-sm">{section.title}</span>
                         <span className="text-xs font-mono text-slate-500 flex-shrink-0">
@@ -344,10 +369,16 @@ export const GenerationView: React.FC<Props> = ({
                         <span>{section.wordCount.toLocaleString()} words</span>
                         <span>•</span>
                         <span>{section.pageEnd - section.pageStart + 1} pages</span>
-                        {isChapter && (
+                        {isChapter ? (
                           <span className="text-emerald-500/80 font-sans font-medium text-[11px] bg-emerald-950/50 px-1.5 py-0.2 rounded border border-emerald-900/60">
-                            Primary Topic
+                            Chapter
                           </span>
+                        ) : (
+                          depth > 0 && (
+                            <span className="text-slate-400/90 font-sans font-medium text-[11px] bg-slate-800/60 px-1.5 py-0.2 rounded border border-slate-700/70">
+                              Subsection
+                            </span>
+                          )
                         )}
                       </div>
                     </div>

@@ -9,7 +9,15 @@
 # Run:    docker run --rm -p 3001:3001 -v jevdeck-data:/data jevdeck
 # See docs/self-hosting.md for the environment variables and the backup/restore steps.
 
-FROM oven/bun:1-alpine AS build
+# The Bun version is the *tested* one, not "the latest 1.x": the lockfile format and the SQLite
+# binding are version-sensitive, so an image built on a different Bun is not the artifact the tests
+# ran against. The default here is the repository's `.bun-version` — `tests/runtime.test.ts` asserts
+# the two agree, so the pin cannot drift — and CI passes it explicitly:
+#
+#   docker build --build-arg BUN_VERSION="$(cat .bun-version)" -t jevdeck .
+ARG BUN_VERSION=1.4.2
+
+FROM oven/bun:${BUN_VERSION}-alpine AS build
 
 WORKDIR /app
 
@@ -33,7 +41,7 @@ RUN if [ -f bun.lock ]; then bun install --frozen-lockfile; else bun install; fi
 # rather than shipping.
 RUN bun --filter "@jevdeck/web" build
 
-FROM oven/bun:1-alpine AS runtime
+FROM oven/bun:${BUN_VERSION}-alpine AS runtime
 
 WORKDIR /app
 

@@ -121,9 +121,9 @@ export const ExportView: React.FC<Props> = ({ deck, cards, isDemo, deckId, canEx
             Built on the server from the stored deck and each card's verbatim citation. Every card
             arrives <strong>new</strong>: an export is a fresh schedule, so your review history,
             intervals and due dates are deliberately not carried across, and nothing here syncs
-            back. Images stored with a document are not bundled into the package either — an
-            imported card cites its page, and the figure stays in JevDeck rather than being copied
-            into an archive whose media handling this build does not implement.
+            back. A figure the source states and the card cites travels with it: its actual bytes
+            are written into the package and referenced from the note, so the picture renders in
+            Anki with no connection to this installation. An image no card cites is left out.
           </p>
           <button
             onClick={() => void handleDownloadApkg()}

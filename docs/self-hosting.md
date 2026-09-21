@@ -100,6 +100,29 @@ both are read from disk at runtime, and a missing prompt is a deliberate hard fa
 silent fallback. `.dockerignore` keeps host `node_modules`, build output, local databases and
 environment files out of the build context.
 
+### The runtime version is the tested one
+
+The image is pinned to the Bun version in `.bun-version`, which is also what CI's toolchain is
+pinned to: the lockfile format and the SQLite binding are version-sensitive, so an image built on a
+different Bun is not the artifact the tests ran against. `docker compose up --build` uses the
+Dockerfile's default, which `tests/runtime.test.ts` asserts equals `.bun-version`; to be explicit (or
+to build against a newer version you have tested yourself):
+
+```bash
+docker build --build-arg "BUN_VERSION=$(cat .bun-version)" -t jevdeck .
+```
+
+### What CI checks about the image
+
+CI's `container` job builds the image, runs it with a loopback provider, and then drives the
+deployed artifact over HTTP: administrator bootstrap, an upload, a real generation through the
+image's own worker, a study session, and the retained original and figure bytes read back. It then
+runs the documented backup command **inside the image**, restores that backup inside the image, and
+starts a second container on the restored database — checking that the account, deck, schedule and
+source bytes are served from it. `tests/container-deployment.test.ts` is that check; it skips itself
+unless `JEVDECK_CONTAINER_BASE_URL` points at a running container, so a local `bun test` needs no
+docker daemon.
+
 ## Configuration
 
 | Variable | Default | Effect |

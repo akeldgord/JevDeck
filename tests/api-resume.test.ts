@@ -414,9 +414,11 @@ describe('An interrupted run', () => {
     stub.setBehaviour({});
 
     // A checkpoint from a different pipeline describes work this code did not do, so it must be
-    // ignored — continuing it would attach another run's concepts to this document.
+    // ignored — continuing it would attach another run's concepts to this document. The fingerprint
+    // is the single place this is recorded, so it is the field the loader reads and the one this
+    // rewrites.
     const progress = readCheckpoint(jobId)!;
-    progress.pipelineVersion = 'some-earlier-pipeline';
+    progress.fingerprint.pipelineVersion = 'some-earlier-pipeline';
     workerDb
       .prepare('UPDATE generation_jobs SET checkpoint = ? WHERE id = ?')
       .run(JSON.stringify(progress), jobId);
@@ -429,7 +431,7 @@ describe('An interrupted run', () => {
     expect(resumed.body.fromCheckpoint).toBe(false);
     expect(resumed.body.reason).toContain('pipeline');
     expect(resumed.body.job.state).toBe('paused');
-    expect(readCheckpoint(jobId)!.pipelineVersion).toBe('some-earlier-pipeline');
+    expect(readCheckpoint(jobId)!.fingerprint.pipelineVersion).toBe('some-earlier-pipeline');
 
     // It is not queued: nothing hands it to a worker that would continue progress it must not use.
     expect(claimNextJob(workerDb, { workerId: 'wrk_never_claims_foreign' })?.id).not.toBe(jobId);
@@ -453,7 +455,7 @@ describe('An interrupted run', () => {
 
     // The new run derived its own concepts; the refused run's stored progress is still its own.
     expect(countSince(marker, 'extract_concepts')).toBe(2);
-    expect(readCheckpoint(jobId)!.pipelineVersion).toBe('some-earlier-pipeline');
+    expect(readCheckpoint(jobId)!.fingerprint.pipelineVersion).toBe('some-earlier-pipeline');
   });
 });
 

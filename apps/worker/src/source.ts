@@ -13,8 +13,19 @@ export interface SourceBlockRow {
   page_index: number;
   page_label: string | null;
   ordinal: number;
+  /**
+   * What the page holds: the document's text, an OCR reading of a picture, unread content, blank.
+   *
+   * The pipeline reads it because the OCR pass has to be able to tell a page nobody has read from a
+   * page whose text is not the document's own, and both from a page with nothing on it.
+   */
+  kind: string;
   raw_text: string;
   normalized_text: string;
+  /** `native`, `ocr` or `none`. */
+  text_source: string;
+  /** Where the reading of this page's picture got to, when one was attempted. */
+  ocr_status: string | null;
 }
 
 export interface SectionRow {
@@ -60,7 +71,8 @@ export function loadStoredSource(db: Database, documentVersionId: string): Store
 
   const blocks = db
     .query(
-      `SELECT id, page_index, page_label, ordinal, raw_text, normalized_text
+      `SELECT id, page_index, page_label, ordinal, kind, raw_text, normalized_text, text_source,
+              ocr_status
          FROM source_blocks
         WHERE document_version_id = ?
         ORDER BY ordinal ASC`

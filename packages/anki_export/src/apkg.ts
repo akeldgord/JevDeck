@@ -21,10 +21,19 @@ import { createHash } from 'node:crypto';
  * A learner who wants to carry progress across should expect to earn it again here, and the export
  * screen says so rather than implying otherwise.
  *
- * Scoped to what the application actually holds otherwise: cards, their source citation and the
- * deck come across; media does not, because the pipeline does not extract figures or tables yet,
- * and writing an empty media map is the honest representation of that rather than a placeholder.
- * Offline media is therefore not provided by this export, and must not be advertised as if it were.
+ * ## Media travels with the card that cites it
+ *
+ * A card can carry the figures its own source states beside its evidence. The bytes go into the
+ * package's media map, the note field refers to the exported file name, and the image is placed on
+ * the **answer** side: a figure shown before the question is answered is the answer. No URL is
+ * written into a note — no absolute server path, no credential, no authenticated link — so the
+ * package renders offline in a clean Anki profile. A figure with no usable bytes is not exported
+ * and is not referred to, rather than becoming a broken image reference.
+ *
+ * The file names are deterministic and collision-free: the sanitized stored name (which already
+ * carries the page and the figure's box), eight hex characters of the bytes' own digest, and an
+ * extension taken from the stored content type. Re-exporting the same deck therefore produces the
+ * same names, and a name can only ever refer to one image.
  *
  * The container is written with stored (uncompressed) entries. The ZIP specification allows it,
  * every reader accepts it, and it removes any chance of a deflate bug corrupting a deck.
@@ -38,6 +47,21 @@ const CLOZE_MODEL_ID = 1_607_392_320;
 const DECK_ID = 1;
 const DEFAULT_DECK_CONF_ID = 1;
 
+export interface ApkgMediaInput {
+  /** The stored file name. Sanitized here; the extension comes from the content type. */
+  name: string;
+  /** The bytes, exactly as they are stored. */
+  bytes: Uint8Array;
+  /**
+   * The stored content type.
+   *
+   * Required rather than guessed from the name: the package may only carry image types a browser
+   * and Anki both render, and a `.png` extension on bytes that are not a PNG is exactly how a
+   * broken reference reaches a learner's profile.
+   */
+  contentType: string;
+}
+
 export interface ApkgCard {
   id: string;
   format: 'qa' | 'cloze';
@@ -50,6 +74,15 @@ export interface ApkgCard {
   excerpt?: string | null;
   pageNumber?: number | null;
   sectionTitle?: string | null;
+  /**
+   * The figures this card cites, already associated with it by the caller.
+   *
+   * Association is a decision about the source, and it is made once, from the stored rows, by
+   * `figuresForEvidence`. This package only carries what it is given: it does not go looking for
+   * images on a page, because "every picture on page 12" is not the same claim as "this card's
+   * figure".
+   */
+  media?: ApkgMediaInput[];
 }
 
 export interface ApkgInput {
@@ -68,6 +101,12 @@ export interface ApkgResult {
   noteCount: number;
   /** Files inside the container, in the order they are written. */
   entries: string[];
+  /** Distinct images written into the package. Zero means the deck genuinely has no media. */
+  mediaCount: number;
+  /** The exported file names, keyed by the card that cites them. */
+  mediaByCard: Map<string, string[]>;
+  /** Stored images that claimed a name but could not be exported, with the reason. */
+  skippedMedia: Array<{ name: string; reason: string }>;
 }
 
 /** Anki's internal ease for a card that has never been reviewed: 2.5, in per-mille. */
@@ -304,7 +343,9 @@ function basicModel() {
         name: 'Card 1',
         ord: 0,
         qfmt: '{{Front}}',
-        afmt: '{{FrontSide}}\n\n<hr id=answer>\n\n{{Back}}\n\n<div class="source">{{Source}}</div>',
+        // The figure goes under the answer, never above it: an image on the question side can give
+        // the answer away, and a deck that does that teaches recognition of the picture.
+        afmt: '{{FrontSide}}\n\n<hr id=answer>\n\n{{Back}}\n\n<div class="media">{{Media}}</div>\n\n<div class="source">{{Source}}</div>',
         bqfmt: '',
         bafmt: '',
         did: null,
@@ -312,12 +353,8 @@ function basicModel() {
         usn: 0,
       },
     ],
-    flds: [
-      field('Front', 0),
-      field('Back', 1),
-      field('Source', 2),
-    ],
-    css: '.card { font-family: sans-serif; font-size: 20px; text-align: left; color: #1e293b; }\n.source { font-size: 13px; color: #64748b; }',
+    flds: [field('Front', 0), field('Back', 1), field('Source', 2), field('Media', 3)],
+    css: '.card { font-family: sans-serif; font-size: 20px; text-align: left; color: #1e293b; }\n.media img { max-width: 100%; height: auto; }\n.source { font-size: 13px; color: #64748b; }',
     latexPre: '',
     latexPost: '',
     req: [[0, 'any', [0]]],
@@ -340,7 +377,7 @@ function clozeModel() {
         name: 'Cloze',
         ord: 0,
         qfmt: '{{cloze:Text}}',
-        afmt: '{{cloze:Text}}\n\n<div class="source">{{Source}}</div>',
+        afmt: '{{cloze:Text}}\n\n<div class="media">{{Media}}</div>\n\n<div class="source">{{Source}}</div>',
         bqfmt: '',
         bafmt: '',
         did: null,
@@ -348,8 +385,8 @@ function clozeModel() {
         usn: 0,
       },
     ],
-    flds: [field('Text', 0), field('Source', 1)],
-    css: '.card { font-family: sans-serif; font-size: 20px; text-align: left; color: #1e293b; }\n.cloze { font-weight: bold; color: #0ea5e9; }\n.source { font-size: 13px; color: #64748b; }',
+    flds: [field('Text', 0), field('Source', 1), field('Media', 2)],
+    css: '.card { font-family: sans-serif; font-size: 20px; text-align: left; color: #1e293b; }\n.cloze { font-weight: bold; color: #0ea5e9; }\n.media img { max-width: 100%; height: auto; }\n.source { font-size: 13px; color: #64748b; }',
     latexPre: '',
     latexPost: '',
     req: [[0, 'any', [0]]],
@@ -401,6 +438,120 @@ function noteTags(tags: string[] | undefined): string {
   return cleaned.length === 0 ? '' : ` ${cleaned.join(' ')} `;
 }
 
+/**
+ * The image types a package may carry.
+ *
+ * A deliberately short list: these are the formats a browser, Anki desktop and Anki's mobile
+ * clients all render from a note. Anything else is refused and reported rather than exported as a
+ * reference that will not draw on the device the learner studies on.
+ */
+const MEDIA_EXTENSIONS: Record<string, string> = {
+  'image/png': '.png',
+  'image/jpeg': '.jpg',
+  'image/gif': '.gif',
+  'image/webp': '.webp',
+  'image/bmp': '.bmp',
+};
+
+/** The extension an image is exported with, or `null` when the type is not one this build writes. */
+export function mediaExtensionFor(contentType: string): string | null {
+  return MEDIA_EXTENSIONS[contentType.trim().toLowerCase()] ?? null;
+}
+
+/**
+ * The name one image is exported under.
+ *
+ * Deterministic, collision-free and safe to put in a note field, which is the whole requirement:
+ *
+ *   - the stem is the stored name (which already carries the page and the figure's box) with
+ *     everything outside `[A-Za-z0-9._-]` replaced, so no path separator, quote or angle bracket
+ *     can reach the HTML of a note;
+ *   - the eight hex characters are the digest of the bytes themselves, so two images can never
+ *     share a name and the same image always gets the same one;
+ *   - the extension comes from the content type, not from the stored name — a `.png` name on JPEG
+ *     bytes is how a package ends up with an image nothing can draw.
+ */
+export function apkgMediaName(
+  name: string,
+  bytes: Uint8Array,
+  contentType: string
+): string | null {
+  const extension = mediaExtensionFor(contentType);
+  if (!extension) return null;
+  if (bytes.byteLength === 0) return null;
+
+  const stem =
+    name
+      .replace(/^.*[\\/]/, '')
+      .replace(/\.[^.]*$/, '')
+      .replace(/[^A-Za-z0-9._-]/g, '_')
+      .slice(0, 60) || 'figure';
+
+  const digest = createHash('sha1').update(bytes).digest('hex').slice(0, 8);
+  return `${stem}-${digest}${extension}`;
+}
+
+interface ResolvedMedia {
+  /** The exported file names, keyed by the card that cites them. */
+  byCard: Map<string, string[]>;
+  /** The images to write, in the order they were first referenced. */
+  files: Array<{ fileName: string; bytes: Uint8Array }>;
+  /** Images that could not be exported, with the reason, so the caller can say what was left out. */
+  skipped: Array<{ name: string; reason: string }>;
+}
+
+/**
+ * Names every card's figures and collects the bytes to write once.
+ *
+ * A figure cited by four cards is one file referenced four times, which is what Anki's media map is
+ * for. Nothing is invented for a card that cites nothing.
+ */
+function resolveMedia(cards: ApkgCard[]): ResolvedMedia {
+  const byCard = new Map<string, string[]>();
+  const files: Array<{ fileName: string; bytes: Uint8Array }> = [];
+  const written = new Set<string>();
+  const skipped: Array<{ name: string; reason: string }> = [];
+
+  for (const card of cards) {
+    const names: string[] = [];
+
+    for (const media of card.media ?? []) {
+      const fileName = apkgMediaName(media.name, media.bytes, media.contentType);
+
+      if (!fileName) {
+        skipped.push({
+          name: media.name,
+          reason: mediaExtensionFor(media.contentType)
+            ? 'the stored image has no bytes'
+            : `\`${media.contentType}\` is not an image type this export writes`,
+        });
+        continue;
+      }
+
+      if (!written.has(fileName)) {
+        written.add(fileName);
+        files.push({ fileName, bytes: media.bytes });
+      }
+
+      if (!names.includes(fileName)) names.push(fileName);
+    }
+
+    if (names.length > 0) byCard.set(card.id, names);
+  }
+
+  return { byCard, files, skipped };
+}
+
+/**
+ * The HTML a note's `Media` field carries: one image tag per figure, and nothing when there is none.
+ *
+ * The names are already restricted to `[A-Za-z0-9._-]` by `apkgMediaName`, so there is nothing here
+ * that could close the tag or introduce a second attribute.
+ */
+function mediaField(names: string[]): string {
+  return names.map(name => `<img src="${name}">`).join('\n');
+}
+
 function citation(card: ApkgCard): string {
   const page = card.pageNumber ?? null;
   const heading = card.sectionTitle ? `${card.sectionTitle}` : null;
@@ -423,6 +574,7 @@ function citation(card: ApkgCard): string {
  */
 export function buildCollection(
   cards: ApkgCard[],
+  mediaByCard: Map<string, string[]>,
   deckTitle: string,
   now: Date
 ): { bytes: Uint8Array; noteCount: number; cardCount: number } {
@@ -543,7 +695,10 @@ export function buildCollection(
           );
 
       const source = fieldSeparatorSafe(citation(card));
-      const fields = isCloze ? [text, source] : [text, back, source];
+      // The figures this card cites, on the answer side only. A card with none gets an empty field
+      // rather than a placeholder: there is no image, and saying so by showing nothing is correct.
+      const media = fieldSeparatorSafe(mediaField(mediaByCard.get(card.id) ?? []));
+      const fields = isCloze ? [text, source, media] : [text, back, source, media];
       const sortField = isCloze ? text.replace(/\{\{c\d+::(.*?)\}\}/g, '$1') : text;
 
       insertNote.run(
@@ -589,29 +744,43 @@ export function buildCollection(
 /** Builds a complete `.apkg` for a deck. */
 export function buildApkg(input: ApkgInput): ApkgResult {
   const now = input.now ?? new Date();
+  const media = resolveMedia(input.cards);
+
   const { bytes: collection, noteCount, cardCount } = buildCollection(
     input.cards,
+    media.byCard,
     input.deck.title,
     now
   );
 
   // Anki's importer reads `media` as a JSON object mapping the names inside the package to real
-  // file names. An empty object means the deck genuinely has no media.
-  const media = new TextEncoder().encode('{}');
+  // file names — `{"0": "figure-nephron-1a2b3c4d.png"}` — and then renames the files into the
+  // learner's collection folder on import. An empty object means the deck genuinely has no media,
+  // which is what a deck whose figures were never extracted gets: no placeholder, no broken link.
+  const mediaMap: Record<string, string> = {};
+  const entries: ZipEntry[] = [{ name: 'collection.anki2', data: collection }];
 
-  const bytes = zipStore([
-    { name: 'collection.anki2', data: collection },
-    { name: 'media', data: media },
-  ]);
+  media.files.forEach((file, index) => {
+    mediaMap[String(index)] = file.fileName;
+  });
+
+  entries.push({ name: 'media', data: new TextEncoder().encode(JSON.stringify(mediaMap)) });
+
+  media.files.forEach((file, index) => {
+    entries.push({ name: String(index), data: file.bytes });
+  });
 
   return {
-    bytes,
+    bytes: zipStore(entries),
     fileName: `${safeFileStem(input.deck.title)}.apkg`,
     // Counted from the collection that was written, not assumed from the input: a cloze note with
     // two deletions is one note and two cards, and reporting "two cards" for it would be wrong.
     cardCount,
     noteCount,
-    entries: ['collection.anki2', 'media'],
+    entries: entries.map(entry => entry.name),
+    mediaCount: media.files.length,
+    mediaByCard: media.byCard,
+    skippedMedia: media.skipped,
   };
 }
 
