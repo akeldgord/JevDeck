@@ -151,7 +151,7 @@ export interface BrowserHarness {
     workerId: string;
     plan?: string;
     killAtBarrier?: boolean;
-    barrier?: 'file' | 'write-lock' | 'none';
+    barrier?: 'file' | 'none';
     timeoutMs?: number;
   }): Promise<WorkerProcessOutcome>;
   close(): Promise<void>;

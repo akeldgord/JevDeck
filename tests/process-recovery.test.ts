@@ -302,18 +302,6 @@ function sendingsSince(marker: number, request: RecordedRequest): number {
  * test's own database and exists nowhere else: production has no fault-injection endpoint and reads
  * no barrier.
  */
-const SLOW_PUBLICATION_TRIGGER = `
-  CREATE TRIGGER test_slow_publication AFTER UPDATE ON generation_jobs
-  WHEN NEW.state = 'completed'
-  BEGIN
-    SELECT COUNT(*) FROM (
-      WITH RECURSIVE slow(x) AS (
-        SELECT 1 UNION ALL SELECT x + 1 FROM slow WHERE x < 20000000
-      ) SELECT x FROM slow
-    );
-  END
-`;
-
 /** Runs a worker process that completes the job, and asserts it really did. */
 async function recover(
   jobId: string,
@@ -620,23 +608,17 @@ describe('Kill point 4 — inside the publication, before the commit', () => {
     const { deckId, jobId } = await queueRun('kill-4-before-commit.pdf');
     const marker = stub.requests.length;
 
-    observerDb.exec(SLOW_PUBLICATION_TRIGGER);
-
-    let killed;
-    try {
-      killed = await runWorkerProcess({
-        dbPath,
-        providerUrl: stub.url,
-        jobId,
-        workerId: 'wrk_kill4',
-        plan: 'before-commit',
-        barrierDir: barrierDirFor('kill4'),
-        barrier: 'write-lock',
-        killAtBarrier: true,
-      });
-    } finally {
-      observerDb.exec('DROP TRIGGER IF EXISTS test_slow_publication');
-    }
+    // The process kills itself from inside the publication transaction, after its last statement
+    // and before its commit — see `workerChild.ts` for why the parent cannot pick this moment out
+    // of the write lock alone.
+    const killed = await runWorkerProcess({
+      dbPath,
+      providerUrl: stub.url,
+      jobId,
+      workerId: 'wrk_kill4',
+      plan: 'before-commit',
+      barrierDir: barrierDirFor('kill4'),
+    });
 
     expect(killed.barrierReached).toBe(true);
     expect(killed.signal).toBe('SIGKILL');
@@ -660,7 +642,13 @@ describe('Kill point 4 — inside the publication, before the commit', () => {
     onlyClaimable(jobId);
     expireLease(jobId);
     const finished = await recover(jobId, 'wrk_kill4_recovery', 'kill4-recovery');
-    expect(finished.result?.state).toBe('completed');
+    // The outcome carries its own reason, so a failure here names what the recovery decided — and
+    // whether it stopped on an uncertain charge — rather than reporting only that it was not what
+    // the test expected.
+    expect(
+      finished.result?.state,
+      `the recovery ended ${finished.result?.errorCode ?? 'with no error code'}: ${finished.result?.message ?? ''}`
+    ).toBe('completed');
 
     expect(stub.requests.length).toBe(callsBeforeRecovery);
     expect(countSince(marker, 'generate_cards')).toBe(control.calls.generation);

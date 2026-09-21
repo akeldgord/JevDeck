@@ -665,122 +665,26 @@ describe('The finalisation gate', () => {
 
 describe('A worker killed mid-publication', () => {
   /**
-   * True while another process holds the database's write lock.
-   *
-   * A fresh connection with no busy timeout, rather than an inference from the child's output: the
-   * only thing that can hold the write lock is a process inside an open write transaction, which
-   * is exactly the state the before-commit case needs to kill.
-   */
-  function writeLockHeld(): boolean {
-    const probe = new Database(dbPath);
-
-    try {
-      probe.exec('PRAGMA busy_timeout = 0');
-      try {
-        probe.exec('BEGIN IMMEDIATE');
-        probe.exec('ROLLBACK');
-        return false;
-      } catch {
-        return true;
-      }
-    } finally {
-      probe.close();
-    }
-  }
-
-  /**
-   * True once the run has stored a checkpoint covering every batch it was going to ask for.
-   *
-   * That is the state the run sits in from its last batch until the publication commits: everything
-   * it paid for is behind it, and the publication is all that is left. It is also what makes the
-   * kill point below unambiguous — a probe that merely saw the write lock held could be looking at
-   * any single-statement write (or at a commit under a loaded machine), but a probe that sees it
-   * held *after* the checkpoint is complete can only be looking at the finalisation.
-   */
-  function everyBatchStored(jobId: string): boolean {
-    const row = workerDb
-      .query('SELECT checkpoint FROM generation_jobs WHERE id = ?')
-      .get(jobId) as { checkpoint: string | null } | null;
-    if (!row?.checkpoint) return false;
-
-    const progress = JSON.parse(row.checkpoint) as {
-      completedCardBatches: number;
-      completedConceptBatches: number;
-      conceptBatchCount: number;
-    };
-
-    return progress.completedCardBatches > 0 && progress.completedConceptBatches === progress.conceptBatchCount;
-  }
-
-  /**
-   * Waits for the child to be inside its publication transaction, with every paid batch stored.
-   *
-   * The publication's last statement is deliberately slow, so the lock stays held for seconds once
-   * it is taken. Asking for it to still be held a moment later is what makes this a barrier rather
-   * than a race, and the checkpoint condition is what rules out a lock held by anything else.
-   */
-  async function waitForPublicationWindow(jobId: string, timeoutMs = 30_000): Promise<void> {
-    const deadline = Date.now() + timeoutMs;
-
-    while (Date.now() < deadline) {
-      if (everyBatchStored(jobId) && writeLockHeld()) {
-        await Bun.sleep(200);
-        if (writeLockHeld()) return;
-      }
-
-      await Bun.sleep(10);
-    }
-
-    throw new Error('the worker never reached its publication with the write lock held');
-  }
-
-  /**
    * Runs `tests/helpers/workerChild.ts` against the shared database and kills it with `SIGKILL`
    * at the named point. Nothing is cleaned up in the child: a killed process runs no `finally`,
    * which is exactly the state this test needs to observe.
    */
   async function killWorkerAt(point: 'before-commit' | 'after-commit', jobId: string): Promise<void> {
-    const barrierDir = barrierDirFor(`publication-${point}`);
+    const outcome = await runWorkerProcess({
+      dbPath,
+      providerUrl: stub.url,
+      jobId,
+      workerId: `wrk_killed_${point.replace('-', '_')}`,
+      plan: point,
+      barrierDir: barrierDirFor(`publication-${point}`),
+      // Before the commit the child kills itself from inside the open transaction — a moment the
+      // parent cannot pick out of the write lock, which says only that *some* transaction is open.
+      // After the commit it blocks on a file and waits to be killed.
+      killAtBarrier: point === 'after-commit',
+    });
 
-    if (point === 'before-commit') {
-      // The run's completion, made slow. The child reaches it with every card, evidence row and
-      // concept already written and the transaction still open — the exact instant the earlier code
-      // committed the publication and left the completion to a second statement. That is why this
-      // trigger is the discriminator: if the two were not one transaction, killing here would leave
-      // the cards committed on a run that still reads as unfinished.
-      workerDb.exec(`
-        CREATE TRIGGER test_slow_publication AFTER UPDATE ON generation_jobs
-        WHEN NEW.state = 'completed'
-        BEGIN
-          SELECT COUNT(*) FROM (
-            WITH RECURSIVE slow(x) AS (
-              SELECT 1 UNION ALL SELECT x + 1 FROM slow WHERE x < 20000000
-            ) SELECT x FROM slow
-          );
-        END
-      `);
-    }
-
-    try {
-      const outcome = await runWorkerProcess({
-        dbPath,
-        providerUrl: stub.url,
-        jobId,
-        workerId: `wrk_killed_${point.replace('-', '_')}`,
-        plan: point,
-        barrierDir,
-        // The two publication points differ in their barrier and in nothing else: before the commit
-        // the process is inside an open transaction, which the write lock reports, and after the
-        // commit it blocks itself on a file.
-        barrier: point === 'before-commit' ? 'write-lock' : 'file',
-        killAtBarrier: true,
-      });
-
-      expect(outcome.barrierReached).toBe(true);
-      expect(outcome.signal).toBe('SIGKILL');
-    } finally {
-      if (point === 'before-commit') workerDb.exec('DROP TRIGGER IF EXISTS test_slow_publication');
-    }
+    expect(outcome.barrierReached).toBe(true);
+    expect(outcome.signal).toBe('SIGKILL');
   }
 
   it('leaves no publication behind, and the run finishes on the next worker', async () => {

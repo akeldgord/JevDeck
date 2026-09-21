@@ -178,6 +178,27 @@ jobs:
           JEVDECK_CONTAINER_MODE: restored
         run: bun test tests/container-deployment.test.ts
 
+      - name: Run the documented Compose deployment
+        # The documented install is `docker compose up --build`, so the image is brought up that way
+        # as well, on a port and volume of its own so it cannot disturb the two containers above.
+        # Last, deliberately: a problem here must not hide whether the build and the restore worked.
+        run: |
+          JEVDECK_PORT=3003 docker compose up --build --detach api
+          for attempt in $(seq 1 60); do
+            if curl -fsS -o /dev/null http://127.0.0.1:3003/api/health; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "The Compose deployment never reported a healthy database:"
+          docker compose logs api
+          exit 1
+
+      - name: Tear the Compose deployment down
+        # Its own volume, so nothing a later run sees is left behind either way.
+        if: always()
+        run: docker compose down --volumes --remove-orphans || true
+
       - name: Container logs, when something above failed
         if: failure()
         run: |

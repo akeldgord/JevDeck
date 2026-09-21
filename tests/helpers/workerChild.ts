@@ -18,10 +18,10 @@
  * The plans:
  *
  *   `none`                          claim the job, run it to its end, write `result.json`, exit.
- *   `before-commit`                 run it; the parent has installed a deliberately slow trigger on
- *                                   the last statement of the publication, so this process sits
- *                                   inside an open, uncommitted transaction. It is not expected to
- *                                   return: the parent kills it while the transaction is open.
+ *   `before-commit`                 run it, and kill this process from *inside* the final
+ *                                   publication, after its last statement and before the commit is
+ *                                   issued. It is not expected to return: it never reports a result
+ *                                   and the transaction it died in is rolled back.
  *   `after-commit`                  run it to completion, write the barrier and block. The parent
  *                                   kills it immediately after the commit rather than after an
  *                                   orderly shutdown.
@@ -87,6 +87,51 @@ function stopAt(label: string): never {
 
   console.error(`workerChild: nobody killed this process at ${label}`);
   process.exit(4);
+}
+
+/**
+ * Makes this process its own kill point inside the final publication.
+ *
+ * The point before the commit sits inside a database transaction rather than at a call boundary, so
+ * no provider wrapper can reach it. Waiting for the write lock from the parent instead cannot say
+ * *which* transaction holds it: on a loaded machine an ordinary write can be seen held twice a few
+ * hundred milliseconds apart, and the parent then kills the run somewhere in its last batch rather
+ * than inside the publication — which is a test that reports the wrong thing rather than a test that
+ * fails. So the process stops itself here, from the only place that knows the fact for certain.
+ *
+ * `finaliseWithPublication` runs its body through `db.transaction(...).immediate()`, so wrapping
+ * that one method puts this code after the publication's last statement and before the commit it is
+ * part of. Reading the job row here reads the open transaction's own writes, which no other
+ * connection can see: the row says `completed` for exactly as long as the commit has not been
+ * issued, and a rollback afterward leaves the run exactly as it was before the publication began.
+ */
+function publicationKillPoint(db: Database, jobId: string): Database {
+  return new Proxy(db, {
+    get(target, property) {
+      if (property === 'transaction') {
+        return (body: () => unknown) =>
+          target.transaction(() => {
+            const result = body();
+
+            const row = target
+              .query('SELECT state FROM generation_jobs WHERE id = ?')
+              .get(jobId) as { state: string } | null;
+
+            if (row?.state === 'completed') {
+              writeFileSync(join(barrierDir, 'barrier'), `before-commit pid=${process.pid}`);
+              // Immediate and not catchable: nothing after this line runs, no `finally` runs, and
+              // the transaction this process died inside is never committed.
+              process.kill(process.pid, 'SIGKILL');
+            }
+
+            return result;
+          });
+      }
+
+      const value = Reflect.get(target, property, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  }) as Database;
 }
 
 type Stop =
@@ -207,7 +252,11 @@ if (!job || job.id !== jobId) {
   process.exit(3);
 }
 
-const outcome = await runGenerationJob(db, provider, job, { workerId, leaseSeconds });
+// Only the publication plan needs the wrapped connection: the others stop at a provider call, which
+// is where a wrapper is the right kind of barrier.
+const runDb = plan === 'before-commit' ? publicationKillPoint(db, jobId) : db;
+
+const outcome = await runGenerationJob(runDb, provider, job, { workerId, leaseSeconds });
 
 // The outcome as this process saw it, for the parent to assert against what the database says. A
 // worker process that claims a job and runs it is the thing under test; the parent reads this

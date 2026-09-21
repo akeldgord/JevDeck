@@ -6,14 +6,13 @@
  * point the test means to interrupt, and a way to stop it with `SIGKILL` so that nothing it would
  * have done afterwards — no `finally`, no orderly shutdown, no second flush — ever happens.
  *
- * The barrier is a file the child writes and then blocks on (`Atomics.wait`), so the parent waits on
- * a fact rather than on a duration. Two of the five points cannot be expressed that way — the two
- * inside the publication transaction, where there is no call boundary to hook — and those use the
- * database's write lock as their barrier instead: only a process inside an open write transaction
- * can hold it, so a probe that finds it held finds a publication in progress.
+ * The barrier is a file the child writes, so the parent waits on a fact rather than on a duration.
+ * Most points then block until the parent kills them (`Atomics.wait`). The one inside the publication
+ * is different: it writes the same file and then kills itself, because the parent can only observe
+ * *that* the write lock is held, never *which* transaction holds it — and a test that kills the run
+ * somewhere else while reporting success is worse than one that fails. See `workerChild.ts`.
  */
 
-import { Database } from 'bun:sqlite';
 import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -47,62 +46,6 @@ export interface WorkerProcessOutcome {
 }
 
 /**
- * True once the run's stored progress covers every batch it was going to ask for.
- *
- * That is the state the run sits in from its last batch until the publication commits: everything
- * it paid for is behind it and the publication is all that is left. It is what makes the
- * write-lock barrier unambiguous — a probe that merely saw the lock held could be looking at any
- * single-statement write, while one that sees it held *after* the checkpoint is complete can only
- * be looking at the finalisation.
- */
-function checkpointCoversEveryBatch(dbPath: string, jobId: string): boolean {
-  const probe = new Database(dbPath);
-
-  try {
-    const row = probe
-      .query('SELECT checkpoint FROM generation_jobs WHERE id = ?')
-      .get(jobId) as { checkpoint: string | null } | null;
-    if (!row?.checkpoint) return false;
-
-    const progress = JSON.parse(row.checkpoint) as {
-      completedCardBatches: number;
-      completedConceptBatches: number;
-      conceptBatchCount: number;
-    };
-
-    return (
-      progress.completedCardBatches > 0 &&
-      progress.completedConceptBatches === progress.conceptBatchCount
-    );
-  } finally {
-    probe.close();
-  }
-}
-
-/**
- * True while another process holds the database's write lock.
- *
- * A fresh connection with no busy timeout, rather than an inference from the child's output: the
- * only thing that can hold the write lock is a process inside an open write transaction.
- */
-export function writeLockHeld(dbPath: string): boolean {
-  const probe = new Database(dbPath);
-
-  try {
-    probe.exec('PRAGMA busy_timeout = 0');
-    try {
-      probe.exec('BEGIN IMMEDIATE');
-      probe.exec('ROLLBACK');
-      return false;
-    } catch {
-      return true;
-    }
-  } finally {
-    probe.close();
-  }
-}
-
-/**
  * Runs one worker process against the shared database.
  *
  * `plan: 'none'` starts a fresh worker that runs the job to its end — which is what the recovery
@@ -120,8 +63,8 @@ export async function runWorkerProcess(options: {
   barrierDir?: string;
   /** Kill the child once it has reached its barrier, rather than letting it finish. */
   killAtBarrier?: boolean;
-  /** The barrier to wait for: the child's file, or the write lock held for a publication. */
-  barrier?: 'file' | 'write-lock' | 'none';
+  /** The barrier to wait for: the child's file, or nothing when the caller only wants the result. */
+  barrier?: 'file' | 'none';
   leaseSeconds?: number;
   timeoutMs?: number;
 }): Promise<WorkerProcessOutcome> {
@@ -156,24 +99,7 @@ export async function runWorkerProcess(options: {
       // whole timeout is what keeps a broken barrier a readable test failure.
       if (child.exitCode !== null) break;
 
-      const reached =
-        barrier === 'write-lock'
-          ? checkpointCoversEveryBatch(options.dbPath, options.jobId) &&
-            writeLockHeld(options.dbPath)
-          : existsSync(barrierPath);
-
-      if (reached) {
-        // The publication's last statement is deliberately slow, so the lock stays held for seconds
-        // once it is taken. Asking for it to still be held a moment later is what makes this a
-        // barrier rather than a race.
-        if (barrier === 'write-lock') {
-          await Bun.sleep(200);
-          if (!writeLockHeld(options.dbPath)) {
-            await Bun.sleep(10);
-            continue;
-          }
-        }
-
+      if (existsSync(barrierPath)) {
         barrierReached = true;
         break;
       }
