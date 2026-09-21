@@ -143,6 +143,11 @@ docker daemon.
 | `JEVDECK_PROVIDER_TIMEOUT_MS` | `90000` | Per-call timeout. A timed-out call is retried while attempts remain. |
 | `JEVDECK_WORKER_ENABLED` | `true` | The API runs the worker in-process, so one process serves and generates. Set `false` and run `bun --filter @jevdeck/worker start` separately to scale them apart; the queue is in the database, so either arrangement works. |
 | `JEVDECK_GENERATION_AVAILABLE` | derived | `false` disables generation even when a credential is present — an operator switch for stopping spend without rotating the key. |
+| `JEVDECK_BUDGET_INSTALLATION_LIMIT_MINOR` | unset | Monthly installation spend cap in cents (`200` is US$2.00). Absent or `0` means no installation cap. A per-account cap is set from the Admin tab instead, and a stored policy wins over this value. |
+| `JEVDECK_BUDGET_CURRENCY` | `USD` | Currency label recorded on the ledger. |
+| `JEVDECK_BUDGET_CHARS_PER_TOKEN` | `2` | Characters per token assumed when bounding what one call may cost, for a provider that returns no token count. It is a bound rather than an average, so a reservation is never smaller than the call can turn out to be. |
+| `JEVDECK_PROVIDER_PRICE_INPUT_PER_MTOK` | built-in table | USD per million input tokens. Set it when the model is not in the built-in price table: otherwise the ledger charges a conservative fallback rate and reports that the figure is not the provider's tariff. |
+| `JEVDECK_PROVIDER_PRICE_OUTPUT_PER_MTOK` | built-in table | USD per million output tokens, as above. |
 | `VITE_JEVDECK_DEMO_MODE` | unset | `true` loads the bundled fixture document, synthetic accounts and simulated usage figures, and marks every screen as demo content. It is absent from the repository, so a production build cannot fall back to it. |
 
 **Never enable demo mode on an instance that holds real data.** It exists so the interface can

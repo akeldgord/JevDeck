@@ -43,7 +43,15 @@ bun scripts/evaluate.ts --list
 
 # Write the review file for a job, and the report
 bun scripts/evaluate.ts --job <job-id> --template evaluations/reports/<job-id>-review.json
+
+# Produce the run to measure, with real material and a real provider
+bun run trial --document ~/papers/chapter-1.pdf
 ```
+
+`bun run trial` drives the product's own interface over a document the operator supplies, records
+what the run cost, and then calls this harness for the report and the review file. It refuses to
+run without a provider credential or without a spend cap, and a `--dry-run` against the loopback
+provider says in its own report that it is not evidence about a hosted model.
 
 Reports are written to `evaluations/reports/` (git-ignored: they describe real material). The
 command exits `1` when a gate is measured and fails, and `0` when the gates pass or when a gate

@@ -143,6 +143,24 @@ To measure the quality gates against a completed run:
 bun run evaluate --job <job-id> --template evaluations/reports/review.json
 ```
 
+To try real material end to end — the flow a person performs, plus what it cost:
+
+```bash
+bun run trial --document ~/papers/chapter-1.pdf                       # high-yield, the default
+bun run trial --document ~/papers/chapter-1.pdf --coverage comprehensive
+bun run trial --document ~/papers/chapter-1.pdf --dry-run             # loopback provider, free
+```
+
+The trial starts a real installation on its own database under `data/trials/`, drives the
+production bundle in Chromium through upload → select → generate → what the reader found → study →
+reload → reopen → export, and then hands the run to `bun run evaluate` for the §5 gate report and
+the review file. Its report records the wall-clock of each stage, the calls the provider was
+actually sent, the tokens, and the settled spend read from the ledger — plus what it did *not* do
+(the Anki import, and any judgement of card quality). It refuses to run without a provider
+credential, refuses a paid run in `CI`, and refuses to spend without an installation cap. Real
+material stays out of Git: the database and exported package live under `data/trials/`, and the
+reports under the git-ignored `evaluations/reports/`.
+
 To explore the interface with the bundled fixture document instead of a real backend, create
 `.env.local` containing `VITE_JEVDECK_DEMO_MODE=true` and restart. Every screen is then marked
 as demo content, and the app does not talk to the API at all.
@@ -212,6 +230,11 @@ for the gates being unmet.
 | `JEVDECK_PROVIDER_TIMEOUT_MS` | api | Per-call timeout. Default `90000`. |
 | `JEVDECK_WORKER_ENABLED` | api | `false` runs the API without the in-process worker, so a separate worker can own the queue. Default `true`. |
 | `JEVDECK_GENERATION_AVAILABLE` | api | `false` disables generation even when a credential is present, without rotating the key. |
+| `JEVDECK_BUDGET_INSTALLATION_LIMIT_MINOR` | api, worker | Monthly installation spend cap in cents (`200` is US$2.00). Absent or `0` means no installation cap; a per-account cap is set from the Admin tab instead. |
+| `JEVDECK_BUDGET_CURRENCY` | worker | Currency label recorded on the ledger. Default `USD`. |
+| `JEVDECK_BUDGET_CHARS_PER_TOKEN` | worker | Characters per token assumed when bounding what a call may cost. Default `2` — a bound, not an average. |
+| `JEVDECK_PROVIDER_PRICE_INPUT_PER_MTOK` | worker | USD per million input tokens. Without it, a model outside the built-in price table is charged at a conservative fallback rate and the ledger records that as a limitation. |
+| `JEVDECK_PROVIDER_PRICE_OUTPUT_PER_MTOK` | worker | USD per million output tokens, as above. |
 
 > A tracked `.env.example` does not exist yet: the file tooling in this workspace refuses any
 > `.env*` path, so the template cannot be written from here. Until it can be, set environment
@@ -291,7 +314,7 @@ JevDeck/
     evaluation/              # Quality-gate measurements (never imported by production code)
   prompts/                   # Versioned prompt templates
   evaluations/               # Harness documentation and reports; held-out material is supplied
-  scripts/                   # backup, restore and evaluate entry points
+  scripts/                   # backup, restore, evaluate and trial entry points
   docs/                      # Architecture, self-hosting, decisions
   tests/                     # Integration and acceptance suites
 ```
