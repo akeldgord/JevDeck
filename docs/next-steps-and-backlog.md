@@ -34,6 +34,26 @@ These checks use controlled provider responses. They do not establish real-model
 
 If credentials or Anki are unavailable, state that concrete missing input. Do not substitute another hardening project. Do not claim live-model or Anki compatibility results that have not been observed.
 
+### The trial, made runnable
+
+`bun run trial` performs the walk above (items 2–4 and 6) as one command: a real installation on its
+own database, the production bundle in Chromium, upload → select → generate → what the reader
+found → study → reload → reopen → export, and then `bun run evaluate` for the gate report and the
+review file. Its report records the wall-clock of each stage, the calls the provider was actually
+sent, the tokens, and the settled spend read from the ledger — and names what it did not do.
+
+Verified end to end against the controlled provider, which is **not** evidence about a hosted
+model: `tests/trial-runner.test.ts` covers the refusals (no credential, `CI`, no spend cap, no
+document) and one full dry run. What the command cannot clear is the two inputs below.
+
+1. **Provider credential.** Nothing has been run against a hosted model. Set
+   `JEVDECK_PROVIDER_API_KEY` and `JEVDECK_PROVIDER_MODEL` — plus
+   `JEVDECK_PROVIDER_PRICE_INPUT_PER_MTOK` / `_OUTPUT_PER_MTOK` for a model outside the built-in
+   price table, and a cap via `JEVDECK_BUDGET_INSTALLATION_LIMIT_MINOR` — then point it at a real
+   article or chapter.
+2. **Anki.** The exported package has only ever been inspected by reading it, never imported into
+   a collection. Item 5 needs a clean profile.
+
 ## JEV: next product experiment
 
 JEV integration/comparison remains separate from baseline usability. Once the baseline produces useful cards, verify access and implement the bounded decision adapter, then compare the same material with and without JEV. Measure accepted-card cost and concept coverage as well as accuracy. Enable it where it helps. Do not delay baseline trials waiting for JEV, and do not describe the current baseline as JEV-powered.
